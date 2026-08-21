@@ -131,7 +131,7 @@ def run_grading(
             ["docker", "exec", *env_args, task_id, "python3", "/tmp/_grade_runner.py"],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=3200,
         )
         if r.returncode != 0:
             logger.error("[%s] Grading script execution failed: %s", task_id, r.stderr)

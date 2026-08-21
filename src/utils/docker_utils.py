@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from dotenv import load_dotenv
 
@@ -222,35 +223,75 @@ def run_warmup(
     if not commands:
         return
 
-    logger.info("[%s] Running warmup (%d commands)", task_id, len(commands))
+    retry_delay = float(os.environ.get("WCB_WARMUP_RETRY_DELAY_SECONDS", "10"))
+    max_retries_raw = os.environ.get("WCB_WARMUP_MAX_RETRIES", "0").strip()
+    max_retries = int(max_retries_raw) if max_retries_raw else 0
+    retry_desc = "unlimited" if max_retries <= 0 else str(max_retries)
+
+    logger.info(
+        "[%s] Running warmup (%d commands, retries=%s, retry_delay=%.1fs)",
+        task_id,
+        len(commands),
+        retry_desc,
+        retry_delay,
+    )
     for idx, cmd in enumerate(commands, start=1):
         logger.info("[%s] warmup: %s", task_id, cmd)
         stripped_cmd = cmd.rstrip()
-        if detach_background and stripped_cmd.endswith("&"):
-            background_cmd = stripped_cmd[:-1].strip()
-            log_path = f"/tmp/wildclaw_warmup_{idx}.log"
-            wrapped = (
-                f"cd {TMP_WORKSPACE} && "
-                f"nohup /bin/bash -lc {shlex.quote(background_cmd)} "
-                f"> {shlex.quote(log_path)} 2>&1 < /dev/null &"
-            )
-            r = subprocess.run(
-                ["docker", "exec", task_id, "/bin/bash", "-lc", wrapped],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(
-                    f"Warmup background command failed: {cmd!r}\n{r.stderr}"
-                )
-            continue
 
-        r = subprocess.run(
-            ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"Warmup command failed: {cmd!r}\n{r.stderr}")
+        attempts = 0
+        while True:
+            attempts += 1
+            if detach_background and stripped_cmd.endswith("&"):
+                background_cmd = stripped_cmd[:-1].strip()
+                log_path = f"/tmp/wildclaw_warmup_{idx}.log"
+                wrapped = (
+                    f"cd {TMP_WORKSPACE} && "
+                    f"nohup /bin/bash -lc {shlex.quote(background_cmd)} "
+                    f"> {shlex.quote(log_path)} 2>&1 < /dev/null &"
+                )
+                r = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-lc", wrapped],
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                r = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
+                    capture_output=True, text=True,
+                )
+
+            if r.returncode != 0:
+                stderr = (r.stderr or "").strip()
+                stdout = (r.stdout or "").strip()
+                if max_retries > 0 and attempts > max_retries:
+                    raise RuntimeError(
+                        f"Warmup command failed after {attempts} attempts: {cmd!r}\n"
+                        f"stdout:\n{stdout}\n\nstderr:\n{stderr}"
+                    )
+                logger.warning(
+                    "[%s] Warmup command failed (command %d/%d, attempt %d, rc=%d); retrying in %.1fs: %s\nstdout: %s\nstderr: %s",
+                    task_id,
+                    idx,
+                    len(commands),
+                    attempts,
+                    r.returncode,
+                    retry_delay,
+                    cmd,
+                    stdout[-1000:],
+                    stderr[-1000:],
+                )
+                time.sleep(max(0.0, retry_delay))
+                continue
+
+            if attempts > 1:
+                logger.info(
+                    "[%s] Warmup command succeeded after %d attempts: %s",
+                    task_id,
+                    attempts,
+                    cmd,
+                )
+            break
 
 
 def run_background(task_id: str, bash_cmd: str, log_path: Path) -> subprocess.Popen:
