@@ -35,6 +35,12 @@ ENCRYPTED_CONTENT_ERROR_MARKER = "invalid_encrypted_content"
 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = int(
     os.environ.get("CODEX_ENCRYPTED_CONTENT_RESUME_ATTEMPTS", "0")
 )
+ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES = int(
+    os.environ.get("CODEX_ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES", "3")
+)
+ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS = float(
+    os.environ.get("CODEX_ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS", "600")
+)
 CODEX_LOG_NOISE_MARKERS = (
     "ReasoningRawContentDelta without active item",
 )
@@ -739,6 +745,7 @@ if __name__ == "__main__":
         started = time.perf_counter()
         excluded_retry_time = 0.0
         resume_session_id: str | None = None
+        consecutive_encrypted_content_failures = 0
         attempt = 0
 
         while True:
@@ -781,6 +788,7 @@ if __name__ == "__main__":
                     f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
 
+            consecutive_encrypted_content_failures += 1
             if is_resume:
                 excluded_retry_time += attempt_elapsed
 
@@ -794,6 +802,35 @@ if __name__ == "__main__":
                 resume_session_id = self._find_latest_session_id(task_id)
 
             resume_no = attempt + 1
+            if (
+                consecutive_encrypted_content_failures >= ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES
+                and ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS > 0
+            ):
+                delay_started = time.perf_counter()
+                append_agent_log_event(
+                    output_dir,
+                    {
+                        "type": "runner.resume_delay",
+                        "reason": ENCRYPTED_CONTENT_ERROR_MARKER,
+                        "message": (
+                            "Repeated invalid_encrypted_content errors; delaying "
+                            "before the next same-session resume attempt."
+                        ),
+                        "consecutive_failures": consecutive_encrypted_content_failures,
+                        "delay_seconds": ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS,
+                        "resume_attempt": resume_no,
+                        "resume_session_id": resume_session_id or "last",
+                    },
+                )
+                logger.warning(
+                    "[%s] Codex invalid_encrypted_content repeated %d times; sleeping %.1fs before resume",
+                    task_id,
+                    consecutive_encrypted_content_failures,
+                    ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS,
+                )
+                time.sleep(ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS)
+                excluded_retry_time += time.perf_counter() - delay_started
+
             max_resume_attempts: int | str = (
                 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
                 if DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
