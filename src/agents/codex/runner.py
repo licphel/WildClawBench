@@ -27,9 +27,14 @@ CODEX_HOME = "/root/.codex"
 CODEX_SESSIONS_DIR = f"{CODEX_HOME}/sessions"
 CODEX_CONFIG_PATH = f"{CODEX_HOME}/config.toml"
 CODEX_SKILLS_DIR = f"{CODEX_HOME}/skills"
+CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
+ENCRYPTED_CONTENT_ERROR_MARKER = "invalid_encrypted_content"
+DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = int(
+    os.environ.get("CODEX_ENCRYPTED_CONTENT_RESUME_ATTEMPTS", "0")
+)
 CODEX_LOG_NOISE_MARKERS = (
     "ReasoningRawContentDelta without active item",
 )
@@ -185,7 +190,7 @@ class CodexAgent(BaseAgent):
                     self._install_image_helper(task_id, spec.model)
                 snapshot_workspace_state(task_id)
                 write_execution_status(spec.output_dir, status="codex_running")
-                self._run_prompt(
+                excluded_retry_time = self._run_prompt(
                     task_id=task_id,
                     prompt=self._build_task_prompt(
                         spec.prompt,
@@ -195,7 +200,7 @@ class CodexAgent(BaseAgent):
                     timeout_seconds=spec.timeout_seconds,
                     output_dir=spec.output_dir,
                 )
-                elapsed_time = time.perf_counter() - start_time
+                elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
                 write_execution_status(
                     spec.output_dir,
                     status="finished",
@@ -728,26 +733,135 @@ if __name__ == "__main__":
         prompt: str,
         timeout_seconds: int,
         output_dir: Path,
-    ) -> None:
+    ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
-        prompt_path = prepare_codex_prompt(task_id, prompt, CODEX_PROMPT_PATH)
         log_path = output_dir / "agent.log"
-        r = self._run_codex_exec(task_id, prompt_path, timeout_seconds, log_path)
+        started = time.perf_counter()
+        excluded_retry_time = 0.0
+        resume_session_id: str | None = None
+        attempt = 0
 
-        if r.returncode == 0:
-            return
+        while True:
+            counted_elapsed = time.perf_counter() - started - excluded_retry_time
+            remaining = max(1, int(timeout_seconds - counted_elapsed))
+            is_resume = attempt > 0
+            current_prompt = (
+                prompt
+                if not is_resume
+                else self._build_same_session_resume_prompt(resume_attempt=attempt)
+            )
+            prompt_path = prepare_codex_prompt(task_id, current_prompt, CODEX_PROMPT_PATH)
+            attempt_started = time.perf_counter()
+            r = self._run_codex_exec(
+                task_id,
+                prompt_path,
+                remaining,
+                log_path,
+                append=is_resume,
+                resume=is_resume,
+                resume_session_id=resume_session_id,
+            )
+            attempt_elapsed = time.perf_counter() - attempt_started
 
-        raise RuntimeError(
-            f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
-        )
+            if r.returncode == 0:
+                return excluded_retry_time
+
+            combined = self._combined_process_output(r)
+            resume_limit_reached = (
+                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
+                and attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+            )
+            if (
+                ENCRYPTED_CONTENT_ERROR_MARKER not in combined
+                or resume_limit_reached
+            ):
+                if is_resume and ENCRYPTED_CONTENT_ERROR_MARKER in combined:
+                    excluded_retry_time += attempt_elapsed
+                raise RuntimeError(
+                    f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
+                )
+
+            if is_resume:
+                excluded_retry_time += attempt_elapsed
+
+            if remaining <= 30:
+                raise RuntimeError(
+                    "Codex run failed with invalid_encrypted_content and no useful "
+                    f"time remains for resume (rc={r.returncode}):\n{r.stderr or r.stdout}"
+                )
+
+            if not resume_session_id:
+                resume_session_id = self._find_latest_session_id(task_id)
+
+            resume_no = attempt + 1
+            max_resume_attempts: int | str = (
+                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                if DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
+                else "unlimited"
+            )
+            append_agent_log_event(
+                output_dir,
+                {
+                    "type": "runner.resume",
+                    "reason": ENCRYPTED_CONTENT_ERROR_MARKER,
+                    "message": (
+                        "Codex CLI hit invalid_encrypted_content; retrying with "
+                        "codex exec resume against the same local session."
+                    ),
+                    "resume_attempt": resume_no,
+                    "max_resume_attempts": max_resume_attempts,
+                    "remaining_timeout_seconds": remaining,
+                    "excluded_failed_resume_seconds": round(excluded_retry_time, 2),
+                    "resume_session_id": resume_session_id or "last",
+                },
+            )
+            logger.warning(
+                "[%s] Codex hit invalid_encrypted_content; retrying codex exec resume (%d/%s, session=%s)",
+                task_id,
+                resume_no,
+                max_resume_attempts,
+                resume_session_id or "last",
+            )
+            attempt += 1
 
     def _run_codex_exec(
-        self, task_id: str, prompt_path: str, timeout_seconds: int, log_path: Path
+        self,
+        task_id: str,
+        prompt_path: str,
+        timeout_seconds: int,
+        log_path: Path,
+        *,
+        append: bool = False,
+        resume: bool = False,
+        resume_session_id: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        cmd = self._build_exec_command(prompt_path)
+        cmd = (
+            self._build_resume_exec_command(
+                prompt_path,
+                session_id=resume_session_id,
+            )
+            if resume
+            else self._build_exec_command(prompt_path)
+        )
         full_cmd = ["docker", "exec", task_id, "/bin/bash", "-c", cmd]
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8", errors="replace") as log:
+        mode = "a" if append else "w"
+        with log_path.open(mode, encoding="utf-8", errors="replace") as log:
+            if append:
+                log.write(
+                    "\n"
+                    + json.dumps(
+                        {
+                            "timestamp": _now_iso(),
+                            "type": "runner.resume_start",
+                            "message": "Retrying with codex exec resume after prior failure.",
+                            "resume_session_id": resume_session_id or "last",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                log.flush()
             proc = subprocess.Popen(
                 full_cmd,
                 stdout=log,
@@ -783,6 +897,16 @@ if __name__ == "__main__":
             returncode,
             stdout=self._read_text_tail(log_path),
             stderr="",
+        )
+
+    @staticmethod
+    def _build_same_session_resume_prompt(*, resume_attempt: int) -> str:
+        return (
+            "The previous request failed with `invalid_encrypted_content`, which is "
+            "an upstream transport/session-state issue. Continue the same benchmark "
+            f"task from the current conversation and `/tmp_workspace` state. Resume "
+            f"attempt {resume_attempt}: inspect any partial files only if needed, "
+            "then finish by writing the required final outputs."
         )
 
     @staticmethod
@@ -896,6 +1020,22 @@ if __name__ == "__main__":
             "codex exec --skip-git-repo-check --cd /tmp_workspace -"
         )
 
+    def _build_resume_exec_command(
+        self,
+        prompt_path: str,
+        *,
+        session_id: str | None,
+    ) -> str:
+        resume_target = shlex.quote(session_id) if session_id else "--last"
+        return (
+            "cd /tmp_workspace && "
+            f"cat {shlex.quote(prompt_path)} | "
+            "codex exec resume --skip-git-repo-check "
+            "--dangerously-bypass-approvals-and-sandbox --json "
+            f"--output-last-message {shlex.quote(CODEX_LAST_MESSAGE_PATH)} "
+            f"{resume_target} -"
+        )
+
     def _build_find_latest_session_command(self) -> str:
         return (
             f"find {CODEX_SESSIONS_DIR} -type f -name '*.jsonl' "
@@ -917,6 +1057,45 @@ if __name__ == "__main__":
         )
         name = (r.stdout or "").strip().splitlines()[0] if r.stdout else ""
         return name or None
+
+    def _find_latest_session_id(self, task_id: str) -> str | None:
+        latest = self._find_latest_session(task_id)
+        if not latest:
+            return None
+
+        r = subprocess.run(
+            [
+                "docker",
+                "exec",
+                task_id,
+                "/bin/bash",
+                "-lc",
+                f"cat {shlex.quote(f'{CODEX_SESSIONS_DIR}/{latest}')}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "[%s] Could not read latest Codex session id: %s",
+                task_id,
+                r.stderr.strip(),
+            )
+            return None
+
+        for raw in (r.stdout or "").splitlines():
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "session_meta":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                session_id = payload.get("id")
+                if isinstance(session_id, str) and session_id.strip():
+                    return session_id.strip()
+        return None
 
     def _copy_file_from_container(self, task_id: str, src: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
