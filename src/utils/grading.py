@@ -8,10 +8,13 @@ import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 
+from src.utils.transient_errors import is_transient_error
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE", "/tmp_workspace")
+MAX_GRADING_RETRIES = 2
 
 def _write_score(output_dir: Path, task_id: str, scores: dict) -> None:
     score_path = output_dir / "score.json"
@@ -127,19 +130,33 @@ def run_grading(
             masked = value[:4] + "***"
             logger.info("[%s] Injecting grading lobster env: %s=%s", task_id, key, masked)
 
-        r = subprocess.run(
-            ["docker", "exec", *env_args, task_id, "python3", "/tmp/_grade_runner.py"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if r.returncode != 0:
-            logger.error("[%s] Grading script execution failed: %s", task_id, r.stderr)
-            return _grading_error(
-                output_dir,
-                task_id,
-                f"grade script failed: {r.stderr}",
-                write_error_score,
+        # Some tasks' grade() functions call an LLM judge over the same relay
+        # (OPENROUTER_API_KEY/BASE_URL, injected above) that the agent itself
+        # uses — subject to the same transient upstream hiccups. Grading is
+        # read-only over an already-collected transcript/workspace, so
+        # re-running it is safe and idempotent; retry it in place rather than
+        # letting one relay blip silently zero out an otherwise-good task.
+        r = None
+        for attempt in range(1, MAX_GRADING_RETRIES + 2):
+            r = subprocess.run(
+                ["docker", "exec", *env_args, task_id, "python3", "/tmp/_grade_runner.py"],
+                capture_output=True,
+                text=True,
+                timeout=3000,
+            )
+            if r.returncode == 0:
+                break
+            if not is_transient_error(r.stderr) or attempt == MAX_GRADING_RETRIES + 1:
+                logger.error("[%s] Grading script execution failed: %s", task_id, r.stderr)
+                return _grading_error(
+                    output_dir,
+                    task_id,
+                    f"grade script failed: {r.stderr}",
+                    write_error_score,
+                )
+            logger.warning(
+                "[%s] Grading script hit a transient error (attempt %d/%d), retrying: %s",
+                task_id, attempt, MAX_GRADING_RETRIES + 1, r.stderr[:300],
             )
 
         try:

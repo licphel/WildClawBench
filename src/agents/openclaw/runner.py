@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.docker_utils import (
+    close_proc_log,
     inject_lobster_workspace,
     inject_openclaw_models,
     run_background,
@@ -20,10 +22,36 @@ from src.utils.docker_utils import (
     setup_workspace,
     start_container,
 )
+from src.utils.transient_errors import is_transient_error
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# `openclaw agent` exits 0 even when the embedded run itself failed (e.g. the
+# upstream model provider returning a transient error) — it only logs
+# `isError=true ... error=<message>` to gateway.log and ends the session with
+# no output. Left unchecked, run_batch.py records this as a clean, low/zero
+# score with no error, which also makes it invisible to the transient-error
+# retries below. Scan gateway.log for that marker so the failure surfaces as
+# a real execution error instead.
+_EMBEDDED_RUN_ERROR_RE = re.compile(r"embedded run agent end:.*isError=true.*?error=(.+)$", re.MULTILINE)
+
+MAX_INNER_RETRIES = 2
+
+
+def _embedded_run_error_in(text: str) -> str | None:
+    match = _EMBEDDED_RUN_ERROR_RE.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _read_new_content(path: Path, from_offset: int) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(from_offset)
+            return f.read()
+    except OSError:
+        return ""
 
 
 class OpenClawAgent(BaseAgent):
@@ -91,33 +119,76 @@ class OpenClawAgent(BaseAgent):
             logger.info("[%s] Waiting for gateway to be ready (2s)...", spec.task_id)
             time.sleep(2)
 
+            gateway_log_path = spec.output_dir / "gateway.log"
             safe_prompt = spec.prompt.replace("'", "'\\''")
             start_time = time.perf_counter()
-            agent_proc = run_background(
-                spec.task_id,
-                bash_cmd=f"openclaw agent --session-id chat --timeout {spec.timeout_seconds} --message '{safe_prompt}'",
-                log_path=spec.output_dir / "agent.log",
-            )
-
-            logger.info("[%s] Waiting for agent to finish...", spec.task_id)
-            try:
-                agent_proc.wait(timeout=spec.timeout_seconds)
-                elapsed_time = time.perf_counter() - start_time
-                logger.info(
-                    "[%s] Agent finished successfully, elapsed: %.2f seconds",
-                    spec.task_id,
-                    elapsed_time,
+            deadline = start_time + spec.timeout_seconds
+            total_attempts = MAX_INNER_RETRIES + 1
+            attempt = 1
+            embedded_error = None
+            timed_out = False
+            while True:
+                remaining = max(1, int(deadline - time.perf_counter()))
+                agent_log_path = spec.output_dir / (
+                    "agent.log" if attempt == 1 else f"agent.retry{attempt}.log"
                 )
-            except subprocess.TimeoutExpired:
-                logger.info("[%s] Agent timed out...", spec.task_id)
-                elapsed_time = float(spec.timeout_seconds)
-                agent_proc.kill()
-                agent_proc.wait()
+                offset_before = gateway_log_path.stat().st_size if gateway_log_path.exists() else 0
+                agent_proc = run_background(
+                    spec.task_id,
+                    bash_cmd=f"openclaw agent --session-id chat --timeout {remaining} --message '{safe_prompt}'",
+                    log_path=agent_log_path,
+                )
 
-            logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)
+                logger.info("[%s] Waiting for agent to finish (attempt %d/%d)...", spec.task_id, attempt, total_attempts)
+                try:
+                    agent_proc.wait(timeout=remaining)
+                    elapsed_time = time.perf_counter() - start_time
+                    logger.info(
+                        "[%s] Agent finished, elapsed: %.2f seconds (attempt %d)",
+                        spec.task_id, elapsed_time, attempt,
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.info("[%s] Agent timed out...", spec.task_id)
+                    elapsed_time = float(spec.timeout_seconds)
+                    agent_proc.kill()
+                    agent_proc.wait()
+                    timed_out = True
+
+                close_proc_log(agent_proc)
+                logger.info("[%s] Agent exit code: %s (attempt %d)", spec.task_id, agent_proc.returncode, attempt)
+
+                if timed_out:
+                    break
+
+                embedded_error = _embedded_run_error_in(_read_new_content(gateway_log_path, offset_before))
+                if not embedded_error:
+                    break
+                if not is_transient_error(embedded_error):
+                    logger.warning(
+                        "[%s] Embedded run failed with a non-transient error, not retrying in-container: %s",
+                        spec.task_id, embedded_error,
+                    )
+                    break
+                if attempt >= total_attempts or time.perf_counter() >= deadline:
+                    logger.warning(
+                        "[%s] Transient embedded-run error, out of in-container retries/time budget: %s",
+                        spec.task_id, embedded_error,
+                    )
+                    break
+                logger.warning(
+                    "[%s] Transient embedded-run error (attempt %d/%d), retrying in the same container: %s",
+                    spec.task_id, attempt, total_attempts, embedded_error,
+                )
+                attempt += 1
+
+            if embedded_error and not timed_out:
+                logger.warning(
+                    "[%s] Embedded run failed despite exit code 0: %s",
+                    spec.task_id, embedded_error,
+                )
             return AgentExecution(
                 elapsed_time=elapsed_time,
-                error=None,
+                error=embedded_error if not timed_out else None,
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
             )

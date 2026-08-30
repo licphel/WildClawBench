@@ -18,6 +18,7 @@ from src.agents.base import AgentTaskSpec, BaseAgent
 from src.agents.claudecode import ClaudeCodeAgent
 from src.agents.codex import CodexAgent
 from src.agents.openclaw import OpenClawAgent
+from src.agents.pylm import PyLMAgent
 from src.utils.cli_args import parse_run_batch_args
 from src.utils.endpoint_utils import (
     normalize_openrouter_base_url_for_claudecode,
@@ -37,6 +38,7 @@ from src.utils.grading import (
     print_global_summary,
     write_error_score as write_error_score_file,
 )
+from src.utils.transient_errors import is_transient_error
 
 load_dotenv()
 logging.basicConfig(
@@ -240,7 +242,17 @@ def run_single_task(
 
     finally:
         grading_transcript_path = backend.transcript_container_path
-        grade_on_error = isinstance(backend, (CodexAgent, ClaudeCodeAgent))
+        # OpenClawAgent previously never set result["error"] (openclaw/runner.py
+        # returned error=None unconditionally), so "not result.get('error')" was
+        # always true for it and grading always ran. Now that runner.py surfaces
+        # embedded-run failures (e.g. an upstream provider hiccup) as a real
+        # error — so run_single_task_with_retry can detect and retry them —
+        # OpenClawAgent needs grade_on_error=True too, or it would silently skip
+        # grading on that path and leave the task with empty scores instead of
+        # the real (near-)zero breakdown it always got before.
+        grade_on_error = isinstance(
+            backend, (CodexAgent, ClaudeCodeAgent, OpenClawAgent, PyLMAgent)
+        )
         should_grade = task.get("automated_checks") and (
             not result.get("error") or grade_on_error
         )
@@ -277,7 +289,9 @@ def run_single_task(
             collect_task_output(
                 task_id,
                 output_dir,
-                include_workspace_changes=isinstance(backend, (CodexAgent, ClaudeCodeAgent)),
+                include_workspace_changes=isinstance(
+                    backend, (CodexAgent, ClaudeCodeAgent, PyLMAgent)
+                ),
             )
         except Exception as exc:
             logger.warning("[%s] Failed to collect task output: %s", task_id, exc)
@@ -298,8 +312,41 @@ def run_single_task(
                     pass
 
         remove_container(task_id)
+        if isinstance(backend, PyLMAgent):
+            backend.cleanup_staging(task_id)
         logger.info("[%s] Container cleaned up", task_id)
 
+    return result
+
+
+# Infra-level hiccups (npm registry connection reset mid-download, upstream LLM
+# provider returning a transient 5xx-style error) have nothing to do with agent
+# capability. Most of these (specifically the LLM-provider kind) are now retried
+# cheaply in-place by OpenClawAgent.run_task itself, reusing the same container
+# / gateway / session (src/agents/openclaw/runner.py) — that should resolve the
+# common case without ever reaching here. This is the fallback for whatever
+# survives that: non-agent-level failures (docker start, warmup) that can only
+# raise once from run_single_task, or an embedded-run error that stayed
+# transient through all of OpenClawAgent's in-container attempts. Rebuilding
+# the whole container is expensive, so only one fallback attempt.
+MAX_TRANSIENT_RETRIES = 1
+
+
+def run_single_task_with_retry(*args, **kwargs) -> dict:
+    """run_single_task, retried on known-transient infra errors.
+
+    Each attempt gets its own output_dir (fresh run_id from run_single_task),
+    so a retry never clobbers a prior attempt's artifacts.
+    """
+    result = run_single_task(*args, **kwargs)
+    attempt = 1
+    while is_transient_error(result.get("error")) and attempt <= MAX_TRANSIENT_RETRIES:
+        logger.warning(
+            "[%s] Transient error survived in-container retries, rebuilding container (attempt %d/%d): %s",
+            result.get("task_id"), attempt, MAX_TRANSIENT_RETRIES, result.get("error"),
+        )
+        result = run_single_task(*args, **kwargs)
+        attempt += 1
     return result
 
 
@@ -321,6 +368,8 @@ def main() -> None:
             openrouter_api_key=OPENROUTER_API_KEY,
             openrouter_base_url=OPENROUTER_BASE_URL_OPENCLAW,
         )
+    elif args.agent_backend == "pylm":
+        backend = PyLMAgent()
     else:
         backend = OpenClawAgent(
             gateway_port=GATEWAY_PORT,
@@ -366,7 +415,7 @@ def main() -> None:
             sys.exit(1)
         task = parse_task_md(task_file)
         logger.info("Single task mode: %s", task["task_id"])
-        result = run_single_task(
+        result = run_single_task_with_retry(
             task,
             args.model,
             backend=backend,
@@ -414,7 +463,7 @@ def main() -> None:
         if args.parallel <= 1:
             for task in tasks:
                 results.append(
-                    run_single_task(
+                    run_single_task_with_retry(
                         task,
                         args.model,
                         backend=backend,
@@ -428,7 +477,7 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.parallel) as pool:
                 futures = {
                     pool.submit(
-                        run_single_task,
+                        run_single_task_with_retry,
                         task,
                         args.model,
                         backend,
