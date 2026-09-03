@@ -325,6 +325,10 @@ class HermesAgentAgent(BaseAgent):
     def _configure_hermes(self, task_id: str, api_key: str = "", base_url: str = "") -> None:
         """Configure hermes-agent inside the container with one consistent provider config."""
         hermes_yaml = (
+            "model:\n"
+            "  context_length: 128000\n"
+            "auxiliary:\n"
+            "  enabled: false\n"
             "tools:\n"
             "  profile: coding\n"
             "  web:\n"
