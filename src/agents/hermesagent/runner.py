@@ -29,6 +29,8 @@ HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "wildclawbench-hermes-agent
 HERMES_HOME = "/root/.hermes"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
+HERMES_RESUME_ATTEMPTS = int(os.environ.get("HERMES_RESUME_ATTEMPTS", "0"))
+HERMES_RETRY_DELAY_SECONDS = float(os.environ.get("HERMES_RETRY_DELAY_SECONDS", "2"))
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 BENCH_RUNNER_HOST_PATH = Path(__file__).with_name("bench_runner.py")
@@ -103,25 +105,46 @@ class HermesAgentAgent(BaseAgent):
 
             start_time = time.perf_counter()
 
-            agent_proc = self._run_bench_runner_background(
-                task_id=spec.task_id,
-                log_path=spec.output_dir / "agent.log",
-            )
-
-            logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
-            try:
-                agent_proc.wait(timeout=spec.timeout_seconds)
-                elapsed_time = time.perf_counter() - start_time
-                logger.info(
-                    "[%s] hermes-agent finished, elapsed: %.2f seconds",
-                    spec.task_id,
-                    elapsed_time,
+            excluded_retry_time = 0.0
+            resume_attempt = 0
+            while True:
+                agent_proc = self._run_bench_runner_background(
+                    task_id=spec.task_id,
+                    log_path=spec.output_dir / "agent.log",
+                    append=resume_attempt > 0,
+                    resume=resume_attempt > 0,
                 )
-            except subprocess.TimeoutExpired:
-                logger.info("[%s] hermes-agent timed out...", spec.task_id)
-                elapsed_time = float(spec.timeout_seconds)
-                agent_proc.kill()
-                agent_proc.wait()
+                counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
+                remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
+                logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
+                attempt_started = time.perf_counter()
+                try:
+                    agent_proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    logger.info("[%s] hermes-agent timed out...", spec.task_id)
+                    elapsed_time = float(spec.timeout_seconds)
+                    agent_proc.kill()
+                    agent_proc.wait()
+                    break
+                attempt_elapsed = time.perf_counter() - attempt_started
+                self._close_runner_streams(agent_proc)
+                if agent_proc.returncode == 0:
+                    elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
+                    break
+                excluded_retry_time += attempt_elapsed
+                if HERMES_RESUME_ATTEMPTS > 0 and resume_attempt >= HERMES_RESUME_ATTEMPTS:
+                    raise RuntimeError(f"Hermes runner failed (rc={agent_proc.returncode})")
+                if remaining <= 30:
+                    raise RuntimeError("Hermes runner failed and no useful time remains for resume")
+                if HERMES_RETRY_DELAY_SECONDS > 0:
+                    delay_started = time.perf_counter()
+                    time.sleep(HERMES_RETRY_DELAY_SECONDS)
+                    excluded_retry_time += time.perf_counter() - delay_started
+                resume_attempt += 1
+                logger.warning(
+                    "[%s] Hermes runner exited non-zero; retrying same session (%s/%s)",
+                    spec.task_id, resume_attempt, HERMES_RESUME_ATTEMPTS or "unlimited",
+                )
             self._close_runner_streams(agent_proc)
 
             logger.info("[%s] hermes-agent exit code: %s", spec.task_id, agent_proc.returncode)
@@ -376,6 +399,7 @@ class HermesAgentAgent(BaseAgent):
                 "base_url": base_url,
                 "max_iterations": 90,
                 "reasoning_config": reasoning_config,
+                "session_id": f"wildclaw-{task_id}",
             },
             "prompt": prompt,
         }
@@ -399,12 +423,14 @@ class HermesAgentAgent(BaseAgent):
                 if p:
                     Path(p).unlink(missing_ok=True)
 
-    def _run_bench_runner_background(self, task_id: str, log_path: Path) -> subprocess.Popen[str]:
+    def _run_bench_runner_background(
+        self, task_id: str, log_path: Path, append: bool = False, resume: bool = False
+    ) -> subprocess.Popen[str]:
         if not BENCH_RUNNER_HOST_PATH.exists():
             raise RuntimeError(f"Hermes bench runner script not found: {BENCH_RUNNER_HOST_PATH}")
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file = log_path.open("w", encoding="utf-8")
+        log_file = log_path.open("a" if append else "w", encoding="utf-8")
         script_file = BENCH_RUNNER_HOST_PATH.open("r", encoding="utf-8")
         proc = subprocess.Popen(
             [
@@ -414,7 +440,9 @@ class HermesAgentAgent(BaseAgent):
                 task_id,
                 "/bin/bash",
                 "-c",
-                f"cd {HERMES_INSTALL_DIR} && {HERMES_VENV_PYTHON} -",
+                f"cd {HERMES_INSTALL_DIR} && "
+                f"WILDCLAW_HERMES_RESUME={'1' if resume else ''} "
+                f"{HERMES_VENV_PYTHON} -",
             ],
             stdin=script_file,
             stdout=log_file,

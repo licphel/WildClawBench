@@ -23,6 +23,18 @@ logger = logging.getLogger(__name__)
 CLAUDECODE_SKILLS_DIR = "/root/.claude/skills"
 CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
+CLAUDECODE_RESUME_ATTEMPTS = int(os.environ.get("CLAUDECODE_RESUME_ATTEMPTS", "0"))
+CLAUDECODE_RETRY_DELAY_SECONDS = float(os.environ.get("CLAUDECODE_RETRY_DELAY_SECONDS", "2"))
+CLAUDECODE_PROVIDER_ERROR_MARKERS = (
+    "insufficient quota",
+    "no available channel",
+    "invalid_encrypted_content",
+    "peer closed connection",
+    "incomplete chunked read",
+    "read operation timed out",
+    "api error: 5",
+    "http 429",
+)
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -154,14 +166,14 @@ class ClaudeCodeAgent(BaseAgent):
             )
             run_warmup(task_id, spec.task.get("warmup", ""))
             snapshot_workspace_state(task_id)
-            self._run_prompt(
+            excluded_retry_time = self._run_prompt(
                 task_id,
                 spec.prompt,
                 spec.model,
                 spec.timeout_seconds,
                 spec.output_dir,
             )
-            elapsed_time = time.perf_counter() - start_time
+            elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
             return AgentExecution(elapsed_time=elapsed_time, error=None, gateway_proc=None, agent_proc=None)
         except subprocess.TimeoutExpired:
             logger.info("[%s] ClaudeCode timed out...", task_id)
@@ -461,27 +473,67 @@ PY"""
         if r_cp.returncode != 0:
             raise RuntimeError(f"ClaudeCode tmp copy failed:\n{r_cp.stderr}")
 
-    def _run_prompt(self, task_id: str, prompt: str, model: str, timeout_seconds: int, output_dir: Path) -> None:
+    def _run_prompt(self, task_id: str, prompt: str, model: str, timeout_seconds: int, output_dir: Path) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
-        cmd = (
-            f"cd /claude_code && "
-            f"IS_SANDBOX=1 ./start.sh "
-            f"--add-dir /tmp_workspace "
-            f"-p {shlex.quote(prompt)} "
-            f"--model {shlex.quote(model)}"
-        )
-        r = subprocess.run(
-            ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        (output_dir / "agent.log").write_text(
-            (r.stdout or "") + ("\n" if r.stdout else "") + (r.stderr or ""),
-            encoding="utf-8",
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}):\n{r.stderr}")
+        started = time.perf_counter()
+        excluded_retry_time = 0.0
+        attempt = 0
+        while True:
+            counted_elapsed = time.perf_counter() - started - excluded_retry_time
+            remaining = max(1, int(timeout_seconds - counted_elapsed))
+            is_resume = attempt > 0
+            current_prompt = prompt if not is_resume else (
+                "Continue the interrupted task from the current session. "
+                "Inspect the existing workspace and finish the required outputs."
+            )
+            resume_flag = "--continue " if is_resume else ""
+            cmd = (
+                f"cd /claude_code && IS_SANDBOX=1 ./start.sh {resume_flag}"
+                f"--add-dir /tmp_workspace -p {shlex.quote(current_prompt)} "
+                f"--model {shlex.quote(model)}"
+            )
+            attempt_started = time.perf_counter()
+            try:
+                r = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                )
+            except subprocess.TimeoutExpired:
+                raise
+            attempt_elapsed = time.perf_counter() - attempt_started
+            output = (r.stdout or "") + ("\n" if r.stdout and r.stderr else "") + (r.stderr or "")
+            log_path = output_dir / "agent.log"
+            with log_path.open("a" if is_resume else "w", encoding="utf-8") as log:
+                if is_resume:
+                    log.write(json.dumps({
+                        "type": "runner.resume_start",
+                        "resume_attempt": attempt,
+                        "message": "Retrying ClaudeCode with --continue in the same session.",
+                    }) + "\n")
+                log.write(output)
+                if output and not output.endswith("\n"):
+                    log.write("\n")
+            provider_error = any(marker in output.lower() for marker in CLAUDECODE_PROVIDER_ERROR_MARKERS)
+            if r.returncode == 0 and not provider_error:
+                return excluded_retry_time
+            excluded_retry_time += attempt_elapsed
+            if CLAUDECODE_RESUME_ATTEMPTS > 0 and attempt >= CLAUDECODE_RESUME_ATTEMPTS:
+                raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")
+            if remaining <= 30:
+                raise RuntimeError(
+                    f"ClaudeCode run failed and no useful time remains for resume (rc={r.returncode}):\n{output}"
+                )
+            if CLAUDECODE_RETRY_DELAY_SECONDS > 0:
+                delay_started = time.perf_counter()
+                time.sleep(CLAUDECODE_RETRY_DELAY_SECONDS)
+                excluded_retry_time += time.perf_counter() - delay_started
+            attempt += 1
+            logger.warning(
+                "[%s] ClaudeCode exited non-zero; retrying --continue (%s/%s)",
+                task_id, attempt, CLAUDECODE_RESUME_ATTEMPTS or "unlimited",
+            )
 
     def _extract_usage_from_logs(self, log_dir: Path) -> dict[str, Any]:
         totals = {

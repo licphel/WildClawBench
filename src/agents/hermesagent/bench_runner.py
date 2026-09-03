@@ -17,6 +17,11 @@ def main() -> int:
     data = json.loads(open(BENCH_CONFIG_PATH, encoding="utf-8").read())
     cfg = data["config"]
     prompt = data["prompt"]
+    if os.environ.get("WILDCLAW_HERMES_RESUME"):
+        prompt = (
+            "Continue the interrupted task from the current session. "
+            "Inspect the existing workspace and finish the required outputs."
+        )
 
     agent = AIAgent(
         model=cfg["model"],
@@ -26,11 +31,12 @@ def main() -> int:
         save_trajectories=True,
         verbose_logging=True,
         reasoning_config=cfg.get("reasoning_config"),
+        session_id=cfg.get("session_id"),
     )
     result = agent.run_conversation(prompt)
     print("Completed:", result.get("completed"))
     print("API calls:", result.get("api_calls"))
-    return 0
+    return 0 if result.get("completed", False) else 1
 
 
 if __name__ == "__main__":
