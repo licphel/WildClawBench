@@ -155,7 +155,7 @@ class ClaudeCodeAgent(BaseAgent):
         task_id = spec.task_id
 
         try:
-            self._start_container(task_id, spec.workspace_path)
+            self._start_container(task_id, spec.workspace_path, small_fast_model=spec.model)
             self._prepare_workspace(task_id)
             self._copy_tmp_files(task_id, spec.workspace_path)
             setup_skills(
@@ -368,12 +368,18 @@ class ClaudeCodeAgent(BaseAgent):
         if r.returncode != 0:
             logger.warning("[%s] ClaudeCode log dir copy failed: %s", task_id, r.stderr.strip())
 
-    def _start_container(self, task_id: str, workspace_path: str) -> None:
+    def _start_container(
+        self, task_id: str, workspace_path: str, small_fast_model: str = ""
+    ) -> None:
         proxy_http = os.environ.get("HTTP_PROXY_INNER", "")
         proxy_https = os.environ.get("HTTPS_PROXY_INNER", "")
         env_map = {
             "ANTHROPIC_API_KEY": self.api_key,
             "ANTHROPIC_BASE_URL": self.api_base_url,
+            # ClaudeCode's built-in WebSearchTool and other side queries use
+            # getSmallFastModel(); route them through the benchmark model.
+            "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model
+            or os.environ.get("ANTHROPIC_SMALL_FAST_MODEL", ""),
             "OPENROUTER_API_KEY": self.api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
             "DISABLE_PROMPT_CACHING": os.environ.get("DISABLE_PROMPT_CACHING", "1"),
