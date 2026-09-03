@@ -328,7 +328,22 @@ class HermesAgentAgent(BaseAgent):
             "model:\n"
             "  context_length: 128000\n"
             "auxiliary:\n"
-            "  enabled: false\n"
+            "  compression:\n"
+            "    provider: disabled\n"
+            "  web_extract:\n"
+            "    provider: disabled\n"
+            "  vision:\n"
+            "    provider: disabled\n"
+            "  browser_vision:\n"
+            "    provider: disabled\n"
+            "  session_search:\n"
+            "    provider: disabled\n"
+            "  skills_hub:\n"
+            "    provider: disabled\n"
+            "  mcp:\n"
+            "    provider: disabled\n"
+            "  title_generation:\n"
+            "    provider: disabled\n"
             "tools:\n"
             "  profile: coding\n"
             "  web:\n"
@@ -366,6 +381,7 @@ class HermesAgentAgent(BaseAgent):
 
             for src, dst in (
                 (yaml_host, f"{HERMES_HOME}/hermes.yaml"),
+                (yaml_host, f"{HERMES_HOME}/config.yaml"),
                 (env_host, f"{HERMES_HOME}/.env"),
             ):
                 copied = subprocess.run(
