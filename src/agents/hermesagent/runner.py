@@ -31,6 +31,11 @@ HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
 HERMES_RESUME_ATTEMPTS = int(os.environ.get("HERMES_RESUME_ATTEMPTS", "0"))
 HERMES_RETRY_DELAY_SECONDS = float(os.environ.get("HERMES_RETRY_DELAY_SECONDS", "2"))
+HERMES_ERROR_MARKERS = (
+    "invalid_encrypted_content",
+    "encrypted content could not be verified",
+    "non-retryable client error",
+)
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 BENCH_RUNNER_HOST_PATH = Path(__file__).with_name("bench_runner.py")
@@ -108,6 +113,11 @@ class HermesAgentAgent(BaseAgent):
             excluded_retry_time = 0.0
             resume_attempt = 0
             while True:
+                log_offset = (
+                    spec.output_dir.joinpath("agent.log").stat().st_size
+                    if spec.output_dir.joinpath("agent.log").exists()
+                    else 0
+                )
                 agent_proc = self._run_bench_runner_background(
                     task_id=spec.task_id,
                     log_path=spec.output_dir / "agent.log",
@@ -118,17 +128,44 @@ class HermesAgentAgent(BaseAgent):
                 remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
                 logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
                 attempt_started = time.perf_counter()
+                encrypted_error_seen = False
                 try:
-                    agent_proc.wait(timeout=remaining)
+                    deadline = time.perf_counter() + remaining
+                    while True:
+                        try:
+                            agent_proc.wait(timeout=min(1.0, max(0.05, deadline - time.perf_counter())))
+                            break
+                        except subprocess.TimeoutExpired:
+                            if self._log_contains_marker(
+                                spec.output_dir / "agent.log", log_offset, HERMES_ERROR_MARKERS
+                            ):
+                                encrypted_error_seen = True
+                                logger.warning(
+                                    "[%s] Hermes provider error detected; stopping current run for session resume",
+                                    spec.task_id,
+                                )
+                                agent_proc.terminate()
+                                try:
+                                    agent_proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    agent_proc.kill()
+                                    agent_proc.wait()
+                                break
+                            if time.perf_counter() >= deadline:
+                                raise
                 except subprocess.TimeoutExpired:
                     logger.info("[%s] hermes-agent timed out...", spec.task_id)
                     elapsed_time = float(spec.timeout_seconds)
                     agent_proc.kill()
                     agent_proc.wait()
                     break
+                if not encrypted_error_seen:
+                    encrypted_error_seen = self._log_contains_marker(
+                        spec.output_dir / "agent.log", log_offset, HERMES_ERROR_MARKERS
+                    )
                 attempt_elapsed = time.perf_counter() - attempt_started
                 self._close_runner_streams(agent_proc)
-                if agent_proc.returncode == 0:
+                if agent_proc.returncode == 0 and not encrypted_error_seen:
                     elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
                     break
                 excluded_retry_time += attempt_elapsed
@@ -142,8 +179,10 @@ class HermesAgentAgent(BaseAgent):
                     excluded_retry_time += time.perf_counter() - delay_started
                 resume_attempt += 1
                 logger.warning(
-                    "[%s] Hermes runner exited non-zero; retrying same session (%s/%s)",
-                    spec.task_id, resume_attempt, HERMES_RESUME_ATTEMPTS or "unlimited",
+                    "[%s] Hermes runner exited non-zero%s; retrying same session (%s/%s)",
+                    spec.task_id,
+                    " after provider error" if encrypted_error_seen else "",
+                    resume_attempt, HERMES_RESUME_ATTEMPTS or "unlimited",
                 )
             self._close_runner_streams(agent_proc)
 
@@ -509,6 +548,16 @@ class HermesAgentAgent(BaseAgent):
                 stream.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _log_contains_marker(log_path: Path, offset: int, markers: tuple[str, ...]) -> bool:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                text = log.read().lower()
+        except OSError:
+            return False
+        return any(marker in text for marker in markers)
 
     @staticmethod
     def _cleanup_bench_config(task_id: str) -> None:
