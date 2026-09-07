@@ -439,7 +439,7 @@ class HermesAgentAgent(BaseAgent):
         task_id: str,
         api_key: str = "",
         base_url: str = "",
-        model: str = "gpt-5.4",
+        model: str = "",
     ) -> None:
         """Configure hermes-agent inside the container with one consistent provider config."""
         hermes_yaml = self._build_hermes_yaml(model, api_key, base_url)

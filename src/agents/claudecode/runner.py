@@ -478,7 +478,11 @@ class ClaudeCodeAgent(BaseAgent):
             or os.environ.get("ANTHROPIC_SMALL_FAST_MODEL", ""),
             "OPENROUTER_API_KEY": self.api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
-            "DISABLE_PROMPT_CACHING": os.environ.get("DISABLE_PROMPT_CACHING", "1"),
+            # Not defaulted on: the env map below only injects truthy values, so
+            # leaving this empty lets the CLI keep its own prompt caching,
+            # which a default of "1" was disabling for every trial. Still
+            # settable from outside when a run wants caching off.
+            "DISABLE_PROMPT_CACHING": os.environ.get("DISABLE_PROMPT_CACHING", ""),
             "DISABLE_INTERLEAVED_THINKING": os.environ.get("DISABLE_INTERLEAVED_THINKING", "1"),
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": os.environ.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1"),
             "IS_SANDBOX": os.environ.get("IS_SANDBOX", "1"),
