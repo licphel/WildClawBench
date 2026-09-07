@@ -50,6 +50,63 @@ open concurrently and stamps every record with the answer: ``attribution:
 ``attribution: "overlapped"`` (recorded, but the self-reported numbers stay
 authoritative because the delta cannot be attributed to one task).
 
+Elapsed time is NOT consolidated the same way
+---------------------------------------------
+The gateway cannot supply it.  It sees request latency; ``elapsed_time`` is the
+agent's wall clock, which also covers container startup, tool execution and
+whatever else the harness put inside its own timer.  So each baseline keeps its
+own number -- and the record says which definition produced it, because the
+five definitions are not the same measurement.  Read off the runners:
+
+===========  =============================================================
+baseline     the clock
+===========  =============================================================
+claudecode   opened at ``run_task`` entry, so container start, workspace
+             prep, skills and warmup are inside it; the wrapper's own
+             retry attempts and their backoff are subtracted
+codex        same
+hermesagent  opened *after* container start, prep, skills, warmup and the
+             hermes config write -- agent only; wrapper retry subtracted
+openclaw     opened after all setup and the gateway's 2s readiness sleep --
+             agent only; nothing subtracted
+pylm         the whole ``docker exec`` of the container entrypoint, so it
+             excludes container start but includes the entrypoint's own
+             provider setup and trajectory export; nothing subtracted
+===========  =============================================================
+
+Two axes, and they do not line up:
+
+*Scope.*  claudecode and codex time the whole task including container
+startup; hermesagent, openclaw and pylm time the agent alone.
+
+*Retries.*  This is the one that bites.  Three baselines subtract the time
+their wrapper spent on retry attempts and backoff; **two do not, and their
+retries are real.**  openclaw's runner has no retry code at all (verified: no
+``retry``/``attempt``/``resume``/``transient``/loop construct in the file) --
+but the openclaw CLI reconnects inside the container, ``MAX_RETRIES = 5`` with
+1s/2s/4s/8s/16s backoff (``baselines/openclaw/src/agents/openai-ws-connection.ts``),
+and the Python wrapper cannot subtract what it never saw.  pylm is the same
+story: ``_run_container_cli`` is a bare ``perf_counter`` span around one
+``docker exec`` and perdura retries inside it (it reports ``retry_count`` and
+subtracts nothing).
+
+    claudecode   excludes wrapper retry time
+    codex        excludes
+    hermesagent  excludes
+    openclaw     INCLUDES -- retries happen in-container, invisible to the wrapper
+    pylm         INCLUDES -- perdura's internal retries, never subtracted
+
+So when the upstream is flaky, openclaw's and pylm's seconds are inflated by
+roughly the amount the other three deduct.  Note also that *no* baseline can
+subtract retries that happen inside the agent process -- a wrapper only times
+the process -- so ``includes_in_container_retry_time`` is true for all five and
+the discriminating field is ``excludes_wrapper_retry_time``.
+
+``runtime_semantics`` names which definition produced the number, so nobody
+plots five baselines' runtimes against each other without knowing that two of
+the bars include something the other three deduct.  Unifying the formulas is
+explicitly out of scope here; recording them is not.
+
 Vocabulary
 ----------
 ``usage_source`` and ``cache_semantics`` mirror ``eval_framework/run_layout.py``
@@ -112,6 +169,89 @@ SELF_REPORTED_CACHE_SEMANTICS = {
     "pylm": CACHE_SUBSET,
 }
 
+#: How each baseline defines ``elapsed_time``.  Verified against
+#: ``src/agents/<backend>/runner.py`` and, for pylm, against
+#: ``eval_framework/wildclaw_cli_runner.py::_run_container_cli``.
+RUNTIME_TASK_MINUS_RETRIES = "task_wall_clock_minus_wrapper_retries"
+RUNTIME_AGENT_MINUS_RETRIES = "agent_wall_clock_minus_wrapper_retries"
+RUNTIME_AGENT_WITH_RETRIES = "agent_wall_clock_including_retries"
+RUNTIME_CONTAINER_CLI_WITH_RETRIES = "container_cli_wall_clock_including_retries"
+RUNTIME_UNKNOWN = "unknown"
+RUNTIME_SEMANTICS_VALUES = (
+    RUNTIME_TASK_MINUS_RETRIES,
+    RUNTIME_AGENT_MINUS_RETRIES,
+    RUNTIME_AGENT_WITH_RETRIES,
+    RUNTIME_CONTAINER_CLI_WITH_RETRIES,
+    RUNTIME_UNKNOWN,
+)
+
+#: ``includes_container_setup``
+#:     whether container start, workspace prep, skills and warmup sit inside
+#:     the clock.
+#: ``excludes_wrapper_retry_time``
+#:     whether the Python wrapper subtracted the time its own retry attempts
+#:     and backoff cost.  This is the discriminating field: three baselines do,
+#:     two do not, and the two that do not still retry.
+#: ``includes_in_container_retry_time``
+#:     true for every baseline.  A wrapper times a process; retries inside that
+#:     process are inside the number and cannot be removed after the fact.
+#: ``retry_sites``
+#:     where the retries this number does or does not count actually happen.
+RUNTIME_DEFINITIONS = {
+    RUNTIME_TASK_MINUS_RETRIES: {
+        "includes_container_setup": True,
+        "excludes_wrapper_retry_time": True,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["wrapper", "in-agent"],
+        "note": "clock opens at run_task entry, before the container starts; "
+                "the wrapper's own retry attempts and backoff are subtracted, "
+                "the agent's internal ones are not",
+    },
+    RUNTIME_AGENT_MINUS_RETRIES: {
+        "includes_container_setup": False,
+        "excludes_wrapper_retry_time": True,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["wrapper", "in-agent"],
+        "note": "clock opens after container start, prep, skills and warmup; "
+                "the wrapper's own retry attempts and backoff are subtracted",
+    },
+    RUNTIME_AGENT_WITH_RETRIES: {
+        "includes_container_setup": False,
+        "excludes_wrapper_retry_time": False,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["in-agent"],
+        "note": "clock opens just before the agent process and nothing is "
+                "subtracted: the runner has no retry code, but the openclaw "
+                "CLI reconnects inside the container (MAX_RETRIES = 5, "
+                "1s/2s/4s/8s/16s backoff) and the wrapper never sees it",
+    },
+    RUNTIME_CONTAINER_CLI_WITH_RETRIES: {
+        "includes_container_setup": False,
+        "excludes_wrapper_retry_time": False,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["in-agent"],
+        "note": "the whole docker exec of the container entrypoint: excludes "
+                "container start but includes the entrypoint's provider setup "
+                "and trajectory export, and includes perdura's internal "
+                "retries (reported as retry_count, never subtracted)",
+    },
+    RUNTIME_UNKNOWN: {
+        "includes_container_setup": None,
+        "excludes_wrapper_retry_time": None,
+        "includes_in_container_retry_time": None,
+        "retry_sites": [],
+        "note": "unrecognised baseline; the definition was not read off a runner",
+    },
+}
+
+RUNTIME_SEMANTICS_BY_BASELINE = {
+    "claudecode": RUNTIME_TASK_MINUS_RETRIES,
+    "codex": RUNTIME_TASK_MINUS_RETRIES,
+    "hermesagent": RUNTIME_AGENT_MINUS_RETRIES,
+    "openclaw": RUNTIME_AGENT_WITH_RETRIES,
+    "pylm": RUNTIME_CONTAINER_CLI_WITH_RETRIES,
+}
+
 #: run_batch.py builds the agent object before it knows it will need a name for
 #: it, and HermesAgentAgent is imported lazily, so map by class name rather than
 #: by isinstance.
@@ -159,6 +299,15 @@ def self_reported_cache_semantics(backend: Any) -> str:
     default, because a wrong convention is worse than a declared absence.
     """
     return SELF_REPORTED_CACHE_SEMANTICS.get(backend_name(backend), CACHE_UNKNOWN)
+
+
+def runtime_semantics_for(backend: Any) -> str:
+    """Which ``elapsed_time`` definition a baseline uses, or ``"unknown"``.
+
+    Never guesses, for the same reason ``self_reported_cache_semantics`` does
+    not: a wrong definition is worse than a declared absence.
+    """
+    return RUNTIME_SEMANTICS_BY_BASELINE.get(backend_name(backend), RUNTIME_UNKNOWN)
 
 
 def total_tokens(usage: dict[str, Any] | None, cache_semantics: str) -> int | None:
@@ -442,6 +591,11 @@ def annotate_usage(
 
     ``cost_usd`` is left self-reported in every case: the Gateway serves a
     subscription and prices nothing, so it has no opinion to contribute.
+
+    ``elapsed_time`` likewise stays exactly as the baseline measured it -- the
+    gateway sees request latency, not the agent's wall clock -- but
+    ``runtime_source``/``runtime_semantics`` record which of the five
+    definitions produced it.
     """
     self_semantics = self_reported_cache_semantics(backend)
     self_block = dict(self_reported)
@@ -450,6 +604,19 @@ def annotate_usage(
 
     record = dict(self_reported)
     record["self_reported"] = self_block
+
+    # Timing is deliberately NOT consolidated: the gateway cannot measure it,
+    # so it stays the baseline's own number and is always source "backend".
+    # Recording which definition produced it is the whole point.
+    runtime_semantics = runtime_semantics_for(backend)
+    record["runtime_source"] = USAGE_SOURCE_BACKEND
+    record["runtime_semantics"] = runtime_semantics
+    record["runtime_definition"] = {
+        key: (list(value) if isinstance(value, list) else value)
+        for key, value in RUNTIME_DEFINITIONS[runtime_semantics].items()
+    }
+    self_block["runtime_source"] = USAGE_SOURCE_BACKEND
+    self_block["runtime_semantics"] = runtime_semantics
 
     delta = window.delta() if window is not None else None
     if delta is None:
