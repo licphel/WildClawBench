@@ -37,6 +37,7 @@ from src.utils.grading import (
     print_global_summary,
     write_error_score as write_error_score_file,
 )
+from src.utils import gateway_usage
 
 load_dotenv()
 logging.basicConfig(
@@ -125,9 +126,15 @@ def grade_the_task(
 def save_usage(output_dir: Path, result: dict, usage: dict, task_id: str) -> dict:
     result["usage"] = usage
     if usage["request_count"] > 0:
+        # usage_source/cache_semantics are logged, not just written: the whole
+        # point of the record is that a number is meaningless without them, and
+        # the console is where an operator first sees it.
         logger.info(
-            "[%s] Token usage - input:%d output:%d cache_read:%d total:%d cost:$%.4f",
+            "[%s] Token usage (%s, cache=%s) - input:%d output:%d cache_read:%d "
+            "total:%d cost:$%.4f",
             task_id,
+            usage.get("usage_source", gateway_usage.USAGE_SOURCE_BACKEND),
+            usage.get("cache_semantics", gateway_usage.CACHE_UNKNOWN),
             usage["input_tokens"], usage["output_tokens"],
             usage["cache_read_tokens"], usage["total_tokens"],
             usage["cost_usd"],
@@ -214,6 +221,15 @@ def run_single_task(
     agent_proc = None
     elapsed_time = float(timeout_seconds)
 
+    # The inference gateway sees every request on the wire, so it is the one
+    # counter that means the same thing for all five baselines.  It is a
+    # host-side singleton with no per-client partition, so this task's slice is
+    # the movement of its cumulative counter across the agent's run: opened
+    # here, closed at the top of `finally` -- deliberately BEFORE
+    # grade_the_task(), because WildClaw's LLM judge talks to the same gateway
+    # with the same token and would otherwise be billed to the agent.
+    usage_window = gateway_usage.GatewayUsageWindow.open()
+
     try:
         execution = backend.run_task(
             AgentTaskSpec(
@@ -239,6 +255,7 @@ def run_single_task(
         logger.error("[%s] Unexpected backend error: %s", task_id, exc)
 
     finally:
+        usage_window.close()
         grading_transcript_path = backend.transcript_container_path
         grade_on_error = isinstance(backend, (CodexAgent, ClaudeCodeAgent))
         should_grade = task.get("automated_checks") and (
@@ -270,6 +287,12 @@ def run_single_task(
             task_id=task_id,
             output_dir=output_dir,
             elapsed_time=elapsed_time,
+        )
+        # Label it and, where the gateway saw this task exclusively, let the
+        # gateway's count take the top-level fields.  The backend's own numbers
+        # are kept under "self_reported" either way.
+        usage = gateway_usage.annotate_usage(
+            usage, backend=backend, window=usage_window
         )
         result = save_usage(output_dir, result, usage, task_id)
 
