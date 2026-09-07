@@ -28,10 +28,18 @@ CODEX_SESSIONS_DIR = f"{CODEX_HOME}/sessions"
 CODEX_CONFIG_PATH = f"{CODEX_HOME}/config.toml"
 CODEX_SKILLS_DIR = f"{CODEX_HOME}/skills"
 CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
+CODEX_API_PROXY_PATH = "/tmp/codex_api_proxy.py"
+CODEX_API_PROXY_PORT = int(os.environ.get("CODEX_API_PROXY_PORT", "18765"))
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
 ENCRYPTED_CONTENT_ERROR_MARKER = "invalid_encrypted_content"
+INSTANT_INFERENCE_QUOTA_ERROR_MARKER = "Insufficient quota available for instant inference"
+GENERIC_CODEX_RUN_FAILED_REASON = "codex_run_failed"
+RETRYABLE_CODEX_ERROR_MARKERS = (
+    ENCRYPTED_CONTENT_ERROR_MARKER,
+    INSTANT_INFERENCE_QUOTA_ERROR_MARKER,
+)
 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = int(
     os.environ.get("CODEX_ENCRYPTED_CONTENT_RESUME_ATTEMPTS", "0")
 )
@@ -181,12 +189,19 @@ class CodexAgent(BaseAgent):
                     spec.task.get("warmup", "") if spec.task else "",
                     detach_background=True,
                 )
+                codex_base_url = self.openrouter_base_url
+                if self._should_disable_instant_inference():
+                    codex_base_url = self._start_codex_api_proxy(
+                        task_id=task_id,
+                        output_dir=spec.output_dir,
+                    )
                 self._write_codex_config(
                     task_id=task_id,
                     model=spec.model,
                     reasoning_effort=spec.thinking
                     or self._default_reasoning_effort_for_model(spec.model),
                     wire_api=self._default_wire_api_for_model(spec.model),
+                    base_url=codex_base_url,
                     output_dir=spec.output_dir,
                 )
                 image_helper_enabled = self._should_enable_image_helper(
@@ -291,6 +306,11 @@ class CodexAgent(BaseAgent):
         sessions_dest = output_dir / "codex_sessions"
         sessions_dest.mkdir(parents=True, exist_ok=True)
         self._copy_dir_from_container(task_id, f"{CODEX_SESSIONS_DIR}/.", sessions_dest)
+        self._copy_file_from_container(
+            task_id,
+            "/tmp/codex_api_proxy.log",
+            output_dir / "codex_api_proxy.log",
+        )
 
         latest = self._find_latest_session(task_id)
         chat_dest = output_dir / "chat.jsonl"
@@ -465,6 +485,7 @@ class CodexAgent(BaseAgent):
         model: str,
         reasoning_effort: str | None,
         wire_api: str | None,
+        base_url: str,
         output_dir: Path,
     ) -> None:
         bare_model = model.split("/", 1)[1] if model.startswith("openrouter/") else model
@@ -472,6 +493,7 @@ class CodexAgent(BaseAgent):
             model=model,
             reasoning_effort=reasoning_effort,
             wire_api=wire_api,
+            base_url=base_url,
         )
 
         # Mirror the rendered config host-side so future debugging is trivial.
@@ -504,9 +526,10 @@ class CodexAgent(BaseAgent):
         model: str,
         reasoning_effort: str | None,
         wire_api: str | None,
+        base_url: str | None = None,
     ) -> str:
         bare_model = model.split("/", 1)[1] if model.startswith("openrouter/") else model
-        safe_base_url = self.openrouter_base_url.replace('"', '\\"')
+        safe_base_url = (base_url or self.openrouter_base_url).replace('"', '\\"')
         reasoning_line = (
             f'model_reasoning_effort = "{reasoning_effort}"\n'
             if reasoning_effort
@@ -529,6 +552,287 @@ class CodexAgent(BaseAgent):
             f'env_key = "OPENROUTER_API_KEY"\n'
             f"{provider_wire_api_line}"
         )
+
+    @staticmethod
+    def _should_disable_instant_inference() -> bool:
+        raw = os.environ.get("CODEX_DISABLE_INSTANT_INFERENCE", "1").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _start_codex_api_proxy(self, task_id: str, output_dir: Path) -> str:
+        if not self.openrouter_base_url:
+            raise RuntimeError("OPENROUTER_BASE_URL is required for Codex API proxy")
+
+        proxy = self._render_codex_api_proxy()
+        proxy_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".py", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(proxy)
+                proxy_tmp = f.name
+
+            copied = subprocess.run(
+                ["docker", "cp", proxy_tmp, f"{task_id}:{CODEX_API_PROXY_PATH}"],
+                capture_output=True,
+                text=True,
+            )
+            if copied.returncode != 0:
+                raise RuntimeError(f"Codex API proxy copy failed:\n{copied.stderr}")
+
+            chmod = subprocess.run(
+                ["docker", "exec", task_id, "chmod", "+x", CODEX_API_PROXY_PATH],
+                capture_output=True,
+                text=True,
+            )
+            if chmod.returncode != 0:
+                raise RuntimeError(f"Codex API proxy chmod failed:\n{chmod.stderr}")
+
+            started = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-d",
+                    "-e",
+                    f"CODEX_API_PROXY_UPSTREAM={self.openrouter_base_url.rstrip('/')}",
+                    "-e",
+                    f"CODEX_API_PROXY_PORT={CODEX_API_PROXY_PORT}",
+                    task_id,
+                    "python3",
+                    CODEX_API_PROXY_PATH,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if started.returncode != 0:
+                raise RuntimeError(f"Codex API proxy startup failed:\n{started.stderr}")
+
+            proxy_base_url = f"http://127.0.0.1:{CODEX_API_PROXY_PORT}/v1"
+            self._wait_for_codex_api_proxy(task_id, proxy_base_url)
+            append_agent_log_event(
+                output_dir,
+                {
+                    "type": "runner.codex_api_proxy",
+                    "message": (
+                        "Codex API proxy enabled; injecting instant_inference=false "
+                        "into JSON requests."
+                    ),
+                    "upstream_base_url": self.openrouter_base_url.rstrip("/"),
+                    "proxy_base_url": proxy_base_url,
+                },
+            )
+            return proxy_base_url
+        finally:
+            if proxy_tmp:
+                Path(proxy_tmp).unlink(missing_ok=True)
+
+    @staticmethod
+    def _wait_for_codex_api_proxy(task_id: str, proxy_base_url: str) -> None:
+        health_url = proxy_base_url.rsplit("/", 1)[0] + "/__health"
+        check = (
+            "python3 - <<'PY'\n"
+            "import sys, time, urllib.request\n"
+            f"url = {json.dumps(health_url)}\n"
+            "for _ in range(50):\n"
+            "    try:\n"
+            "        urllib.request.urlopen(url, timeout=1).read()\n"
+            "        raise SystemExit(0)\n"
+            "    except SystemExit:\n"
+            "        raise\n"
+            "    except Exception:\n"
+            "        time.sleep(0.1)\n"
+            "raise SystemExit(1)\n"
+            "PY"
+        )
+        r = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-lc", check],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                "Codex API proxy did not become ready:\n"
+                f"stdout: {r.stdout}\nstderr: {r.stderr}"
+            )
+
+    @staticmethod
+    def _render_codex_api_proxy() -> str:
+        return r'''#!/usr/bin/env python3
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM = os.environ["CODEX_API_PROXY_UPSTREAM"].rstrip("/")
+PORT = int(os.environ.get("CODEX_API_PROXY_PORT", "18765"))
+LOG_PATH = os.environ.get("CODEX_API_PROXY_LOG", "/tmp/codex_api_proxy.log")
+PREFIX = "/v1"
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+def log_event(**event: object) -> None:
+    event = {"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), **event}
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def upstream_url(path: str) -> str:
+    parsed = urllib.parse.urlsplit(path)
+    forward_path = parsed.path
+    if forward_path == PREFIX:
+        forward_path = ""
+    elif forward_path.startswith(PREFIX + "/"):
+        forward_path = forward_path[len(PREFIX):]
+    target = UPSTREAM + (forward_path or "/")
+    if parsed.query:
+        target += "?" + parsed.query
+    return target
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        if self.path == "/__health":
+            self.send_response(200)
+            self.send_header("content-length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        self.forward()
+
+    def do_POST(self) -> None:
+        self.forward()
+
+    def do_DELETE(self) -> None:
+        self.forward()
+
+    def do_PATCH(self) -> None:
+        self.forward()
+
+    def do_PUT(self) -> None:
+        self.forward()
+
+    def forward(self) -> None:
+        length = int(self.headers.get("content-length") or 0)
+        body = self.rfile.read(length) if length else None
+        headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in HOP_BY_HOP_HEADERS
+            and key.lower() not in {"host", "content-length"}
+        }
+
+        if body and "json" in self.headers.get("content-type", "").lower():
+            injected = False
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if isinstance(payload, dict):
+                    payload["instant_inference"] = False
+                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    headers["content-type"] = "application/json"
+                    injected = True
+            except Exception as exc:
+                log_event(
+                    event="json_injection_skipped",
+                    path=self.path,
+                    error=str(exc),
+                )
+        else:
+            injected = False
+
+        if body is not None:
+            headers["content-length"] = str(len(body))
+
+        request = urllib.request.Request(
+            upstream_url(self.path),
+            data=body,
+            headers=headers,
+            method=self.command,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=None) as response:
+                log_event(
+                    event="upstream_response",
+                    method=self.command,
+                    path=self.path,
+                    upstream_url=upstream_url(self.path),
+                    status=response.status,
+                    injected_instant_inference_false=injected,
+                )
+                self.send_response(response.status)
+                for key, value in response.headers.items():
+                    if key.lower() not in HOP_BY_HOP_HEADERS:
+                        self.send_header(key, value)
+                self.end_headers()
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except urllib.error.HTTPError as exc:
+            data = exc.read()
+            log_event(
+                event="upstream_response",
+                method=self.command,
+                path=self.path,
+                upstream_url=upstream_url(self.path),
+                status=exc.code,
+                injected_instant_inference_false=injected,
+                error_body=data.decode("utf-8", errors="replace")[:1000],
+            )
+            self.send_response(exc.code)
+            for key, value in exc.headers.items():
+                if key.lower() not in HOP_BY_HOP_HEADERS:
+                    self.send_header(key, value)
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            log_event(
+                event="proxy_error",
+                method=self.command,
+                path=self.path,
+                upstream_url=upstream_url(self.path),
+                injected_instant_inference_false=injected,
+                error=str(exc),
+            )
+            data = json.dumps({"error": {"message": str(exc)}}).encode("utf-8")
+            self.send_response(502)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        log_event(event="access", client=self.address_string(), message=fmt % args)
+
+
+def main() -> int:
+    log_event(event="started", listen=f"127.0.0.1:{PORT}", upstream=UPSTREAM)
+    ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler).serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
 
     def _install_image_helper(self, task_id: str, model: str) -> None:
         """Install a recoverable OpenRouter chat-completions image helper.
@@ -745,7 +1049,7 @@ if __name__ == "__main__":
         started = time.perf_counter()
         excluded_retry_time = 0.0
         resume_session_id: str | None = None
-        consecutive_encrypted_content_failures = 0
+        consecutive_retryable_failures = 0
         attempt = 0
 
         while True:
@@ -774,27 +1078,25 @@ if __name__ == "__main__":
                 return excluded_retry_time
 
             combined = self._combined_process_output(r)
+            retry_reason = self._codex_error_reason(combined)
             resume_limit_reached = (
                 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
                 and attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
             )
-            if (
-                ENCRYPTED_CONTENT_ERROR_MARKER not in combined
-                or resume_limit_reached
-            ):
-                if is_resume and ENCRYPTED_CONTENT_ERROR_MARKER in combined:
+            if resume_limit_reached:
+                if is_resume:
                     excluded_retry_time += attempt_elapsed
                 raise RuntimeError(
                     f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
 
-            consecutive_encrypted_content_failures += 1
+            consecutive_retryable_failures += 1
             if is_resume:
                 excluded_retry_time += attempt_elapsed
 
             if remaining <= 30:
                 raise RuntimeError(
-                    "Codex run failed with invalid_encrypted_content and no useful "
+                    f"Codex run failed with {retry_reason} and no useful "
                     f"time remains for resume (rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
 
@@ -803,7 +1105,7 @@ if __name__ == "__main__":
 
             resume_no = attempt + 1
             if (
-                consecutive_encrypted_content_failures >= ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES
+                consecutive_retryable_failures >= ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES
                 and ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS > 0
             ):
                 delay_started = time.perf_counter()
@@ -811,21 +1113,22 @@ if __name__ == "__main__":
                     output_dir,
                     {
                         "type": "runner.resume_delay",
-                        "reason": ENCRYPTED_CONTENT_ERROR_MARKER,
+                        "reason": retry_reason,
                         "message": (
-                            "Repeated invalid_encrypted_content errors; delaying "
+                            "Repeated Codex run failures; delaying "
                             "before the next same-session resume attempt."
                         ),
-                        "consecutive_failures": consecutive_encrypted_content_failures,
+                        "consecutive_failures": consecutive_retryable_failures,
                         "delay_seconds": ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS,
                         "resume_attempt": resume_no,
                         "resume_session_id": resume_session_id or "last",
                     },
                 )
                 logger.warning(
-                    "[%s] Codex invalid_encrypted_content repeated %d times; sleeping %.1fs before resume",
+                    "[%s] Codex run failure (%s) repeated %d times; sleeping %.1fs before resume",
                     task_id,
-                    consecutive_encrypted_content_failures,
+                    retry_reason,
+                    consecutive_retryable_failures,
                     ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS,
                 )
                 time.sleep(ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS)
@@ -840,9 +1143,9 @@ if __name__ == "__main__":
                 output_dir,
                 {
                     "type": "runner.resume",
-                    "reason": ENCRYPTED_CONTENT_ERROR_MARKER,
+                    "reason": retry_reason,
                     "message": (
-                        "Codex CLI hit invalid_encrypted_content; retrying with "
+                        "Codex CLI exited non-zero; retrying with "
                         "codex exec resume against the same local session."
                     ),
                     "resume_attempt": resume_no,
@@ -853,8 +1156,9 @@ if __name__ == "__main__":
                 },
             )
             logger.warning(
-                "[%s] Codex hit invalid_encrypted_content; retrying codex exec resume (%d/%s, session=%s)",
+                "[%s] Codex exited non-zero (%s); retrying codex exec resume (%d/%s, session=%s)",
                 task_id,
+                retry_reason,
                 resume_no,
                 max_resume_attempts,
                 resume_session_id or "last",
@@ -939,12 +1243,20 @@ if __name__ == "__main__":
     @staticmethod
     def _build_same_session_resume_prompt(*, resume_attempt: int) -> str:
         return (
-            "The previous request failed with `invalid_encrypted_content`, which is "
-            "an upstream transport/session-state issue. Continue the same benchmark "
+            "The previous Codex turn failed before the benchmark task finished. "
+            "Continue the same benchmark "
             f"task from the current conversation and `/tmp_workspace` state. Resume "
             f"attempt {resume_attempt}: inspect any partial files only if needed, "
             "then finish by writing the required final outputs."
         )
+
+    @staticmethod
+    def _codex_error_reason(combined_output: str) -> str:
+        combined_lower = combined_output.lower()
+        for marker in RETRYABLE_CODEX_ERROR_MARKERS:
+            if marker.lower() in combined_lower:
+                return marker
+        return GENERIC_CODEX_RUN_FAILED_REASON
 
     @staticmethod
     def _terminate_codex_processes(task_id: str) -> None:

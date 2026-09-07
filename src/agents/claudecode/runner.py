@@ -28,11 +28,28 @@ CLAUDECODE_RETRY_DELAY_SECONDS = float(os.environ.get("CLAUDECODE_RETRY_DELAY_SE
 CLAUDECODE_PROVIDER_ERROR_MARKERS = (
     "insufficient quota",
     "no available channel",
+    "current group has no available channels",
     "invalid_encrypted_content",
+    "encrypted content could not be verified",
+    "could not be decrypted or parsed",
+    "api call failed",
+    "badrequesterror",
+    "non-retryable",
     "peer closed connection",
     "incomplete chunked read",
     "read operation timed out",
+    "connection reset",
+    "connection error",
+    "connection aborted",
+    "network error",
+    "network aborted",
+    "econnreset",
+    "etimedout",
+    "eai_again",
+    "bad gateway",
+    "service unavailable",
     "api error: 5",
+    "http 400",
     "http 429",
 )
 
@@ -65,7 +82,7 @@ class ClaudeCodeAgent(BaseAgent):
 
     @property
     def transcript_container_path(self) -> str:
-        return "/claude_code/log/chat.json"
+        return "/claude_code/log/chat.jsonl"
 
     def prepare_grading_transcript(self, task_id: str) -> str:
         with tempfile.TemporaryDirectory(prefix="claudecode_transcript_") as tmp_dir:
@@ -208,7 +225,7 @@ class ClaudeCodeAgent(BaseAgent):
         log_dest = output_dir / "claude_code_log"
         log_dest.mkdir(parents=True, exist_ok=True)
         self._copy_file_from_container(task_id, "/claude_code/log/usage.json", log_dest / "usage.json")
-        self._copy_file_from_container(task_id, "/claude_code/log/chat.json", log_dest / "chat.json")
+        self._copy_file_from_container(task_id, "/claude_code/log/chat.jsonl", log_dest / "chat.json")
         self._copy_dir_from_container(task_id, "/claude_code/log/.", log_dest)
         self._sync_agent_log_from_claude_logs(task_id, output_dir, log_dest)
 
@@ -272,6 +289,10 @@ class ClaudeCodeAgent(BaseAgent):
         for payload in payloads:
             self._accumulate_costed_usage(payload, totals)
 
+        official = self._extract_usage_from_official_rows(payloads)
+        if official["request_count"] > 0:
+            return official
+
         totals["total_tokens"] = (
             totals["input_tokens"]
             + totals["output_tokens"]
@@ -282,6 +303,80 @@ class ClaudeCodeAgent(BaseAgent):
             totals["cost_usd"] = self._estimate_cost(totals)
         totals["cost_usd"] = round(totals["cost_usd"], 6)
         return totals
+
+    def _extract_usage_from_official_rows(self, payloads: list[Any]) -> dict[str, Any]:
+        """Read the aggregate usage emitted by Claude Code's stream-json result."""
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "request_count": 0,
+        }
+
+        result_rows = [
+            row for row in payloads
+            if isinstance(row, dict) and row.get("type") == "result"
+        ]
+        for row in result_rows:
+            model_usage = row.get("modelUsage")
+            if isinstance(model_usage, dict):
+                for model_data in model_usage.values():
+                    if not isinstance(model_data, dict):
+                        continue
+                    self._add_usage_values(totals, model_data)
+                if totals["request_count"] > 0:
+                    continue
+
+            usage = row.get("usage")
+            if isinstance(usage, dict):
+                self._add_usage_values(totals, usage)
+                cost = self._num(row.get("total_cost_usd"), default=0.0)
+                if cost > 0:
+                    totals["cost_usd"] = cost
+
+        if totals["request_count"] == 0:
+            for row in payloads:
+                if not isinstance(row, dict) or row.get("type") != "assistant":
+                    continue
+                message = row.get("message")
+                if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                    self._add_usage_values(totals, message["usage"])
+
+        totals["total_tokens"] = (
+            totals["input_tokens"]
+            + totals["output_tokens"]
+            + totals["cache_read_tokens"]
+            + totals["cache_write_tokens"]
+        )
+        totals["cost_usd"] = round(totals["cost_usd"], 6)
+        return totals
+
+    def _add_usage_values(self, totals: dict[str, Any], usage: dict[str, Any]) -> None:
+        input_tokens = int(self._num(usage.get("input_tokens", usage.get("inputTokens"))))
+        output_tokens = int(self._num(usage.get("output_tokens", usage.get("outputTokens"))))
+        cache_read_tokens = int(
+            self._num(usage.get("cache_read_input_tokens", usage.get("cacheReadInputTokens")))
+        )
+        cache_write_tokens = int(
+            self._num(
+                usage.get(
+                    "cache_creation_input_tokens",
+                    usage.get("cacheCreationInputTokens"),
+                )
+            )
+        )
+        cost = self._num(usage.get("cost_usd", usage.get("costUSD")), default=0.0)
+
+        if input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or cost:
+            totals["request_count"] += int(self._num(usage.get("requestCount"), default=1))
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        totals["cache_read_tokens"] += cache_read_tokens
+        totals["cache_write_tokens"] += cache_write_tokens
+        totals["cost_usd"] += cost
 
     def _accumulate_costed_usage(self, payload: Any, totals: dict[str, Any]) -> None:
         if isinstance(payload, list):
@@ -373,6 +468,7 @@ class ClaudeCodeAgent(BaseAgent):
     ) -> None:
         proxy_http = os.environ.get("HTTP_PROXY_INNER", "")
         proxy_https = os.environ.get("HTTPS_PROXY_INNER", "")
+        no_proxy = os.environ.get("NO_PROXY_INNER", "")
         env_map = {
             "ANTHROPIC_API_KEY": self.api_key,
             "ANTHROPIC_BASE_URL": self.api_base_url,
@@ -391,6 +487,8 @@ class ClaudeCodeAgent(BaseAgent):
             "https_proxy": proxy_https,
             "HTTP_PROXY": proxy_http,
             "HTTPS_PROXY": proxy_https,
+            "no_proxy": no_proxy,
+            "NO_PROXY": no_proxy,
         }
         env_args: list[str] = []
         for key, value in env_map.items():
@@ -489,8 +587,11 @@ PY"""
             remaining = max(1, int(timeout_seconds - counted_elapsed))
             is_resume = attempt > 0
             current_prompt = prompt if not is_resume else (
-                "Continue the interrupted task from the current session. "
-                "Inspect the existing workspace and finish the required outputs."
+                "A previous attempt of this same task was interrupted by a transient "
+                "provider error. Continue from the current workspace, preserve and "
+                "verify completed work, and finish every required output. Do not "
+                "restart the task or discuss the interruption. The original task is:\n\n"
+                f"{prompt}"
             )
             resume_flag = "--continue " if is_resume else ""
             cmd = (

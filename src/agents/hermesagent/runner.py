@@ -31,10 +31,12 @@ HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
 HERMES_RESUME_ATTEMPTS = int(os.environ.get("HERMES_RESUME_ATTEMPTS", "0"))
 HERMES_RETRY_DELAY_SECONDS = float(os.environ.get("HERMES_RETRY_DELAY_SECONDS", "2"))
-HERMES_ERROR_MARKERS = (
+HERMES_RESUMABLE_ERROR_MARKERS = (
     "invalid_encrypted_content",
     "encrypted content could not be verified",
-    "non-retryable client error",
+    "could not be decrypted or parsed",
+    "insufficient quota for instant inference",
+    "quota for instant inference",
 )
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
@@ -71,6 +73,8 @@ class HermesAgentAgent(BaseAgent):
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         elapsed_time = float(spec.timeout_seconds)
         agent_proc = None
+        start_time: float | None = None
+        excluded_retry_time = 0.0
 
         try:
             api_key, base_url = self._resolve_runtime_provider(spec.model, spec.models_config)
@@ -100,7 +104,7 @@ class HermesAgentAgent(BaseAgent):
             )
             run_warmup(spec.task_id, spec.task.get("warmup", ""))
 
-            self._configure_hermes(spec.task_id, api_key, base_url)
+            self._configure_hermes(spec.task_id, api_key, base_url, spec.model)
 
             reasoning_config = self._map_thinking(spec.thinking)
             self._write_bench_runner(
@@ -109,8 +113,6 @@ class HermesAgentAgent(BaseAgent):
             )
 
             start_time = time.perf_counter()
-
-            excluded_retry_time = 0.0
             resume_attempt = 0
             while True:
                 log_offset = (
@@ -128,7 +130,7 @@ class HermesAgentAgent(BaseAgent):
                 remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
                 logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
                 attempt_started = time.perf_counter()
-                encrypted_error_seen = False
+                provider_error_reason: str | None = None
                 try:
                     deadline = time.perf_counter() + remaining
                     while True:
@@ -136,13 +138,13 @@ class HermesAgentAgent(BaseAgent):
                             agent_proc.wait(timeout=min(1.0, max(0.05, deadline - time.perf_counter())))
                             break
                         except subprocess.TimeoutExpired:
-                            if self._log_contains_marker(
-                                spec.output_dir / "agent.log", log_offset, HERMES_ERROR_MARKERS
-                            ):
-                                encrypted_error_seen = True
+                            provider_error_reason = self._find_error_marker(
+                                spec.output_dir / "agent.log", log_offset
+                            )
+                            if provider_error_reason:
                                 logger.warning(
-                                    "[%s] Hermes provider error detected; stopping current run for session resume",
-                                    spec.task_id,
+                                    "[%s] Hermes provider error detected (%s); stopping current run for session resume",
+                                    spec.task_id, provider_error_reason,
                                 )
                                 agent_proc.terminate()
                                 try:
@@ -159,15 +161,20 @@ class HermesAgentAgent(BaseAgent):
                     agent_proc.kill()
                     agent_proc.wait()
                     break
-                if not encrypted_error_seen:
-                    encrypted_error_seen = self._log_contains_marker(
-                        spec.output_dir / "agent.log", log_offset, HERMES_ERROR_MARKERS
+                if not provider_error_reason:
+                    provider_error_reason = self._find_error_marker(
+                        spec.output_dir / "agent.log", log_offset
                     )
                 attempt_elapsed = time.perf_counter() - attempt_started
                 self._close_runner_streams(agent_proc)
-                if agent_proc.returncode == 0 and not encrypted_error_seen:
+                if agent_proc.returncode == 0 and not provider_error_reason:
                     elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
                     break
+                if not provider_error_reason:
+                    raise RuntimeError(
+                        f"Hermes runner failed without a resumable provider error "
+                        f"(rc={agent_proc.returncode})"
+                    )
                 excluded_retry_time += attempt_elapsed
                 if HERMES_RESUME_ATTEMPTS > 0 and resume_attempt >= HERMES_RESUME_ATTEMPTS:
                     raise RuntimeError(f"Hermes runner failed (rc={agent_proc.returncode})")
@@ -181,7 +188,7 @@ class HermesAgentAgent(BaseAgent):
                 logger.warning(
                     "[%s] Hermes runner exited non-zero%s; retrying same session (%s/%s)",
                     spec.task_id,
-                    " after provider error" if encrypted_error_seen else "",
+                    f" after provider error ({provider_error_reason})" if provider_error_reason else "",
                     resume_attempt, HERMES_RESUME_ATTEMPTS or "unlimited",
                 )
             self._close_runner_streams(agent_proc)
@@ -200,8 +207,13 @@ class HermesAgentAgent(BaseAgent):
                 self._close_runner_streams(agent_proc)
             self._cleanup_bench_config(spec.task_id)
             logger.error("[%s] hermes-agent execution error: %s", spec.task_id, exc)
+            if start_time is not None:
+                elapsed_time = min(
+                    float(spec.timeout_seconds),
+                    max(0.0, time.perf_counter() - start_time - excluded_retry_time),
+                )
             return AgentExecution(
-                elapsed_time=float(spec.timeout_seconds),
+                elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=None,
                 agent_proc=agent_proc,
@@ -307,8 +319,12 @@ class HermesAgentAgent(BaseAgent):
             "-e", f"HTTP_PROXY={proxy_http}",
             "-e", f"HTTPS_PROXY={proxy_https}",
             "-e", f"BRAVE_API_KEY={self.brave_api_key}",
+            "-e", f"OPENAI_API_KEY={api_key}",
+            "-e", f"OPENAI_BASE_URL={base_url}",
             "-e", f"OPENROUTER_API_KEY={api_key}",
             "-e", f"OPENROUTER_BASE_URL={base_url}",
+            "-e", "HERMES_INFERENCE_PROVIDER=custom",
+            "-e", f"TERMINAL_CWD={TMP_WORKSPACE}",
             "-e", f"no_proxy={'' if not proxy_http else os.environ.get('NO_PROXY_INNER', '')}",
         ]
         for line in extra_env.splitlines():
@@ -361,62 +377,79 @@ class HermesAgentAgent(BaseAgent):
         if r.returncode != 0:
             raise RuntimeError(f"hermes-agent workspace copy failed:\n{r.stderr}")
 
-    def _configure_hermes(self, task_id: str, api_key: str = "", base_url: str = "") -> None:
-        """Configure hermes-agent inside the container with one consistent provider config."""
-        hermes_yaml = (
-            "model:\n"
-            "  context_length: 128000\n"
-            "auxiliary:\n"
-            "  compression:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  web_extract:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  vision:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  browser_vision:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  session_search:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  skills_hub:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  mcp:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "  title_generation:\n"
-            "    provider: custom\n"
-            "    model: gpt-5.4\n"
-            f"    base_url: {base_url}\n"
-            "    key_env: OPENROUTER_API_KEY\n"
-            "tools:\n"
-            "  profile: coding\n"
-            "  web:\n"
-            "    search:\n"
-            "      enabled: true\n"
-            "      provider: brave\n"
+    @staticmethod
+    def _yaml_quote(value: object) -> str:
+        return json.dumps(str(value), ensure_ascii=True)
+
+    @classmethod
+    def _build_hermes_yaml(cls, model: str, api_key: str, base_url: str) -> str:
+        """Build a config that pins the main and every auxiliary call together."""
+        model_value = cls._yaml_quote(model)
+        key_value = cls._yaml_quote(api_key)
+        base_value = cls._yaml_quote(base_url)
+        auxiliary_tasks = (
+            "compression",
+            "vision",
+            "browser_vision",
+            "web_extract",
+            "session_search",
+            "skills_hub",
+            "approval",
+            "mcp",
+            "flush_memories",
+            "title_generation",
         )
+        lines = [
+            "model:",
+            f"  default: {model_value}",
+            "  provider: custom",
+            f"  base_url: {base_value}",
+            f"  api_key: {key_value}",
+            "  api_mode: chat_completions",
+            "  context_length: 128000",
+            "terminal:",
+            f"  cwd: {TMP_WORKSPACE}",
+            "auxiliary:",
+        ]
+        for task in auxiliary_tasks:
+            lines.extend(
+                [
+                    f"  {task}:",
+                    "    provider: custom",
+                    f"    model: {model_value}",
+                    f"    base_url: {base_value}",
+                    f"    api_key: {key_value}",
+                    "    api_mode: chat_completions",
+                ]
+            )
+        lines.extend(
+            [
+                "tools:",
+                "  profile: coding",
+                "  web:",
+                "    search:",
+                "      enabled: true",
+                "      provider: brave",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _configure_hermes(
+        self,
+        task_id: str,
+        api_key: str = "",
+        base_url: str = "",
+        model: str = "gpt-5.4",
+    ) -> None:
+        """Configure hermes-agent inside the container with one consistent provider config."""
+        hermes_yaml = self._build_hermes_yaml(model, api_key, base_url)
         hermes_env = (
+            f"OPENAI_API_KEY={api_key}\n"
+            f"OPENAI_BASE_URL={base_url}\n"
             f"OPENROUTER_API_KEY={api_key}\n"
             f"OPENROUTER_BASE_URL={base_url}\n"
+            "HERMES_INFERENCE_PROVIDER=custom\n"
+            f"TERMINAL_CWD={TMP_WORKSPACE}\n"
             f"BRAVE_API_KEY={self.brave_api_key}\n"
         )
 
@@ -479,7 +512,9 @@ class HermesAgentAgent(BaseAgent):
             "config": {
                 "model": model,
                 "api_key": api_key,
+                "provider": "custom",
                 "base_url": base_url,
+                "api_mode": "chat_completions",
                 "max_iterations": 90,
                 "reasoning_config": reasoning_config,
                 "session_id": f"wildclaw-{task_id}",
@@ -549,15 +584,25 @@ class HermesAgentAgent(BaseAgent):
             except Exception:
                 pass
 
-    @staticmethod
-    def _log_contains_marker(log_path: Path, offset: int, markers: tuple[str, ...]) -> bool:
+    @classmethod
+    def _find_error_marker(cls, log_path: Path, offset: int) -> str | None:
         try:
             with log_path.open("r", encoding="utf-8", errors="replace") as log:
                 log.seek(offset)
                 text = log.read().lower()
         except OSError:
-            return False
-        return any(marker in text for marker in markers)
+            return None
+
+        for line in text.splitlines():
+            # Hermes reports optional tool capability probes as
+            # ``tools.registry ... unavailable (check failed)``.  They are
+            # normal in the benchmark image and must not trigger a resume.
+            if "tools.registry" in line and "unavailable (check failed)" in line:
+                continue
+            for marker in HERMES_RESUMABLE_ERROR_MARKERS:
+                if marker in line:
+                    return marker
+        return None
 
     @staticmethod
     def _cleanup_bench_config(task_id: str) -> None:
