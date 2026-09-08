@@ -15,7 +15,11 @@ logger = logging.getLogger(__name__)
 
 # -grader: carries the shared grading interpreter (src/utils/grading.py::
 # GRADER_PYTHON). The agent-visible environment is unchanged from v1.3-node.
-DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE",   "wildclawbench-ubuntu:v1.3-node-grader")
+# openclaw's task image.  Renamed from wildclawbench-ubuntu:v1.3-node-grader
+# when the OpenClaw CLI stopped being whatever the base image was built with
+# and became a build argument (Dockerfile.openclaw ARG OPENCLAW_VERSION);
+# the tag now names the CLI release, as the codex and claudecode tags do.
+DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE", "").strip()
 TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE",  "/tmp_workspace")
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
@@ -26,6 +30,8 @@ def remove_container(name: str) -> None:
 
 def start_container(task_id: str, workspace_path: str, extra_env: str = "",
                     tmp_path: str = "", lobster_env: list[str] | None = None) -> None:
+    if not DOCKER_IMAGE:
+        raise RuntimeError("DOCKER_IMAGE must be set before starting a WildClaw container")
     workspace = Path(workspace_path).expanduser()
     if not workspace.is_dir():
         raise RuntimeError(f"Workspace path does not exist or is not a directory: {workspace}")

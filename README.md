@@ -9,7 +9,7 @@
 
 [![Tasks](https://img.shields.io/badge/Tasks-60-blue)]()
 [![Harnesses](https://img.shields.io/badge/Harnesses-4-purple)]()
-[![Models](https://img.shields.io/badge/Models-32-green)]()
+[![Models](https://img.shields.io/badge/Models-31-green)]()
 [![Leaderboard](https://img.shields.io/badge/🏆_Leaderboard-WildClawBench-8c2416)](https://internlm.github.io/WildClawBench/)
 <br>
 [![arXiv](https://img.shields.io/badge/arXiv-2605.10912-b31b1b.svg)](https://arxiv.org/abs/2605.10912)
@@ -46,7 +46,7 @@ Most agent benchmarks test isolated capabilities — calling a function, parsing
 
 - **Real environment, not mocks.** Tasks run inside a live OpenClaw instance with real tools (browser, bash, file system, email, calendar).
 - **60 original tasks, built by hand.** Not adapted from existing benchmarks — each task was designed from scratch to stress-test real-world agent capabilities.
-- **Four agent harnesses, one task suite.** OpenClaw, Claude Code, Codex CLI, and Hermes Agent all execute the same 60 tasks under the same grading. This separates *model capability* from *harness scaffolding* — you can see how much an agent's score depends on its surrounding tools versus the underlying LLM.
+- **Five agent harnesses, one task suite.** OpenClaw, Claude Code, Codex CLI, Hermes Agent, and Perdura (PyLM) execute the same task suite under the same grading. This separates *model capability* from *harness scaffolding* — you can see how much an agent's score depends on its surrounding tools versus the underlying LLM.
 - **Reproducible & isolated.** Each task runs in its own Docker container. Same image, same data, same grading code. Ground truth and grading scripts are injected only after the agent finishes — they are never visible during execution, eliminating data leakage. Scores are reproducible across machines.
 
 ## News
@@ -54,7 +54,7 @@ Most agent benchmarks test isolated capabilities — calling a function, parsing
 - **2026-08** Meta's **[Muse Glimmer release](https://research.meta.ai/blog/introducing-muse-glimmer-open-agentic-model)** reports WildClawBench evaluation scores. Thanks for the recognition!
 - **2026-07** We expanded the OpenClaw leaderboard with evaluations of the latest frontier models, including **GPT-5.6 Sol, Claude Fable 5, Kimi K3 and etc**.
 - **2026-06** ByteDance Seed's **[Seed2.1 release](https://seed.bytedance.com/en/blog/seed2-1-officially-released-advancing-ai-productivity)** includes WildClawBench in its agent evaluations. Thanks for the recognition!
-- **2026-05** We released a new version with **four agent harnesses** — OpenClaw, Claude Code, Codex CLI, and Hermes Agent — so the same 60-task suite can be evaluated under multiple scaffolds.
+- **2026-05** We released a version with multiple agent harnesses — OpenClaw, Claude Code, Codex CLI, and Hermes Agent — so the same 60-task suite can be evaluated under multiple scaffolds. The repository runner now also includes Perdura/PyLM.
 - **2026-05** We published a **[technical report PDF](WildClawBench_report.pdf)**.
 - **2026-05** Tencent’s **[Hunyuan3 Preview](https://hunyuan.tencent.com/research/hy3)** page reports WildClawBench evaluation scores. Thanks for the recognition!
 
@@ -65,7 +65,7 @@ Most agent benchmarks test isolated capabilities — calling a function, parsing
 WildClawBench reports two complementary leaderboards:
 
 1. **Model leaderboard (OpenClaw harness)** — apples-to-apples comparison of LLMs running inside the same OpenClaw harness.
-2. **Harness comparison** — same model, same tasks, four different agent scaffolds.
+2. **Harness comparison** — same model and tasks across the configured agent scaffolds.
 
 Full interactive leaderboard at [internlm.github.io/WildClawBench](https://internlm.github.io/WildClawBench/).
 
@@ -82,41 +82,38 @@ Full interactive leaderboard at [internlm.github.io/WildClawBench](https://inter
 | 4 | Claude Fable 5 | Anthropic | 62.0% | 324 min | $87.71 |
 | 5 | GPT-5.5 | OpenAI | 58.2% | 262 min | $37.80 |
 | 6 | Grok 4.5 | xAI | 57.5% | 359 min | $28.43 |
-| 7 | Qwen3.8-Max | Alibaba Cloud | 56.2% | 708 min | $24.70 |
-| 8 | Muse Spark 1.1 | Meta | 54.8% | 367 min | $23.59 |
-| 9 | Kimi K3 | Moonshot AI | 54.5% | 488 min | $40.08 |
-| 10 | GLM 5.2 | Zhipu AI | 54.2% | 442 min | $17.10 |
-| 11 | Claude Opus 4.6 | Anthropic | 51.6% | 508 min | $81.00 |
-| 12 | GPT-5.4 | OpenAI | 50.3% | 350 min | $19.80 |
-| 13 | Hy3 | Tencent | 49.7% | 338 min | $2.13 |
-| 14 | GLM 5.1 | Zhipu AI | 48.2% | 515 min | $34.80 |
-| 15 | Muse Glimmer 30B | Meta | 47.6% | 352 min | $6.06 |
-| 16 | Kimi K2.7 Code | Moonshot AI | 46.9% | 674 min | $72.31 |
-| 17 | DeepSeek V4 Pro | DeepSeek | 43.7% | 605 min | $12.00 |
-| 18 | Qwen3.6 27B | Alibaba Cloud | 43.2% | 421 min | $20.91 |
-| 19 | MiMo V2.5 Pro | Xiaomi | 43.0% | 451 min | $12.60 |
-| 20 | GLM 5 | Zhipu AI | 42.6% | 373 min | $11.40 |
-| 21 | Gemini 3.1 Pro | Google DeepMind | 40.8% | 240 min | $18.00 |
-| 22 | MiMo V2 Pro | Xiaomi | 40.2% | 458 min | $26.40 |
-| 23 | Gemma 4 31B IT | Google DeepMind | 37.6% | 384 min | $3.46 |
-| 24 | Qwen3.5 397B | Alibaba Cloud | 34.5% | 459 min | $22.20 |
-| 25 | DeepSeek V3.2 | DeepSeek | 34.0% | 549 min | $11.40 |
-| 26 | GLM 5 Turbo | Zhipu AI | 33.9% | 499 min | $15.00 |
-| 27 | MiniMax M2.7 | MiniMax | 33.8% | 551 min | $7.20 |
-| 28 | Kimi K2.5 | Moonshot AI | 30.8% | 406 min | $6.60 |
-| 29 | MiMo V2 Flash | Xiaomi | 30.8% | 433 min | $10.20 |
-| 30 | MiniMax M2.5 | MiniMax | 27.1% | 542 min | $9.60 |
-| 31 | Step 3.5 Flash | StepFun | 26.7% | 430 min | $6.60 |
-| 32 | Grok 4.20 Beta | xAI | 19.3% | 94 min | $9.60 |
+| 7 | Muse Spark 1.1 | Meta | 54.8% | 367 min | $23.59 |
+| 8 | Kimi K3 | Moonshot AI | 54.5% | 488 min | $40.08 |
+| 9 | GLM 5.2 | Zhipu AI | 54.2% | 442 min | $17.10 |
+| 10 | Claude Opus 4.6 | Anthropic | 51.6% | 508 min | $81.00 |
+| 11 | GPT-5.4 | OpenAI | 50.3% | 350 min | $19.80 |
+| 12 | Hy3 | Tencent | 49.7% | 338 min | $2.13 |
+| 13 | GLM 5.1 | Zhipu AI | 48.2% | 515 min | $34.80 |
+| 14 | Muse Glimmer 30B | Meta | 47.6% | 352 min | N/A |
+| 15 | Kimi K2.7 Code | Moonshot AI | 46.9% | 674 min | $72.31 |
+| 16 | DeepSeek V4 Pro | DeepSeek | 43.7% | 605 min | $12.00 |
+| 17 | Qwen3.6 27B | Alibaba Cloud | 43.2% | 421 min | $20.91 |
+| 18 | MiMo V2.5 Pro | Xiaomi | 43.0% | 451 min | $12.60 |
+| 19 | GLM 5 | Zhipu AI | 42.6% | 373 min | $11.40 |
+| 20 | Gemini 3.1 Pro | Google DeepMind | 40.8% | 240 min | $18.00 |
+| 21 | MiMo V2 Pro | Xiaomi | 40.2% | 458 min | $26.40 |
+| 22 | Gemma 4 31B IT | Google DeepMind | 37.6% | 384 min | $3.46 |
+| 23 | Qwen3.5 397B | Alibaba Cloud | 34.5% | 459 min | $22.20 |
+| 24 | DeepSeek V3.2 | DeepSeek | 34.0% | 549 min | $11.40 |
+| 25 | GLM 5 Turbo | Zhipu AI | 33.9% | 499 min | $15.00 |
+| 26 | MiniMax M2.7 | MiniMax | 33.8% | 551 min | $7.20 |
+| 27 | Kimi K2.5 | Moonshot AI | 30.8% | 406 min | $6.60 |
+| 28 | MiMo V2 Flash | Xiaomi | 30.8% | 433 min | $10.20 |
+| 29 | MiniMax M2.5 | MiniMax | 27.1% | 542 min | $9.60 |
+| 30 | Step 3.5 Flash | StepFun | 26.7% | 430 min | $6.60 |
+| 31 | Grok 4.20 Beta | xAI | 19.3% | 94 min | $9.60 |
 
 > Claude Opus 4.8 cost uses the dynamic base-tier rates for this evaluation: $5/M input, $25/M output, $0.5/M cache read, and $6.25/M cache write.
-> Muse Glimmer 30B cost uses the OpenRouter rates for this evaluation: $0.35/M input, $1.50/M output, and $0.04/M cache read.
 > Kimi K2.7 Code cost uses the published rates for this evaluation: $6.5/M input, $27/M output, and $1.3/M cached input.
-> Qwen3.8-Max cost uses the evaluation rates: $1.7535/M input, $5.2605/M output, and $0.219186/M cache read.
 
 ### Harness comparison
 
-Same 60 tasks, same grading, four different agent scaffolds. Time and cost are per-task averages; score is in %. Time is in minutes per task, cost in USD per task. **Bold** = best harness for that model.
+Same tasks and grading across agent scaffolds. The table below is the historical four-harness comparison; the repository runner additionally supports Perdura/PyLM. Time and cost are per-task averages; score is in %. **Bold** = best harness for that model.
 
 | Model | OpenClaw |  |  | Claude Code |  |  | Codex |  |  | Hermes Agent |  |  |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -195,33 +192,20 @@ newgrp docker
 
 ### Download Images
 
-WildClawBench ships **four** Docker images, one per harness. They are all hosted on [HuggingFace](https://huggingface.co/datasets/internlm/WildClawBench/tree/main/Images). Pick the one(s) that match the harness you want to evaluate:
+The repository runner uses **five** pinned Docker images, one per harness. The current tags are recorded in `eval_framework/baseline_verifier/wildclawbench/runner_config.json`; verify that those exact tags exist on the machine running the benchmark before starting a run.
 
-| Harness | Image tarball | Loaded tag |
-|---|---|---|
-| OpenClaw     | `wildclawbench-ubuntu_v1.3.tar`                       | `wildclawbench-ubuntu:v1.3` |
-| Claude Code  | `wildclawbench-claudecode-ubuntu_v0.2-patched.tar`    | `wildclawbench-claudecode-ubuntu:v0.2` |
-| Codex CLI    | `wildclawbench-codex-ubuntu_v0.0.tar`                 | `wildclawbench-codex-ubuntu:v0.0` |
-| Hermes Agent | `wildclawbench-hermes-agent-v0.5.tar.gz`              | `wildclawbench-hermes-agent:v0.5` |
+| Harness | Pinned image tag |
+|---|---|
+| OpenClaw | `wildclawbench-openclaw-ubuntu:v2026.9.1-grader` |
+| Claude Code | `wildclawbench-claudecode-ubuntu:v2.1.263-grader` |
+| Codex CLI | `wildclawbench-codex-ubuntu:v0.153.4-grader` |
+| Hermes Agent | `wildclawbench-hermes-agent:v0.21.0-grader` |
+| Perdura / PyLM | `wildclawbench-perdura-ubuntu:v0.5` |
 
-```bash
-pip install -U "huggingface_hub[cli]"
-
-# Download the images you need (or all four)
-hf download internlm/WildClawBench Images/wildclawbench-ubuntu_v1.3.tar                    --repo-type dataset --local-dir .
-hf download internlm/WildClawBench Images/wildclawbench-claudecode-ubuntu_v0.2-patched.tar --repo-type dataset --local-dir .
-hf download internlm/WildClawBench Images/wildclawbench-codex-ubuntu_v0.0.tar              --repo-type dataset --local-dir .
-hf download internlm/WildClawBench Images/wildclawbench-hermes-agent-v0.5.tar.gz           --repo-type dataset --local-dir .
-```
-
-Then load each image into Docker:
-
-```bash
-docker load -i Images/wildclawbench-ubuntu_v1.3.tar
-docker load -i Images/wildclawbench-claudecode-ubuntu_v0.2-patched.tar
-docker load -i Images/wildclawbench-codex-ubuntu_v0.0.tar
-docker load -i Images/wildclawbench-hermes-agent-v0.5.tar.gz
-```
+Image build/load is an infrastructure step maintained with the baseline
+verifier. Do not silently substitute an older tag: the launcher passes the
+exact configured tag and the corresponding backend fails fast if its canonical
+image variable is absent.
 
 ### Download Task Data
 
@@ -263,136 +247,47 @@ OPENROUTER_API_KEY=your_api_key_here
 BRAVE_API_KEY=your_brave_key_here  # required for search tasks
 ```
 
-- **OpenRouter API Key** — Any model available on [OpenRouter](https://openrouter.ai/models) is supported. The default model is defined in the `.env` file as `DEFAULT_MODEL=openrouter/stepfun/step-3.5-flash:free` — replace it with any model you want to evaluate.
+- **Inference gateway** — all five baselines use the per-experiment gateway. Its upstream defaults to the Codex OAuth route; configure a different upstream with `PYLM_INFERENCE_PROVIDER` when needed. A run is rejected if the gateway cannot be started or if it attempts to attach to a shared gateway.
+- **Benchmark model** — fixed at `gpt-5.6-terra` for the alignment run. Model overrides are rejected so agent calls, image calls, side queries, and judges remain comparable.
 - **Brave Search API Key** — Required for Search & Retrieval tasks. Get one (with free monthly credits) at [brave.com/search/api](https://brave.com/search/api/).
-- **Judge model** (optional) — `JUDGE_MODEL` controls the LLM used by judge-based grading metrics. Defaults to `openai/gpt-5.4`.
+- **Judge model** — defaults to the same `gpt-5.6-terra` gateway model for this benchmark alignment.
 
-Then run one of the four harnesses:
+Then use the unified entrypoint. Each invocation owns its output directory and gateway:
 
 ```bash
-bash script/run.sh openclaw     --category all --parallel 4 --model openrouter/openai/gpt-5.5
-bash script/run.sh claudecode   --category all --parallel 4 --model openai/gpt-5.5
-bash script/run.sh codex        --category all --parallel 4 --model openrouter/openai/gpt-5.5
-bash script/run.sh hermesagent  --category all --parallel 4 --model openai/gpt-5.5
+bash script/run.sh openclaw     --category all --parallel 4
+bash script/run.sh claudecode   --category all --parallel 4
+bash script/run.sh codex        --category all --parallel 4
+bash script/run.sh hermesagent  --category all --parallel 4
+bash script/run.sh pylm         --category all --parallel 4
 ```
 
 Single-task runs are also supported:
 
 ```bash
-bash script/run.sh openclaw --task tasks/06_Safety_Alignment/06_Safety_Alignment_task_1_file_overwrite.md \
-                            --model openrouter/openai/gpt-5.5
+bash script/run.sh openclaw --task tasks/06_Safety_Alignment/06_Safety_Alignment_task_1_file_overwrite.md
 ```
 
-> Model-name conventions differ per harness:
-> - **OpenClaw / Codex** expect `openrouter/<provider>/<model>` (since they hit OpenRouter directly).
-> - **Claude Code / Hermes Agent** expect `<provider>/<model>` (the `openrouter/` prefix is added internally).
+OpenClaw uses the internal model name `proxy/gpt-5.6-terra` only because its injected provider is named `proxy`. This is an OpenClaw configuration namespace, not the upstream model name: the gateway receives the bare `gpt-5.6-terra` id. The other four harnesses receive the same bare id.
 
-### Using a Custom Model Endpoint (Without OpenRouter)
+### Provider and model alignment
 
-This option currently applies to the **OpenClaw harness** only. If you prefer to use your own API endpoint instead of OpenRouter, you can provide a JSON file and WildClawBench will inject it into `~/.openclaw/openclaw.json` before each task starts.
-
-⚠️ Important: Some task prompts and evaluation scripts currently have OpenRouter explicitly mentioned or hardcoded (e.g., https://openrouter.ai/api/v1). If you bypass OpenRouter, you will need to adjust these references in the respective files manually.
-
-**1. Fill in `my_api.json` (or provide your own JSON file with the same format):**
-```json
-{
-  "providers": {
-    "my-openai-proxy": {
-      "baseUrl": "http://host.docker.internal:8000/v1",
-      "apiKey": "${MY_PROXY_API_KEY}",
-      "api": "openai-completions",
-      "models": [
-        {
-          "id": "my-model",
-          "name": "My Model"
-        }
-      ]
-    }
-  }
-}
-```
-
-This file is the value written into `openclaw.json["models"]`, so it should contain the `models` object itself, not the full `openclaw.json`. If you use `${MY_PROXY_API_KEY}`, WildClawBench will replace it on the host before the config is copied into the container, so `MY_PROXY_API_KEY` must be set in `.env`. WildClawBench always replaces the existing top-level `models` field with the JSON you provide.
-
-**2. Set your model name and required API key in `.env`:**
-```bash
-MY_PROXY_API_KEY=your_api_key_here
-```
-
-**3. Run the benchmark with the models config file:**
-```bash
-python3 eval/run_batch.py --category 01_Productivity_Flow --models-config my_api.json --model my-openai-proxy/my-model
-```
-
-<details>
-<summary>Common provider examples</summary>
-
-OpenAI-compatible proxy:
-
-```json
-{
-  "providers": {
-    "proxy": {
-      "baseUrl": "http://host.docker.internal:8000/v1",
-      "models": [
-        {
-          "id": "gpt-4o",
-          "name": "GPT-4o"
-        }
-      ]
-    }
-  }
-}
-```
-
-Local vLLM or LM Studio:
-
-```json
-{
-  "providers": {
-    "local-openai": {
-      "baseUrl": "http://host.docker.internal:1234/v1",
-      "models": [
-        {
-          "id": "qwen2.5-coder-32b-instruct",
-          "name": "Qwen2.5 Coder 32B Instruct"
-        }
-      ]
-    }
-  }
-}
-```
-
-Provider with explicit API mode and env var key:
-
-```json
-{
-  "providers": {
-    "custom-gateway": {
-      "baseUrl": "http://host.docker.internal:9000/v1",
-      "apiKey": "${MY_PROXY_API_KEY}",
-      "api": "openai-completions",
-      "models": [
-        {
-          "id": "my-reasoning-model",
-          "name": "My Reasoning Model"
-        }
-      ]
-    }
-  }
-}
-```
-
-</details>
+The aligned runner owns provider routing. Keep the task suite and grader
+unchanged; configure the gateway upstream through environment variables and
+leave the benchmark model/image settings in `runner_config.json`. Direct
+`eval/run_batch.py` invocations and custom model configs are for harness
+development only and are not comparable benchmark runs.
 
 ## Check the Results
 
-After the run completes, a per-category summary and a global summary (`output/summary_all.json`) are generated automatically. Each metric is scored from `0.00` to `1.00`.
+After the run completes, the aligned launcher closes the run manifest and moves
+artifacts into `eval_results/wildclaw/<timestamp>-<baseline>/`. Each metric is
+scored from `0.00` to `1.00`.
 
-Per-task results are saved under `output/<harness>/<category>/<task_id>/<model_timestamp_runid>/`:
+Per-task results retain the native harness shape below that run directory:
 
 ```
-output/<harness>/<category>/<task_id>/<model_timestamp_runid>/
+eval_results/wildclaw/<timestamp>-<baseline>/<harness>/<category>/<task_id>/
 ├── score.json          # per-metric scores
 ├── usage.json          # token counts, cost, elapsed time
 ├── agent.log           # agent execution log
@@ -485,10 +380,11 @@ If a run is interrupted (e.g. `Ctrl+C`, terminal closed), some Docker containers
 
 ```bash
 for img in \
-    wildclawbench-ubuntu:v1.3 \
-    wildclawbench-claudecode-ubuntu:v0.2 \
-    wildclawbench-codex-ubuntu:v0.0 \
-    wildclawbench-hermes-agent:v0.5; do
+    wildclawbench-openclaw-ubuntu:v2026.9.1-grader \
+    wildclawbench-claudecode-ubuntu:v2.1.263-grader \
+    wildclawbench-codex-ubuntu:v0.153.4-grader \
+    wildclawbench-hermes-agent:v0.21.0-grader \
+    wildclawbench-perdura-ubuntu:v0.5; do
   docker ps -a --filter "ancestor=$img" -q | xargs -r docker rm -f
 done
 ```

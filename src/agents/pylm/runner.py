@@ -23,9 +23,11 @@ class PyLMAgent(BaseAgent):
     transcript_path = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 
     def __init__(self, image: str | None = None) -> None:
-        self.image = image or os.environ.get(
-            "WILDCLAW_PERDURA_IMAGE", "wildclawbench-perdura-ubuntu:v0.5"
-        )
+        self.image = (image or os.environ.get("WILDCLAW_PERDURA_IMAGE", "")).strip()
+        if not self.image:
+            raise ValueError(
+                "WILDCLAW_PERDURA_IMAGE must be set when no Perdura image is passed"
+            )
         self._summaries: dict[str, dict] = {}
         self._staging_dirs: dict[str, str] = {}
 
