@@ -73,14 +73,24 @@ class ApprovalPosture:
 
 CODEX = ApprovalPosture(
     baseline="codex",
-    mechanism="argv",
+    mechanism="argv+config",
     argv=("--dangerously-bypass-approvals-and-sandbox",),
-    config={"approval_policy": "never"},
+    config={
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+    },
     rationale=(
         "Codex's documented default asks before every command and there is no "
         "UI in a headless container to answer with. The flag is codex's own "
-        "name for the bypass; approval_policy is stated too so a config read "
-        "and an argv read agree."
+        "name for the bypass; approval_policy and sandbox_mode are stated too "
+        "so a config read and an argv read agree -- both are keys the runner "
+        "writes into $CODEX_HOME/config.toml, and both used to be literals in "
+        "codex/runner.py rather than reads of this table. Note that the two "
+        "halves are not delivered on the same turn: config.toml is written "
+        "before every run and is what holds the posture on the first turn, "
+        "while the argv flag is passed only by the resume command "
+        "(codex/runner.py::_build_resume_exec_command). Each run's "
+        "approval_posture.json says which, under `applied`."
     ),
 )
 

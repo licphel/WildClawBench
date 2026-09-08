@@ -185,20 +185,36 @@ class CodexAgent(BaseAgent):
                 write_execution_status(spec.output_dir, status="starting_container")
                 self._start_container(task_id, spec.workspace_path, spec.task, spec.lobster)
                 write_execution_status(spec.output_dir, status="container_started")
-                # codex is the one baseline that never declared its posture:
-                # the bypass is spelled twice, in _build_config_toml's
-                # approval_policy/sandbox_mode and again as the argv flag, and
-                # nothing tied either to POSTURES.  Both are recorded here, so
-                # a finished run says what it applied instead of leaving it to
-                # be reconstructed from the copied-out config.toml.
+                # codex is the one baseline that never declared its
+                # posture: the bypass was spelled three times -- in
+                # _render_codex_config's approval_policy/sandbox_mode, as the
+                # argv flag in _build_resume_exec_command, and again in the
+                # `applied` block here -- and none of the three read POSTURES.
+                # All three now interpolate CODEX_POSTURE, so changing the
+                # module changes what the CLI is given and not just what the
+                # artifact claims.
+                #
+                # `delivered_as` is per-path on purpose, because the two paths
+                # differ and the difference is exactly what an auditor needs:
+                # _build_exec_command (the first turn) passes NO approval flag
+                # and rests entirely on config.toml; only
+                # _build_resume_exec_command adds the argv one.  Recording a
+                # flat "argv + config.toml" would have made the artifact claim
+                # a flag most runs never send.
                 record_posture(
                     spec.output_dir,
                     CODEX_POSTURE,
                     applied={
-                        "delivered_as": "codex exec argv + $CODEX_HOME/config.toml",
+                        "delivered_as": {
+                            "first_turn": "$CODEX_HOME/config.toml only",
+                            "resume_turns": (
+                                "$CODEX_HOME/config.toml + codex exec resume argv"
+                            ),
+                        },
                         "argv": list(CODEX_POSTURE.argv),
+                        "argv_sent_on": "resume turns only",
                         "config": dict(CODEX_POSTURE.config),
-                        "sandbox_mode": "danger-full-access",
+                        "config_path": CODEX_CONFIG_PATH,
                     },
                 )
                 write_execution_status(spec.output_dir, status="preparing_workspace")
@@ -582,8 +598,12 @@ class CodexAgent(BaseAgent):
             f'model_supports_reasoning_summaries = false\n'
             f'hide_agent_reasoning = true\n'
             f'model = "{bare_model}"\n'
-            f'approval_policy = "never"\n'
-            f'sandbox_mode = "danger-full-access"\n'
+            # From src/agents/approval_posture.py, not literals: the run
+            # records CODEX_POSTURE.config into approval_posture.json, so a
+            # literal here is a value the artifact can disagree with while
+            # nothing errors.
+            f'approval_policy = "{CODEX_POSTURE.config["approval_policy"]}"\n'
+            f'sandbox_mode = "{CODEX_POSTURE.config["sandbox_mode"]}"\n'
             f'\n'
             f'[model_providers.openrouter]\n'
             f'name = "openrouter"\n'
@@ -1096,11 +1116,13 @@ if __name__ == "__main__":
         session_id: str | None,
     ) -> str:
         resume_target = shlex.quote(session_id) if session_id else "--last"
+        # Same source as the recorded artifact -- see _render_codex_config.
+        approval_flags = " ".join(CODEX_POSTURE.argv)
         return (
             "cd /tmp_workspace && "
             f"cat {shlex.quote(prompt_path)} | "
             "codex exec resume --skip-git-repo-check "
-            "--dangerously-bypass-approvals-and-sandbox --json "
+            f"{approval_flags} --json "
             f"--output-last-message {shlex.quote(CODEX_LAST_MESSAGE_PATH)} "
             f"{resume_target} -"
         )
