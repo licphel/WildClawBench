@@ -298,7 +298,7 @@ eval_results/wildclaw/<timestamp>-<baseline>/<harness>/<category>/<task_id>/
 └── task_output/        # files produced by the agent
 ```
 
-The subdirectory name is `<short_model>_<timestamp>_<runid>`, where `short_model` is the last segment of the model path (e.g. `claude-sonnet-4.6` from `openrouter/anthropic/claude-sonnet-4.6`) and `runid` is a 6-char random hex string, so parallel or repeated runs never collide.
+The subdirectory name is `<short_model>_<timestamp>_<runid>`, where `short_model` is the last segment of the model path (for this alignment run, `gpt-5.6-terra`) and `runid` is a 6-char random hex string, so parallel or repeated runs never collide.
 
 For independent verification and side-by-side comparison, we have provided the complete evaluation details and trajectories in our Google Drive folder:
 
