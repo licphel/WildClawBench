@@ -33,12 +33,11 @@ class ClaudeCodeAgent(BaseAgent):
         anthropic_base_url: str = "",
         openrouter_base_url: str = "",
     ) -> None:
-        self.image = (
-            image
-            or os.environ.get("DOCKER_IMAGE_CLAUDECODE")
-            or os.environ.get("CLAUDECODE_DOCKER_IMAGE")
-            or "wildclawbench-claudecode-ubuntu:v0.2"
-        )
+        self.image = (image or os.environ.get("DOCKER_IMAGE_CLAUDECODE", "")).strip()
+        if not self.image:
+            raise ValueError(
+                "DOCKER_IMAGE_CLAUDECODE must be set when no Claude Code image is passed"
+            )
         explicit_api_key = anthropic_api_key.strip()
         self.api_key = explicit_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.openrouter_base_url = normalize_openrouter_base_url_for_claudecode(

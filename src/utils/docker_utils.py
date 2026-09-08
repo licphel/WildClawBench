@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE",   "wildclawbench-ubuntu:v1.3")
+DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE", "").strip()
 TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE",  "/tmp_workspace")
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
@@ -23,6 +23,8 @@ def remove_container(name: str) -> None:
 
 def start_container(task_id: str, workspace_path: str, extra_env: str = "",
                     tmp_path: str = "", lobster_env: list[str] | None = None) -> None:
+    if not DOCKER_IMAGE:
+        raise RuntimeError("DOCKER_IMAGE must be set before starting a WildClaw container")
     workspace = Path(workspace_path).expanduser()
     if not workspace.is_dir():
         raise RuntimeError(f"Workspace path does not exist or is not a directory: {workspace}")

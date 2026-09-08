@@ -116,7 +116,9 @@ class CodexAgent(BaseAgent):
         openrouter_base_url: str = "",
         reasoning_effort_default: str = DEFAULT_REASONING_EFFORT,
     ) -> None:
-        resolved_image = image or os.environ.get("DOCKER_IMAGE_CODEX") or "wildclawbench-codex-ubuntu:v0.0"
+        resolved_image = (image or os.environ.get("DOCKER_IMAGE_CODEX", "")).strip()
+        if not resolved_image:
+            raise ValueError("DOCKER_IMAGE_CODEX must be set when no Codex image is passed")
         self.image: str = resolved_image
         self.openrouter_api_key = (
             openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")

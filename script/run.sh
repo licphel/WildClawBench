@@ -4,41 +4,39 @@ set -euo pipefail
 if [[ $# -lt 1 ]]; then
   cat <<'EOF'
 Usage:
-  bash script/run.sh openclaw    [run_batch args...]
-  bash script/run.sh claudecode  [run_batch args...]
-  bash script/run.sh codex       [run_batch args...]
-  bash script/run.sh hermesagent [run_batch args...]
+  bash script/run.sh <openclaw|claudecode|codex|hermesagent|pylm> [run_batch args...]
+
+The benchmark model is fixed by the repository runner config (gpt-5.6-terra).
+Each invocation gets its own output directory and inference gateway.
 
 Examples:
-  bash script/run.sh openclaw --category all --parallel 4 --model openrouter/openai/gpt-5.5
-  bash script/run.sh claudecode --category all --parallel 4 --model openai/gpt-5.5
-  bash script/run.sh codex --category all --parallel 4 --model openrouter/openai/gpt-5.5
-  bash script/run.sh hermesagent --category all --parallel 4 --model openai/gpt-5.5
-
-  bash script/run.sh openclaw --task tasks/06_Safety_Alignment/06_Safety_Alignment_task_1_file_overwrite.md --model openrouter/openai/gpt-5.5
+  bash script/run.sh openclaw --category 01_Productivity_Flow --parallel 1
+  bash script/run.sh pylm --task tasks/01_Productivity_Flow/01_Productivity_Flow_task_6_calendar_scheduling.md
 EOF
   exit 1
 fi
 
 backend="$1"
-shift || true
+shift
 
 case "$backend" in
-  openclaw)
-    exec python3 eval/run_batch.py --agent-backend openclaw "$@"
-    ;;
-  claudecode)
-    exec python3 eval/run_batch.py --agent-backend claudecode "$@"
-    ;;
-  codex)
-    exec python3 eval/run_batch.py --agent-backend codex "$@"
-    ;;
-  hermesagent)
-    exec python3 eval/run_batch.py --agent-backend hermesagent "$@"
+  openclaw|claudecode|codex|hermesagent|pylm)
     ;;
   *)
-    echo "Unknown backend: $backend"
-    echo "Expected one of: openclaw, claudecode, codex, hermesagent"
+    echo "Unknown backend: $backend" >&2
+    echo "Expected one of: openclaw, claudecode, codex, hermesagent, pylm" >&2
     exit 1
     ;;
 esac
+
+WCB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$WCB_ROOT/../.." && pwd)"
+# The outer eval_framework adapter deliberately supplies an absolute output
+# root and sets this to 0; all standalone unified-entrypoint invocations use
+# the manifest-backed layout.
+if [[ "${WILDCLAW_RUN_LAYOUT:-}" != "0" ]]; then
+  export WILDCLAW_RUN_LAYOUT=1
+fi
+export WILDCLAW_RUN_LABEL="${WILDCLAW_RUN_LABEL:-$backend}"
+
+exec bash "$REPO_ROOT/eval_framework/baseline_verifier/wildclawbench/run_${backend}.sh" "$@"

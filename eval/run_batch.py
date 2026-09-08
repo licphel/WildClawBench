@@ -54,7 +54,7 @@ ROOT_DIR         = Path(__file__).resolve().parent.parent
 TASKS_DIR        = ROOT_DIR / os.environ.get("TASKS_SUBDIR",  "tasks")
 OUTPUT_DIR       = ROOT_DIR / os.environ.get("OUTPUT_SUBDIR", "output")
 
-DEFAULT_MODEL    = os.environ.get("DEFAULT_MODEL",    "openrouter/anthropic/claude-sonnet-4.6")
+DEFAULT_MODEL    = os.environ.get("DEFAULT_MODEL",    "gpt-5.6-terra")
 DEFAULT_PARALLEL = int(os.environ.get("DEFAULT_PARALLEL", "1"))
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")

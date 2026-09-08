@@ -25,7 +25,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "wildclawbench-hermes-agent:v0.5")
+HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "").strip()
 HERMES_HOME = "/root/.hermes"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
@@ -44,7 +44,9 @@ class HermesAgentAgent(BaseAgent):
         openrouter_base_url: str = "https://openrouter.ai/api/v1",
         brave_api_key: str = "",
     ) -> None:
-        self.image = image or HERMES_IMAGE
+        self.image = (image or HERMES_IMAGE).strip()
+        if not self.image:
+            raise ValueError("HERMES_DOCKER_IMAGE must be set when no Hermes image is passed")
         self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.openrouter_base_url = openrouter_base_url
         self.brave_api_key = brave_api_key or os.environ.get("BRAVE_API_KEY", "")
