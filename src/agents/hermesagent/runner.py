@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from dotenv import load_dotenv
 
+from src.agents.approval_posture import HERMES as HERMES_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.docker_utils import (
     run_warmup,
@@ -104,6 +105,24 @@ class HermesAgentAgent(BaseAgent):
             run_warmup(spec.task_id, spec.task.get("warmup", ""))
 
             self._configure_hermes(spec.task_id, api_key, base_url, spec.model)
+            # Read back from the container rather than from the string this
+            # process just built: the config only counts once hermes-agent can
+            # load it, and the point of the artifact is that a finished run can
+            # be audited without re-deriving what the harness would have done.
+            readback = subprocess.run(
+                ["docker", "exec", spec.task_id, "/bin/bash", "-c",
+                 f"sed -n '/^approvals:/,/^[^ ]/p' {HERMES_HOME}/config.yaml"],
+                capture_output=True, text=True,
+            )
+            record_posture(
+                spec.output_dir,
+                HERMES_POSTURE,
+                applied={
+                    "delivered_as": f"{HERMES_HOME}/config.yaml (and hermes.yaml)",
+                    "readback": (readback.stdout or "").strip()[:400],
+                    "readback_returncode": readback.returncode,
+                },
+            )
 
             reasoning_config = self._map_thinking(spec.thinking)
             self._write_bench_runner(
@@ -434,6 +453,58 @@ class HermesAgentAgent(BaseAgent):
             )
         lines.extend(
             [
+                # The per-session JSON snapshot is opt-in as of hermes 0.21.0.
+                # ``run_agent._save_session_log`` early-returns unless
+                # ``sessions.write_json_snapshots`` is true
+                # (``hermes_cli/config_defaults.py`` defaults it to False, read
+                # into ``agent._session_json_enabled`` by
+                # ``agent/agent_init.py``), because state.db is now canonical
+                # and the snapshots have no in-tree consumer upstream. They do
+                # have one here: ``~/.hermes/sessions/session_*.json`` is the
+                # only thing ``compat_transcript.py`` can build the graded
+                # openclaw-shaped transcript from, and without it grading, the
+                # usage numbers, the saved artifacts and resume all read an
+                # empty run. Payload shape and path are unchanged from 0.9.0 --
+                # only the gate is new.
+                "sessions:",
+                "  write_json_snapshots: true",
+                # Pinned, not inherited. hermes-agent's own default is
+                # ``approvals.mode: "manual"``
+                # (hermes_cli/config.py DEFAULT_CONFIG, deep-merged under any
+                # user config), and every other WildClaw baseline states its
+                # bypass outright: codex ``--dangerously-bypass-approvals-and-
+                # sandbox``, pylm ``--sandbox-mode dangerous_skip``.
+                #
+                # This block is the *only* thing holding hermes' posture here,
+                # and always has been. The container short-circuit at the top
+                # of ``tools/approval.py:check_all_command_guards`` -- now
+                # ``_should_skip_container_guards`` -- is not a second
+                # mechanism backing it up: it keys on ``env_type``, which is
+                # hermes' *terminal backend* (``TERMINAL_ENV``, default
+                # ``local``), not on whether hermes itself happens to be
+                # running inside a container. WildClaw never sets
+                # ``TERMINAL_ENV`` and never sets ``terminal.backend``, so
+                # ``env_type`` is ``local`` and that branch has never once been
+                # taken on this path, at 0.9.0 or at 0.21.0. (The one place in
+                # this repository that does take it is
+                # ``eval_framework/backends/hermes_backend.py``, which sets
+                # ``TERMINAL_ENV=docker`` for its macOS docker-terminal route.)
+                # 0.21.0 also adds an unconditional hardline floor -- rm -rf /,
+                # mkfs, dd to a raw device, fork bombs -- that runs before
+                # ``mode: "off"`` is even read and cannot be bypassed by any
+                # config; that is deliberate upstream policy, not a posture
+                # this harness can or should declare around.
+                #
+                # Quoted because bare ``off`` is YAML 1.1 false; hermes
+                # normalises that back to "off" (_normalize_approval_mode), but
+                # the config should say what it means. Matches
+                # eval_framework/backends/hermes_backend.py:2244 and
+                # terrarium_agents/hermes_agent.py:978, which both already
+                # write this block.
+                "approvals:",
+                # From src/agents/approval_posture.py, so the value the config
+                # carries and the value the run records are one value.
+                f'  mode: {cls._yaml_quote(HERMES_POSTURE.config["approvals.mode"])}',
                 "tools:",
                 "  profile: coding",
                 "  web:",

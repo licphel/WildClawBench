@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from src.agents.approval_posture import OPENCLAW as OPENCLAW_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.grading import extract_usage_from_jsonl
-from src.utils.transient_errors import resumable_provider_error
+from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
 from src.utils.docker_utils import (
     close_proc_log,
     inject_lobster_workspace,
@@ -27,8 +29,24 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+OPENCLAW_HOME = "/root/.openclaw"
+#: The one path every WildClaw baseline's graded transcript lives at. OpenClaw
+#: no longer writes it itself (see ``prepare_grading_transcript``), so this is
+#: the name of the file the runner puts there, not the name of a file OpenClaw
+#: promises.
+OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_HOME}/agents/main/sessions/chat.jsonl"
+
 OPENCLAW_RESUME_ATTEMPTS = int(os.environ.get("OPENCLAW_RESUME_ATTEMPTS", "0"))
-OPENCLAW_RETRY_DELAY_SECONDS = float(os.environ.get("OPENCLAW_RETRY_DELAY_SECONDS", "2"))
+# Zero, and shared: RESUME_BACKOFF_S is the one place in the repo that
+# decides how long a runner waits before resuming an agent whose attempt
+# died on a provider error.  Backoff is the Gateway Pacer's job -- it reads
+# the upstream's own Retry-After and gates every client through one
+# schedule, which five runners sleeping privately cannot do.  The env var
+# still overrides, for an operator who needs to slow one baseline down by
+# hand.
+OPENCLAW_RETRY_DELAY_SECONDS = float(
+    os.environ.get("OPENCLAW_RETRY_DELAY_SECONDS", str(RESUME_BACKOFF_S))
+)
 OPENCLAW_RESUME_PREFIX = (
     "A previous attempt of this same task was interrupted by a transient "
     "provider error. Continue from the current workspace, preserve and "
@@ -56,7 +74,92 @@ class OpenClawAgent(BaseAgent):
 
     @property
     def transcript_container_path(self) -> str:
-        return "/root/.openclaw/agents/main/sessions/chat.jsonl"
+        return OPENCLAW_TRANSCRIPT_PATH
+
+    def prepare_grading_transcript(self, task_id: str) -> str:
+        """Guarantee ``chat.jsonl`` exists, whichever way OpenClaw stored it.
+
+        OpenClaw wrote one JSONL file per session under
+        ``agents/<id>/sessions/`` up to 2026.3.x. From 2026.9.1 there is no such
+        file: the transcript is rows in the ``transcript_events`` table of
+        ``<state>/agents/<id>/agent/openclaw-agent.sqlite``, and ``sessionFile``
+        survives only as a deprecated "compatibility token; returns the session
+        key, not a file path" (``src/agents/sessions/agent-session-base.ts``).
+        Every consumer here reads the file: the grader loads it through
+        ``transcript_loader.load_transcript`` inside the container, and
+        ``collect_usage`` copies it out and runs ``extract_usage_from_jsonl``
+        over it. A missing file is not an error anywhere -- grading sees an
+        empty transcript and usage reports all zeros -- so the break would have
+        been silent.
+
+        The stored events are byte-identical to the lines the JSONL carried, so
+        this is a container change and not a format change: the rows are
+        emitted in ``(session_id, seq)`` order and nothing is reshaped. The
+        existing file wins when there is one, which keeps this a no-op on an
+        image still carrying an OpenClaw that writes JSONL -- as the WildClaw
+        images do today -- and makes it the source once they are rebuilt.
+        """
+
+        self._materialize_transcript(task_id)
+        return self.transcript_container_path
+
+    def _materialize_transcript(self, task_id: str) -> None:
+        script = f"""python3 - <<'PY'
+import glob
+import json
+import os
+import sqlite3
+
+out = {json.dumps(OPENCLAW_TRANSCRIPT_PATH)}
+if os.path.exists(out) and os.path.getsize(out) > 0:
+    raise SystemExit(0)
+
+rows = []
+for db in sorted(glob.glob({json.dumps(OPENCLAW_HOME)} + "/**/openclaw-agent.sqlite", recursive=True)):
+    try:
+        conn = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        continue
+    try:
+        rows.extend(
+            conn.execute(
+                "select session_id, seq, event_json from transcript_events "
+                "order by session_id, seq"
+            ).fetchall()
+        )
+    except sqlite3.Error:
+        # A run that never reached the agent leaves the table absent.
+        pass
+    finally:
+        conn.close()
+
+os.makedirs(os.path.dirname(out), exist_ok=True)
+written = 0
+with open(out, "w", encoding="utf-8") as handle:
+    for _session_id, _seq, event_json in rows:
+        try:
+            event = json.loads(event_json)
+        except (TypeError, ValueError):
+            continue
+        handle.write(json.dumps(event, ensure_ascii=False) + "\\n")
+        written += 1
+print("materialized %d transcript event(s) from SQLite" % written)
+PY"""
+        r = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            # Loud, never fatal: a transcript this could not build leaves the
+            # run exactly where it already was, and grading still runs.
+            logger.warning(
+                "[%s] Could not materialize the openclaw transcript: %s",
+                task_id,
+                (r.stderr or "").strip()[:400],
+            )
+        elif (r.stdout or "").strip():
+            logger.info("[%s] %s", task_id, (r.stdout or "").strip())
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         gateway_proc = None
@@ -85,6 +188,7 @@ class OpenClawAgent(BaseAgent):
             if spec.models_config:
                 inject_openclaw_models(spec.task_id, spec.models_config)
 
+            self._apply_approval_posture(spec.task_id, spec.output_dir)
             self._set_model(spec.task_id, spec.model)
             self._inject_openrouter_key(spec.task_id)
             image_model = self.image_model or spec.model
@@ -244,10 +348,53 @@ class OpenClawAgent(BaseAgent):
         logger.info("[%s] Model set: %s", task_id, model)
 
     def _inject_openrouter_key(self, task_id: str) -> None:
+        """Save the OpenRouter key where the running OpenClaw will look for it.
+
+        Two stores, one per era. Up to 2026.3.x the credential was a JSON file
+        at ``agents/<id>/agent/auth-profiles.json`` and writing it was the whole
+        job. From 2026.9.1 auth is SQLite, and that file is not merely ignored:
+        it is *detected* by name and makes OpenClaw refuse to start at all --
+        ``AuthProfileMigrationRequiredError``, "requires legacy credential
+        migration; run openclaw doctor --fix"
+        (``src/agents/auth-profiles/legacy-source-diagnostic.ts``). So writing
+        it unconditionally would take the whole baseline down once the image is
+        rebuilt.
+
+        ``models auth paste-api-key`` is the CLI that owns the current store; it
+        reads the key from stdin, so the key never appears in an argv a
+        ``docker exec`` would log, and it writes both the secret and the
+        non-secret ``auth.profiles`` descriptor in config. It does not exist on
+        2026.3.11 (that CLI has ``paste-token`` only), which is exactly what
+        selects the legacy write for an image that still needs it.
+        """
+
         if not self.openrouter_api_key:
             return
 
-        auth_profile_path = "/root/.openclaw/agents/main/agent/auth-profiles.json"
+        modern = subprocess.run(
+            [
+                "docker", "exec", "-i", task_id, "/bin/bash", "-c",
+                "openclaw models auth paste-api-key "
+                "--provider openrouter --profile-id openrouter:default",
+            ],
+            input=self.openrouter_api_key + "\n",
+            capture_output=True,
+            text=True,
+        )
+        if modern.returncode == 0:
+            logger.info(
+                "[%s] Saved OPENROUTER_API_KEY via openclaw models auth paste-api-key",
+                task_id,
+            )
+            return
+        logger.info(
+            "[%s] openclaw models auth paste-api-key unavailable (%s); "
+            "writing the legacy auth-profiles.json instead",
+            task_id,
+            (modern.stderr or modern.stdout or "").strip().splitlines()[-1:] or "",
+        )
+
+        auth_profile_path = f"{OPENCLAW_HOME}/agents/main/agent/auth-profiles.json"
         inject_cmd = f"""python3 - <<'PY'
 import json
 import pathlib
@@ -267,6 +414,68 @@ PY"""
             text=True,
         )
         logger.info("[%s] Injected OPENROUTER_API_KEY into auth-profiles.json", task_id)
+
+    def _apply_approval_posture(self, task_id: str, output_dir: Path) -> None:
+        """Write openclaw's approval posture from the harness, not the image.
+
+        OpenClaw has no bypass flag, so the declaration has to be config -- and
+        it used to be config baked into a Docker layer
+        (``/root/.openclaw/openclaw.json`` and
+        ``/root/.openclaw/exec-approvals.json``), which meant the only way to
+        learn what policy an openclaw run had was to open the image. These are
+        the same three keys ``eval_framework/backends/openclaw_backend.py``
+        writes on the outer path, plus the allowlist file the CLI reads
+        separately from ``openclaw.json``; the values agree with the baked ones
+        key for key, so applying them over an image that still carries them is
+        a no-op rather than a change. What is written, and whether each write
+        succeeded, is recorded next to the task's other artifacts.
+        """
+
+        applied: dict[str, object] = {"config": {}, "files": {}}
+        for key, value in OPENCLAW_POSTURE.config.items():
+            r = subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-c",
+                 f"openclaw config set {shlex.quote(key)} {shlex.quote(str(value))}"],
+                capture_output=True, text=True,
+            )
+            applied["config"][key] = {
+                "value": value,
+                "returncode": r.returncode,
+                "stderr": (r.stderr or "").strip()[:400],
+            }
+            if r.returncode != 0:
+                # Loud, but not fatal: the image still carries the same values,
+                # so a failed write leaves the run in the state it was already
+                # in rather than in an undeclared one. The artifact says which.
+                logger.warning(
+                    "[%s] openclaw config set %s failed: %s",
+                    task_id, key, (r.stderr or "").strip(),
+                )
+        for path, payload in OPENCLAW_POSTURE.files.items():
+            body = json.dumps(payload, ensure_ascii=False)
+            r = subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-c",
+                 f"mkdir -p {shlex.quote(str(Path(path).parent))} && "
+                 f"printf %s {shlex.quote(body)} > {shlex.quote(path)}"],
+                capture_output=True, text=True,
+            )
+            applied["files"][path] = {
+                "returncode": r.returncode,
+                "stderr": (r.stderr or "").strip()[:400],
+            }
+            if r.returncode != 0:
+                logger.warning(
+                    "[%s] writing %s failed: %s", task_id, path, (r.stderr or "").strip()
+                )
+        readback = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c",
+             "cat /root/.openclaw/exec-approvals.json; echo; "
+             "openclaw config get tools.exec.security 2>&1; "
+             "openclaw config get tools.exec.ask 2>&1"],
+            capture_output=True, text=True,
+        )
+        applied["readback"] = (readback.stdout or "").strip()[:2000]
+        record_posture(output_dir, OPENCLAW_POSTURE, applied=applied)
 
     def _set_image_model(self, task_id: str, model: str) -> None:
         subprocess.run(

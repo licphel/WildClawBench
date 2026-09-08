@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.agents.approval_posture import CODEX as CODEX_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.codex.backend import (
     CODEX_PROMPT_PATH,
@@ -35,12 +36,29 @@ DEFAULT_REASONING_EFFORT = "medium" #"high"
 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = int(
     os.environ.get("CODEX_ENCRYPTED_CONTENT_RESUME_ATTEMPTS", "0")
 )
-ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES = int(
-    os.environ.get("CODEX_ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES", "3")
-)
-ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS = float(
-    os.environ.get("CODEX_ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS", "600")
-)
+# 0 = unlimited resumes, bounded in practice by the `remaining <= 30` budget
+# stop below.  Same default and same bound as the other four baselines.
+#
+# Two knobs used to sit beside it and are gone:
+# CODEX_ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES (3) and
+# CODEX_ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS (600).  After three consecutive
+# retryable failures this runner slept **ten minutes** before the next
+# same-session resume -- codex alone; the other four back off 2s per resume and
+# codex had no per-resume backoff at all.  The sleep was refunded from the task
+# budget, so it did not shorten codex's working time, but it did burn ten
+# minutes of real wall clock per occurrence, and once the retry axis was
+# unified on "included" it landed inside the reported elapsed_time.
+#
+# It was also never doing anything.  No `runner.resume_delay` event exists in
+# any agent.log under benchmarks/WildClawBench/output* or eval_results/ -- the
+# branch has not fired in a single run recorded on this host -- and on its own
+# terms it is questionable: the delay is named for `invalid_encrypted_content`,
+# which src/utils/transient_errors.py classes as an UNRECOVERABLE_SESSION
+# pattern precisely because no amount of continuing the same session recovers
+# it, yet the wait was followed by a resume of that same session.  Waiting
+# helps only the quota signatures next to it in that table, and quota is what
+# the Gateway's own Pacer already backs off on, coherently, for all five
+# baselines at once.  See RESUME_BACKOFF_S in src/utils/transient_errors.py.
 CODEX_LOG_NOISE_MARKERS = (
     "ReasoningRawContentDelta without active item",
 )
@@ -167,6 +185,22 @@ class CodexAgent(BaseAgent):
                 write_execution_status(spec.output_dir, status="starting_container")
                 self._start_container(task_id, spec.workspace_path, spec.task, spec.lobster)
                 write_execution_status(spec.output_dir, status="container_started")
+                # codex is the one baseline that never declared its posture:
+                # the bypass is spelled twice, in _build_config_toml's
+                # approval_policy/sandbox_mode and again as the argv flag, and
+                # nothing tied either to POSTURES.  Both are recorded here, so
+                # a finished run says what it applied instead of leaving it to
+                # be reconstructed from the copied-out config.toml.
+                record_posture(
+                    spec.output_dir,
+                    CODEX_POSTURE,
+                    applied={
+                        "delivered_as": "codex exec argv + $CODEX_HOME/config.toml",
+                        "argv": list(CODEX_POSTURE.argv),
+                        "config": dict(CODEX_POSTURE.config),
+                        "sandbox_mode": "danger-full-access",
+                    },
+                )
                 write_execution_status(spec.output_dir, status="preparing_workspace")
                 self._prepare_workspace(task_id, spec.workspace_path)
                 skills_text = spec.task.get("skills", "") if spec.task else ""
@@ -773,7 +807,6 @@ if __name__ == "__main__":
         started = time.perf_counter()
         excluded_retry_time = 0.0
         resume_session_id: str | None = None
-        consecutive_retryable_failures = 0
         attempt = 0
 
         while True:
@@ -825,7 +858,6 @@ if __name__ == "__main__":
                     f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
 
-            consecutive_retryable_failures += 1
             # Every transiently-failed attempt is refunded, the first one
             # included -- claudecode and hermes already refund theirs, and a
             # provider failure on attempt 1 says no more about the agent than
@@ -842,36 +874,6 @@ if __name__ == "__main__":
                 resume_session_id = self._find_latest_session_id(task_id)
 
             resume_no = attempt + 1
-            if (
-                consecutive_retryable_failures >= ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES
-                and ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS > 0
-            ):
-                delay_started = time.perf_counter()
-                append_agent_log_event(
-                    output_dir,
-                    {
-                        "type": "runner.resume_delay",
-                        "reason": retry_reason,
-                        "message": (
-                            "Repeated Codex run failures; delaying "
-                            "before the next same-session resume attempt."
-                        ),
-                        "consecutive_failures": consecutive_retryable_failures,
-                        "delay_seconds": ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS,
-                        "resume_attempt": resume_no,
-                        "resume_session_id": resume_session_id or "last",
-                    },
-                )
-                logger.warning(
-                    "[%s] Codex run failure (%s) repeated %d times; sleeping %.1fs before resume",
-                    task_id,
-                    retry_reason,
-                    consecutive_retryable_failures,
-                    ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS,
-                )
-                time.sleep(ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS)
-                excluded_retry_time += time.perf_counter() - delay_started
-
             max_resume_attempts: int | str = (
                 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
                 if DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
@@ -996,7 +998,7 @@ if __name__ == "__main__":
                 "exec",
                 task_id,
                 "/bin/bash",
-                "-lc",
+                "-c",
                 (
                     "pkill -TERM -f 'codex exec' 2>/dev/null || true; "
                     "sleep 2; "
@@ -1136,7 +1138,7 @@ if __name__ == "__main__":
                 "exec",
                 task_id,
                 "/bin/bash",
-                "-lc",
+                "-c",
                 f"cat {shlex.quote(f'{CODEX_SESSIONS_DIR}/{latest}')}",
             ],
             capture_output=True,

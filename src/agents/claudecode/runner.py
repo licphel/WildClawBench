@@ -12,11 +12,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from src.agents.approval_posture import CLAUDE as CLAUDE_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
-from src.utils.transient_errors import resumable_provider_error
+from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
 
 load_dotenv()
 
@@ -25,7 +26,16 @@ CLAUDECODE_SKILLS_DIR = "/root/.claude/skills"
 CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 CLAUDECODE_RESUME_ATTEMPTS = int(os.environ.get("CLAUDECODE_RESUME_ATTEMPTS", "0"))
-CLAUDECODE_RETRY_DELAY_SECONDS = float(os.environ.get("CLAUDECODE_RETRY_DELAY_SECONDS", "2"))
+# Zero, and shared: RESUME_BACKOFF_S is the one place in the repo that
+# decides how long a runner waits before resuming an agent whose attempt
+# died on a provider error.  Backoff is the Gateway Pacer's job -- it reads
+# the upstream's own Retry-After and gates every client through one
+# schedule, which five runners sleeping privately cannot do.  The env var
+# still overrides, for an operator who needs to slow one baseline down by
+# hand.
+CLAUDECODE_RETRY_DELAY_SECONDS = float(
+    os.environ.get("CLAUDECODE_RETRY_DELAY_SECONDS", str(RESUME_BACKOFF_S))
+)
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -592,10 +602,29 @@ PY"""
                 f"{prompt}"
             )
             resume_flag = "--continue " if is_resume else ""
+            # The approval posture is stated here, by the harness, rather than
+            # left to /claude_code/start.sh -- which is a Docker layer, so a
+            # reader of this repository could not find out what policy a claude
+            # run had. start.sh puts its own copy of the flag before "$@", so
+            # during the overlap the CLI simply receives it twice; the baked
+            # copy can be dropped from the image once whoever owns the build
+            # gets to it. See src/agents/approval_posture.py.
+            approval_flags = " ".join(CLAUDE_POSTURE.argv)
             cmd = (
                 f"cd /claude_code && IS_SANDBOX=1 ./start.sh {resume_flag}"
+                f"{approval_flags} "
                 f"--add-dir /tmp_workspace -p {shlex.quote(current_prompt)} "
                 f"--model {shlex.quote(model)}"
+            )
+            record_posture(
+                output_dir,
+                CLAUDE_POSTURE,
+                applied={
+                    "delivered_as": "docker exec argv",
+                    "flags": list(CLAUDE_POSTURE.argv),
+                    "command": cmd,
+                    "image_side_duplicate": "/claude_code/start.sh",
+                },
             )
             attempt_started = time.perf_counter()
             try:
