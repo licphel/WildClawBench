@@ -56,56 +56,56 @@ The gateway cannot supply it.  It sees request latency; ``elapsed_time`` is the
 agent's wall clock, which also covers container startup, tool execution and
 whatever else the harness put inside its own timer.  So each baseline keeps its
 own number -- and the record says which definition produced it, because the
-five definitions are not the same measurement.  Read off the runners:
+definitions still differ on scope.  Read off the runners:
 
 ===========  =============================================================
 baseline     the clock
 ===========  =============================================================
 claudecode   opened at ``run_task`` entry, so container start, workspace
-             prep, skills and warmup are inside it; the wrapper's own
-             retry attempts and their backoff are subtracted
+             prep, skills and warmup are inside it
 codex        same
 hermesagent  opened *after* container start, prep, skills, warmup and the
-             hermes config write -- agent only; wrapper retry subtracted
+             hermes config write -- agent only
 openclaw     opened after all setup and the gateway's 2s readiness sleep --
-             agent only; nothing subtracted
+             agent only
 pylm         the whole ``docker exec`` of the container entrypoint, so it
              excludes container start but includes the entrypoint's own
-             provider setup and trajectory export; nothing subtracted
+             provider setup and trajectory export
 ===========  =============================================================
 
-Two axes, and they do not line up:
+Two axes.  One of them has been unified; the other has not, and must not be
+read as if it had.
 
-*Scope.*  claudecode and codex time the whole task including container
-startup; hermesagent, openclaw and pylm time the agent alone.
+*Retries: unified, on "included".*  Every baseline retries, but only three of
+the five retry somewhere their Python wrapper can see.  openclaw reconnects
+inside the openclaw CLI (``MAX_RETRIES = 5`` with 1s/2s/4s/8s/16s backoff, in
+``baselines/openclaw/src/agents/openai-ws-connection.ts``) and perdura retries
+inside its own runtime -- it reports ``retry_count`` and nothing more -- so
+neither wrapper can deduct that time however much it wants to.  "Every clock
+includes retry time" is therefore the only convention all five can actually
+satisfy; "every clock subtracts it" is not on the menu, and a column where two
+bars quietly mean something different from the other three is worse than a
+column that is uniformly inclusive.  So the three wrappers that used to
+subtract their own retry attempts no longer do:
 
-*Retries.*  This is the one that bites.  Three baselines subtract the time
-their wrapper spent on retry attempts and backoff; **two do not, and their
-retries are real.**  openclaw's runner has no retry code at all (verified: no
-``retry``/``attempt``/``resume``/``transient``/loop construct in the file) --
-but the openclaw CLI reconnects inside the container, ``MAX_RETRIES = 5`` with
-1s/2s/4s/8s/16s backoff (``baselines/openclaw/src/agents/openai-ws-connection.ts``),
-and the Python wrapper cannot subtract what it never saw.  pylm is the same
-story: ``_run_container_cli`` is a bare ``perf_counter`` span around one
-``docker exec`` and perdura retries inside it (it reports ``retry_count`` and
-subtracts nothing).
+    claudecode   includes wrapper retry time
+    codex        includes
+    hermesagent  includes
+    openclaw     includes (and never could reach the CLI's own reconnects)
+    pylm         includes (and never could reach perdura's own retries)
 
-    claudecode   excludes wrapper retry time
-    codex        excludes
-    hermesagent  excludes
-    openclaw     INCLUDES -- retries happen in-container, invisible to the wrapper
-    pylm         INCLUDES -- perdura's internal retries, never subtracted
+Each wrapper still *measures* the time its own retry attempts and backoff
+cost, because the **task budget** still refunds it: a run resumed after a
+transient provider error gets its full timeout of real work.  That refund is a
+fairness knob about how long the agent may run; it is not, any more, a
+subtraction from the number that gets reported.
 
-So when the upstream is flaky, openclaw's and pylm's seconds are inflated by
-roughly the amount the other three deduct.  Note also that *no* baseline can
-subtract retries that happen inside the agent process -- a wrapper only times
-the process -- so ``includes_in_container_retry_time`` is true for all five and
-the discriminating field is ``excludes_wrapper_retry_time``.
-
-``runtime_semantics`` names which definition produced the number, so nobody
-plots five baselines' runtimes against each other without knowing that two of
-the bars include something the other three deduct.  Unifying the formulas is
-explicitly out of scope here; recording them is not.
+*Scope: not unified.*  claudecode and codex time the whole task including
+container startup; hermesagent, openclaw and pylm time the agent alone.  This
+axis is what ``runtime_semantics`` still discriminates, so nobody plots five
+baselines' runtimes against each other without knowing that two of the bars
+carry container start, workspace prep, skills and warmup that the other three
+do not.
 
 Vocabulary
 ----------
@@ -172,68 +172,128 @@ SELF_REPORTED_CACHE_SEMANTICS = {
 #: How each baseline defines ``elapsed_time``.  Verified against
 #: ``src/agents/<backend>/runner.py`` and, for pylm, against
 #: ``eval_framework/wildclaw_cli_runner.py::_run_container_cli``.
-RUNTIME_TASK_MINUS_RETRIES = "task_wall_clock_minus_wrapper_retries"
-RUNTIME_AGENT_MINUS_RETRIES = "agent_wall_clock_minus_wrapper_retries"
+#: The three ``*_including_retries`` ids are what the runners produce now.
+#: The three ``*_minus_wrapper_retries`` ids are retired but NOT deleted:
+#: ``usage.json`` records already on disk carry them, and a reader that cannot
+#: resolve the id a record was stamped with learns less than one that can.
+RUNTIME_TASK_WITH_RETRIES = "task_wall_clock_including_retries"
 RUNTIME_AGENT_WITH_RETRIES = "agent_wall_clock_including_retries"
 RUNTIME_CONTAINER_CLI_WITH_RETRIES = "container_cli_wall_clock_including_retries"
+RUNTIME_TASK_MINUS_RETRIES = "task_wall_clock_minus_wrapper_retries"
+RUNTIME_AGENT_MINUS_RETRIES = "agent_wall_clock_minus_wrapper_retries"
+RUNTIME_CONTAINER_CLI_MINUS_RETRIES = "container_cli_wall_clock_minus_wrapper_retries"
 RUNTIME_UNKNOWN = "unknown"
 RUNTIME_SEMANTICS_VALUES = (
-    RUNTIME_TASK_MINUS_RETRIES,
-    RUNTIME_AGENT_MINUS_RETRIES,
+    RUNTIME_TASK_WITH_RETRIES,
     RUNTIME_AGENT_WITH_RETRIES,
     RUNTIME_CONTAINER_CLI_WITH_RETRIES,
+    RUNTIME_TASK_MINUS_RETRIES,
+    RUNTIME_AGENT_MINUS_RETRIES,
+    RUNTIME_CONTAINER_CLI_MINUS_RETRIES,
     RUNTIME_UNKNOWN,
+)
+
+#: The ids no baseline reports any more.  Kept resolvable for records written
+#: before the retry axis was unified; a *new* record carrying one of these is
+#: a bug, not history.
+RUNTIME_RETIRED_SEMANTICS = frozenset(
+    {
+        RUNTIME_TASK_MINUS_RETRIES,
+        RUNTIME_AGENT_MINUS_RETRIES,
+        RUNTIME_CONTAINER_CLI_MINUS_RETRIES,
+    }
 )
 
 #: ``includes_container_setup``
 #:     whether container start, workspace prep, skills and warmup sit inside
-#:     the clock.
+#:     the clock.  This is the discriminating field: two baselines open the
+#:     clock before the container exists, three after.
 #: ``excludes_wrapper_retry_time``
 #:     whether the Python wrapper subtracted the time its own retry attempts
-#:     and backoff cost.  This is the discriminating field: three baselines do,
-#:     two do not, and the two that do not still retry.
+#:     and backoff cost.  False for every baseline in current use -- two of
+#:     the five could never have subtracted anything (their retries are inside
+#:     the agent process), so "included" is the only convention all five can
+#:     satisfy.  True only on the retired ids.
 #: ``includes_in_container_retry_time``
 #:     true for every baseline.  A wrapper times a process; retries inside that
 #:     process are inside the number and cannot be removed after the fact.
 #: ``retry_sites``
 #:     where the retries this number does or does not count actually happen.
+#: ``retired``
+#:     present and true on the ids no runner produces any more.  They resolve
+#:     so that records already on disk stay readable.
 RUNTIME_DEFINITIONS = {
+    RUNTIME_TASK_WITH_RETRIES: {
+        "includes_container_setup": True,
+        "excludes_wrapper_retry_time": False,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["wrapper", "in-agent"],
+        "note": "clock opens at run_task entry, before the container starts, "
+                "so container start, workspace prep, skills and warmup are "
+                "inside it; nothing is subtracted -- the wrapper's own resumed "
+                "attempts and their backoff are inside the number, as are the "
+                "agent's internal retries.  The wrapper still measures its own "
+                "retry time, but only to refund the task budget",
+    },
+    RUNTIME_AGENT_WITH_RETRIES: {
+        "includes_container_setup": False,
+        "excludes_wrapper_retry_time": False,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["wrapper", "in-agent"],
+        "note": "clock opens after container start, prep, skills and warmup, "
+                "just before the agent process, and nothing is subtracted: "
+                "the wrapper's own resumed attempts are inside the number, and "
+                "so are the agent's internal ones -- for openclaw that is the "
+                "CLI reconnecting inside the container (MAX_RETRIES = 5, "
+                "1s/2s/4s/8s/16s backoff), which no wrapper ever saw",
+    },
+    RUNTIME_CONTAINER_CLI_WITH_RETRIES: {
+        "includes_container_setup": False,
+        "excludes_wrapper_retry_time": False,
+        "includes_in_container_retry_time": True,
+        "retry_sites": ["wrapper", "in-agent"],
+        "note": "the whole docker exec of the container entrypoint: excludes "
+                "container start but includes the entrypoint's provider setup "
+                "and trajectory export, the attempts _run_container_cli "
+                "resumed after a transient provider error, and perdura's own "
+                "internal retries (reported as retry_count, never subtractable)",
+    },
     RUNTIME_TASK_MINUS_RETRIES: {
         "includes_container_setup": True,
         "excludes_wrapper_retry_time": True,
         "includes_in_container_retry_time": True,
         "retry_sites": ["wrapper", "in-agent"],
-        "note": "clock opens at run_task entry, before the container starts; "
-                "the wrapper's own retry attempts and backoff are subtracted, "
-                "the agent's internal ones are not",
+        "retired": True,
+        "note": "RETIRED.  clock opens at run_task entry, before the container "
+                "starts; the wrapper's own retry attempts and backoff are "
+                "subtracted, the agent's internal ones are not.  claudecode "
+                "and codex reported this until the retry axis was unified on "
+                "'included'; kept so those records still resolve",
     },
     RUNTIME_AGENT_MINUS_RETRIES: {
         "includes_container_setup": False,
         "excludes_wrapper_retry_time": True,
         "includes_in_container_retry_time": True,
         "retry_sites": ["wrapper", "in-agent"],
-        "note": "clock opens after container start, prep, skills and warmup; "
-                "the wrapper's own retry attempts and backoff are subtracted",
+        "retired": True,
+        "note": "RETIRED.  clock opens after container start, prep, skills and "
+                "warmup; the wrapper's own retry attempts and backoff are "
+                "subtracted.  hermesagent and openclaw reported this until the "
+                "retry axis was unified on 'included'; kept so those records "
+                "still resolve",
     },
-    RUNTIME_AGENT_WITH_RETRIES: {
+    RUNTIME_CONTAINER_CLI_MINUS_RETRIES: {
         "includes_container_setup": False,
-        "excludes_wrapper_retry_time": False,
+        "excludes_wrapper_retry_time": True,
         "includes_in_container_retry_time": True,
-        "retry_sites": ["in-agent"],
-        "note": "clock opens just before the agent process and nothing is "
-                "subtracted: the runner has no retry code, but the openclaw "
-                "CLI reconnects inside the container (MAX_RETRIES = 5, "
-                "1s/2s/4s/8s/16s backoff) and the wrapper never sees it",
-    },
-    RUNTIME_CONTAINER_CLI_WITH_RETRIES: {
-        "includes_container_setup": False,
-        "excludes_wrapper_retry_time": False,
-        "includes_in_container_retry_time": True,
-        "retry_sites": ["in-agent"],
-        "note": "the whole docker exec of the container entrypoint: excludes "
-                "container start but includes the entrypoint's provider setup "
-                "and trajectory export, and includes perdura's internal "
-                "retries (reported as retry_count, never subtracted)",
+        "retry_sites": ["wrapper", "in-agent"],
+        "retired": True,
+        "note": "RETIRED.  the docker exec of the container entrypoint, minus "
+                "the attempts _run_container_cli resumed after a transient "
+                "provider error; perdura's own internal retries were still "
+                "inside the number (reported as retry_count).  pylm reported "
+                "this until the retry axis was unified on 'included'; kept so "
+                "those records still resolve",
     },
     RUNTIME_UNKNOWN: {
         "includes_container_setup": None,
@@ -245,9 +305,9 @@ RUNTIME_DEFINITIONS = {
 }
 
 RUNTIME_SEMANTICS_BY_BASELINE = {
-    "claudecode": RUNTIME_TASK_MINUS_RETRIES,
-    "codex": RUNTIME_TASK_MINUS_RETRIES,
-    "hermesagent": RUNTIME_AGENT_MINUS_RETRIES,
+    "claudecode": RUNTIME_TASK_WITH_RETRIES,
+    "codex": RUNTIME_TASK_WITH_RETRIES,
+    "hermesagent": RUNTIME_AGENT_WITH_RETRIES,
     "openclaw": RUNTIME_AGENT_WITH_RETRIES,
     "pylm": RUNTIME_CONTAINER_CLI_WITH_RETRIES,
 }
@@ -480,6 +540,16 @@ def fetch_gateway_usage() -> dict[str, Any] | None:
     }
     for gateway_key, our_key in _GATEWAY_KEY_MAP.items():
         snapshot[our_key] = _int(raw.get(gateway_key))
+    # Timing and anomalies, for adjudicating a wall-clock timeout. Kept under
+    # private keys because `_counters_only` -- what reaches usage.json's
+    # cumulative_before/after -- filters to `_COUNTERS`, so these ride along
+    # inside the process without widening the record's published shape.
+    state = payload.get("requests")
+    snapshot["_requests"] = dict(state) if isinstance(state, dict) else None
+    anomalies = payload.get("anomalies")
+    snapshot["_anomaly_count"] = (
+        _int(anomalies.get("count")) if isinstance(anomalies, dict) else None
+    )
     return snapshot
 
 
@@ -544,6 +614,95 @@ class GatewayUsageWindow:
     def exclusive(self) -> bool:
         return self.concurrent_tasks_max <= 1
 
+    def timeout_evidence(self) -> dict[str, Any]:
+        """What the Gateway saw across this task, for a timeout adjudication.
+
+        Consumed by ``src/utils/transient_errors.py::timeout_was_inference_anomaly``
+        and written verbatim into ``usage.json`` so the decision can be
+        re-derived from the artifacts. Building it here rather than there keeps
+        the rule (which patterns and thresholds mean what) in the module every
+        layer shares, and the retrieval (which is Gateway-shaped and
+        WildClaw-specific) in the module that already owns retrieval.
+
+        Every age is computed against the **Gateway's own clock** (``now`` in
+        its ``requests`` block), never against ours: the WildClaw singleton
+        happens to run on the same host as the batch, but Sentinel's runs
+        inside the trial container and the two clocks need not agree.
+        """
+
+        before, after = self.before, self.after
+        base: dict[str, Any] = {
+            "schema_version": 1,
+            "attributable": False,
+            "unattributable_reason": None,
+            "request_count": None,
+            "anomaly_count": None,
+            "in_flight_at_close": None,
+            "in_flight_age_s": None,
+            "idle_tail_s": None,
+            "stalled_request_age_s": _stalled_request_age_s(),
+        }
+        if not before or not after:
+            _, _, reason = _Endpoint.resolve()
+            base["unattributable_reason"] = (
+                f"no gateway counter for this task ({reason})"
+            )
+            return base
+        if not self.exclusive:
+            base["unattributable_reason"] = (
+                f"{self.concurrent_tasks_max} task windows overlapped, so the "
+                "gateway's movement cannot be attributed to this task"
+            )
+            return base
+
+        state_before = before.get("_requests")
+        state_after = after.get("_requests")
+        if not isinstance(state_after, dict) or not isinstance(state_before, dict):
+            base["unattributable_reason"] = (
+                "the gateway does not report per-request timing (it predates "
+                "the provenance 'requests' block); only counts are available"
+            )
+            return base
+
+        delta = self.delta()
+        base["request_count"] = None if delta is None else delta["request_count"]
+
+        anomalies_before = before.get("_anomaly_count")
+        anomalies_after = after.get("_anomaly_count")
+        if isinstance(anomalies_before, int) and isinstance(anomalies_after, int):
+            base["anomaly_count"] = max(0, anomalies_after - anomalies_before)
+
+        now = state_after.get("now")
+        opened_at = state_before.get("now")
+        base["in_flight_at_close"] = _int(state_after.get("in_flight"))
+
+        oldest = state_after.get("oldest_in_flight_started_at")
+        if (
+            isinstance(now, (int, float))
+            and isinstance(oldest, (int, float))
+            and isinstance(opened_at, (int, float))
+            # Only a request that started inside this task's window belongs to
+            # it. A shared singleton gateway can still be holding a stalled
+            # request from an *earlier* task whose handler never returned;
+            # blaming this task's timeout on that would retry a healthy run.
+            and oldest >= opened_at
+        ):
+            base["in_flight_age_s"] = round(float(now) - float(oldest), 1)
+
+        last = state_after.get("last_completed_at")
+        if isinstance(now, (int, float)) and isinstance(last, (int, float)):
+            base["idle_tail_s"] = round(float(now) - float(last), 1)
+
+        if base["request_count"] is None:
+            base["unattributable_reason"] = (
+                "the gateway counter moved backwards (it was restarted "
+                "mid-task), so the difference measures nothing"
+            )
+            return base
+
+        base["attributable"] = True
+        return base
+
     def delta(self) -> dict[str, Any] | None:
         """This window's movement of the Gateway counter, or ``None``.
 
@@ -596,6 +755,13 @@ def annotate_usage(
     gateway sees request latency, not the agent's wall clock -- but
     ``runtime_source``/``runtime_semantics`` record which of the five
     definitions produced it.
+
+    ``gateway_usage.timeout_adjudication`` carries what the Gateway saw about
+    *timing* across the same window: enough for
+    ``transient_errors.timeout_was_inference_anomaly`` to say whether a
+    wall-clock timeout was the agent running long or the upstream stalling.
+    It is written on every task so the threshold stays re-calibratable from a
+    normal batch's artifacts, not only from its failures.
     """
     self_semantics = self_reported_cache_semantics(backend)
     self_block = dict(self_reported)
@@ -618,6 +784,20 @@ def annotate_usage(
     self_block["runtime_source"] = USAGE_SOURCE_BACKEND
     self_block["runtime_semantics"] = runtime_semantics
 
+    # Stamped on every task, not only on the ones that time out: run_batch.py
+    # reads it off the result to decide whether a timeout earns a retry, and
+    # keeping it on the healthy runs too is what makes the threshold
+    # re-calibratable from the artifacts of a normal batch.
+    timeout_evidence = (
+        window.timeout_evidence()
+        if window is not None
+        else {
+            "schema_version": 1,
+            "attributable": False,
+            "unattributable_reason": "no usage window opened",
+        }
+    )
+
     delta = window.delta() if window is not None else None
     if delta is None:
         _, _, reason = _Endpoint.resolve()
@@ -626,6 +806,7 @@ def annotate_usage(
             "status": "unavailable",
             "reason": reason if window is not None else "no usage window opened",
             "source": "inference_gateway_upstream",
+            "timeout_adjudication": timeout_evidence,
         }
         record["usage_source"] = (
             USAGE_SOURCE_NONE if _reported_nothing(self_reported) else USAGE_SOURCE_BACKEND
@@ -646,6 +827,7 @@ def annotate_usage(
         "total_tokens": total_tokens(delta, GATEWAY_CACHE_SEMANTICS),
         "cumulative_before": _counters_only(window.before),
         "cumulative_after": _counters_only(window.after),
+        "timeout_adjudication": timeout_evidence,
     }
 
     if not window.exclusive:
@@ -687,6 +869,20 @@ def annotate_usage(
         )
         record["cache_semantics"] = self_semantics
     return record
+
+
+def _stalled_request_age_s() -> float | None:
+    """The adjudication threshold, recorded alongside the evidence it judges.
+
+    Imported lazily and defensively: this module is also loaded by tests and
+    tools that have no ``src`` package on the path, and a missing threshold
+    should degrade the record's completeness, never break usage accounting.
+    """
+    try:
+        from src.utils.transient_errors import STALLED_REQUEST_AGE_S
+    except Exception:  # noqa: BLE001
+        return None
+    return float(STALLED_REQUEST_AGE_S)
 
 
 def _reported_nothing(usage: dict[str, Any]) -> bool:

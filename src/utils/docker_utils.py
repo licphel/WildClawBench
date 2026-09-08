@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE",   "wildclawbench-ubuntu:v1.3")
+# -grader: carries the shared grading interpreter (src/utils/grading.py::
+# GRADER_PYTHON). The agent-visible environment is unchanged from v1.3-node.
+DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE",   "wildclawbench-ubuntu:v1.3-node-grader")
 TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE",  "/tmp_workspace")
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
@@ -245,13 +247,23 @@ def run_warmup(
             if detach_background and stripped_cmd.endswith("&"):
                 background_cmd = stripped_cmd[:-1].strip()
                 log_path = f"/tmp/wildclaw_warmup_{idx}.log"
+                # `-c`, not `-lc`, in both shells here and everywhere else in
+                # the harness.  These two lines were the only place a warmup
+                # command's PATH depended on whether it ended in `&`: the
+                # backgrounded branch used a login shell and the branch below
+                # does not, so the same warmup line saw two different PATHs
+                # depending on a trailing character.  In the hermes image that
+                # was a real difference -- a login shell there sourced uv's
+                # env script and inserted /root/.local/bin, which carries uv's
+                # own package-less python3.12.  Every image's ENV PATH is now
+                # authoritative and complete, so a login shell adds nothing.
                 wrapped = (
                     f"cd {TMP_WORKSPACE} && "
-                    f"nohup /bin/bash -lc {shlex.quote(background_cmd)} "
+                    f"nohup /bin/bash -c {shlex.quote(background_cmd)} "
                     f"> {shlex.quote(log_path)} 2>&1 < /dev/null &"
                 )
                 r = subprocess.run(
-                    ["docker", "exec", task_id, "/bin/bash", "-lc", wrapped],
+                    ["docker", "exec", task_id, "/bin/bash", "-c", wrapped],
                     capture_output=True,
                     text=True,
                 )
@@ -294,9 +306,11 @@ def run_warmup(
             break
 
 
-def run_background(task_id: str, bash_cmd: str, log_path: Path) -> subprocess.Popen:
+def run_background(
+    task_id: str, bash_cmd: str, log_path: Path, append: bool = False
+) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open("w", encoding="utf-8")
+    log_file = log_path.open("a" if append else "w", encoding="utf-8")
     proc = subprocess.Popen(
         ["docker", "exec", task_id, "/bin/bash", "-c",
          f"cd {TMP_WORKSPACE} && {bash_cmd}"],
