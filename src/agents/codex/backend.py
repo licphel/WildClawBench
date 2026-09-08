@@ -57,7 +57,7 @@ def _copy_text_to_container(task_id: str, container_path: str, text: str) -> Non
                     "0",
                     task_id,
                     "/bin/sh",
-                    "-lc",
+                    "-c",
                     (
                         f"ls -ld {shlex.quote(container_dir)} 2>&1 || true; "
                         "id -un 2>/dev/null || true; "
@@ -169,7 +169,7 @@ def ensure_codex_cli(task_id: str) -> None:
     last_error_output = ""
     for attempt in range(CODEX_BOOTSTRAP_RETRIES + 1):
         result = subprocess.run(
-            ["docker", "exec", task_id, "/bin/bash", "-lc", bootstrap_cmd],
+            ["docker", "exec", task_id, "/bin/bash", "-c", bootstrap_cmd],
             capture_output=True,
             text=True,
         )

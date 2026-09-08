@@ -18,6 +18,7 @@ from src.agents.base import AgentTaskSpec, BaseAgent
 from src.agents.claudecode import ClaudeCodeAgent
 from src.agents.codex import CodexAgent
 from src.agents.openclaw import OpenClawAgent
+from src.agents.pylm import PyLMAgent
 from src.utils.cli_args import parse_run_batch_args
 from src.utils.endpoint_utils import (
     normalize_openrouter_base_url_for_claudecode,
@@ -36,6 +37,11 @@ from src.utils.grading import (
     print_summary,
     print_global_summary,
     write_error_score as write_error_score_file,
+)
+from src.utils.transient_errors import (
+    MAX_TASK_ATTEMPTS,
+    attempt_evidence,
+    should_retry_attempt,
 )
 from src.utils import gateway_usage
 
@@ -64,6 +70,17 @@ OPENROUTER_BASE_URL_CLAUDECODE = normalize_openrouter_base_url_for_claudecode(
     os.environ.get("OPENROUTER_BASE_URL", "")
 )
 MODELS_API_KEY_PLACEHOLDER = "${MY_PROXY_API_KEY}"
+
+#: Baselines graded even when the run reported an error, so a failed task keeps
+#: its real (usually near-zero) per-check breakdown instead of empty scores.
+#: All five are listed rather than making this unconditional so an unrecognised
+#: backend still falls back to the conservative behaviour.  Matched by *class
+#: name* via gateway_usage.backend_name, not isinstance: HermesAgentAgent is
+#: imported lazily inside main() to keep it off the module-level import path,
+#: which is exactly why gateway_usage.BACKEND_NAME_BY_CLASS maps by name too.
+GRADE_ON_ERROR_BACKENDS = frozenset(
+    {"claudecode", "codex", "hermesagent", "openclaw", "pylm"}
+)
 
 ALL_CATEGORIES = [
     "01_Productivity_Flow",
@@ -257,7 +274,22 @@ def run_single_task(
     finally:
         usage_window.close()
         grading_transcript_path = backend.transcript_container_path
-        grade_on_error = isinstance(backend, (CodexAgent, ClaudeCodeAgent))
+        # This started as an isinstance tuple that grew one baseline at a time:
+        # OpenClawAgent previously never set result["error"] (openclaw/runner.py
+        # returned error=None unconditionally), so "not result.get('error')" was
+        # always true for it and grading always ran. Once runner.py surfaced
+        # embedded-run failures (e.g. an upstream provider hiccup) as a real
+        # error — so run_single_task_with_retry can detect and retry them —
+        # OpenClawAgent needed grade_on_error=True too, or it would silently
+        # skip grading on that path and leave the task with empty scores instead
+        # of the real (near-)zero breakdown it always got before.  hermesagent
+        # was the one baseline never given the same treatment, and via
+        # isinstance it could not be: HermesAgentAgent is imported lazily and
+        # naming it here would force an eager module-level import.  Matching on
+        # the backend name instead fixes that, and all five are now aligned.
+        grade_on_error = (
+            gateway_usage.backend_name(backend) in GRADE_ON_ERROR_BACKENDS
+        )
         should_grade = task.get("automated_checks") and (
             not result.get("error") or grade_on_error
         )
@@ -300,7 +332,9 @@ def run_single_task(
             collect_task_output(
                 task_id,
                 output_dir,
-                include_workspace_changes=isinstance(backend, (CodexAgent, ClaudeCodeAgent)),
+                include_workspace_changes=isinstance(
+                    backend, (CodexAgent, ClaudeCodeAgent, PyLMAgent)
+                ),
             )
         except Exception as exc:
             logger.warning("[%s] Failed to collect task output: %s", task_id, exc)
@@ -321,8 +355,72 @@ def run_single_task(
                     pass
 
         remove_container(task_id)
+        if isinstance(backend, PyLMAgent):
+            backend.cleanup_staging(task_id)
         logger.info("[%s] Container cleaned up", task_id)
 
+    return result
+
+
+# Infra-level hiccups (npm registry connection reset mid-download, upstream LLM
+# provider returning a transient 5xx-style error) have nothing to do with agent
+# capability. Most of these (specifically the LLM-provider kind) are now retried
+# cheaply in-place by OpenClawAgent.run_task itself, reusing the same container
+# / gateway / session (src/agents/openclaw/runner.py) — that should resolve the
+# common case without ever reaching here. This is the fallback for whatever
+# survives that: non-agent-level failures (docker start, warmup) that can only
+# raise once from run_single_task, or an embedded-run error that stayed
+# transient through all of OpenClawAgent's in-container attempts. Rebuilding
+# the whole container is expensive, so only one fallback attempt.
+#
+# The number is no longer WildClaw's to choose. MAX_TASK_ATTEMPTS is the
+# repo-wide budget in src/utils/transient_errors.py (authoritative copy:
+# eval_framework/retry_policy.py), so this harness and the shared
+# eval_framework/runner.py that drives Sentinel, ToolMaze, BEAM and
+# vendor_onboarding cannot answer "re-run this task?" differently.
+MAX_TRANSIENT_RETRIES = max(0, MAX_TASK_ATTEMPTS - 1)
+
+
+def run_single_task_with_retry(*args, **kwargs) -> dict:
+    """run_single_task, retried only on a demonstrated inference anomaly.
+
+    Each attempt gets its own output_dir (fresh run_id from run_single_task),
+    so a retry never clobbers a prior attempt's artifacts.
+
+    The decision itself is not made here -- ``should_retry_attempt`` in
+    src/utils/transient_errors.py is the one place in the repo that decides it,
+    and it reads the same two things every caller can supply: the failure text,
+    and what the Gateway saw across the attempt (already written into this
+    attempt's usage.json under ``gateway_usage.timeout_adjudication``, so the
+    verdict can be re-derived from the artifacts afterwards).
+
+    What that gate is worth, measured: 01_Productivity_Flow/task_1 timed out at
+    1224s having made 31 gateway requests with the last landing 46s before the
+    deadline and nothing open at it -- an agent working right up to the wall.
+    Under the old string-only rule it was handed a second container and a
+    second clock, and scored 0.3705 where the first attempt scored 0.0. That is
+    not correcting a measurement error, it is manufacturing a better score.
+    """
+
+    result = run_single_task(*args, **kwargs)
+    attempt = 1
+    while attempt <= MAX_TRANSIENT_RETRIES:
+        retry, why = should_retry_attempt(
+            result.get("error"), attempt_evidence(result)
+        )
+        if not retry:
+            if result.get("error"):
+                logger.info(
+                    "[%s] Kept as the measurement, not retried: %s",
+                    result.get("task_id"), why,
+                )
+            break
+        logger.warning(
+            "[%s] Rebuilding container (attempt %d/%d): %s",
+            result.get("task_id"), attempt, MAX_TRANSIENT_RETRIES, why,
+        )
+        result = run_single_task(*args, **kwargs)
+        attempt += 1
     return result
 
 
@@ -344,6 +442,8 @@ def main() -> None:
             openrouter_api_key=OPENROUTER_API_KEY,
             openrouter_base_url=OPENROUTER_BASE_URL_OPENCLAW,
         )
+    elif args.agent_backend == "pylm":
+        backend = PyLMAgent()
     else:
         backend = OpenClawAgent(
             gateway_port=GATEWAY_PORT,
@@ -389,7 +489,7 @@ def main() -> None:
             sys.exit(1)
         task = parse_task_md(task_file)
         logger.info("Single task mode: %s", task["task_id"])
-        result = run_single_task(
+        result = run_single_task_with_retry(
             task,
             args.model,
             backend=backend,
@@ -437,7 +537,7 @@ def main() -> None:
         if args.parallel <= 1:
             for task in tasks:
                 results.append(
-                    run_single_task(
+                    run_single_task_with_retry(
                         task,
                         args.model,
                         backend=backend,
@@ -451,7 +551,7 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.parallel) as pool:
                 futures = {
                     pool.submit(
-                        run_single_task,
+                        run_single_task_with_retry,
                         task,
                         args.model,
                         backend,

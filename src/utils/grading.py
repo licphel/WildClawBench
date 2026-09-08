@@ -8,10 +8,65 @@ import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 
+from src.utils.transient_errors import is_transient_error
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE", "/tmp_workspace")
+MAX_GRADING_RETRIES = 2
+
+GRADER_PYTHON = "/opt/wildclaw-grader/bin/python"
+"""The one interpreter every baseline is graded with.
+
+Grading runs inside the agent's own container, and the five images put five
+different interpreters on ``python3`` -- openclaw/claudecode ``/usr/bin/python3``
+3.10.12, codex a conda env 3.11.15, hermes ``/opt/hermes/.venv`` 3.12.13, pylm a
+PyReduce venv 3.13.15 -- with different packages behind them. That made the same
+``automated_checks`` score differently per baseline: the official claudecode
+image has neither pymupdf nor PyPDF2, so ``06_Safety_Alignment_task_1``'s
+``looks_like_mae_pdf()`` took its ``return True`` fallback and unlocked 0.5 of
+that task for one baseline only, and ``05_..._task_8`` imports ``bs4`` at
+grading time where two images have none. The images now all carry this venv at
+this fixed path.
+
+The agent-visible ``python3`` was separately aligned afterwards: codex,
+claudecode, hermes and pylm now all resolve it to ``/root/miniconda3/envs/eval``
+(CPython 3.12.13), the environment the tasks name by absolute path. openclaw is
+the deliberate exception and still resolves ``/usr/bin/python3`` 3.10.12 -- see
+the note in eval_framework/baseline_verifier/wildclawbench/Dockerfile.openclaw.
+That alignment is independent of this constant: grading uses GRADER_PYTHON
+either way, so scores stay comparable regardless of what the agent runs under.
+"""
+
+
+def _grader_interpreter(task_id: str) -> str:
+    """``GRADER_PYTHON`` if the container has it, else the agent's ``python3``.
+
+    A hard switch would break every container built before the grader landed.
+    The fallback is deliberately loud rather than silent: grading on the agent's
+    own interpreter is exactly the defect this replaces, so a run that does it
+    has to say so in its log instead of quietly producing numbers that are not
+    comparable across baselines.
+    """
+
+    probe = subprocess.run(
+        ["docker", "exec", task_id, "test", "-x", GRADER_PYTHON],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if probe.returncode == 0:
+        return GRADER_PYTHON
+    logger.warning(
+        "[%s] %s missing; grading falls back to the agent image's own python3. "
+        "Scores from this run are NOT comparable across baselines -- rebuild the "
+        "image with the shared grader layer.",
+        task_id,
+        GRADER_PYTHON,
+    )
+    return "python3"
+
 
 def _write_score(output_dir: Path, task_id: str, scores: dict) -> None:
     score_path = output_dir / "score.json"
@@ -127,19 +182,34 @@ def run_grading(
             masked = value[:4] + "***"
             logger.info("[%s] Injecting grading lobster env: %s=%s", task_id, key, masked)
 
-        r = subprocess.run(
-            ["docker", "exec", *env_args, task_id, "python3", "/tmp/_grade_runner.py"],
-            capture_output=True,
-            text=True,
-            timeout=3200,
-        )
-        if r.returncode != 0:
-            logger.error("[%s] Grading script execution failed: %s", task_id, r.stderr)
-            return _grading_error(
-                output_dir,
-                task_id,
-                f"grade script failed: {r.stderr}",
-                write_error_score,
+        # Some tasks' grade() functions call an LLM judge over the same relay
+        # (OPENROUTER_API_KEY/BASE_URL, injected above) that the agent itself
+        # uses — subject to the same transient upstream hiccups. Grading is
+        # read-only over an already-collected transcript/workspace, so
+        # re-running it is safe and idempotent; retry it in place rather than
+        # letting one relay blip silently zero out an otherwise-good task.
+        r = None
+        interpreter = _grader_interpreter(task_id)
+        for attempt in range(1, MAX_GRADING_RETRIES + 2):
+            r = subprocess.run(
+                ["docker", "exec", *env_args, task_id, interpreter, "/tmp/_grade_runner.py"],
+                capture_output=True,
+                text=True,
+                timeout=3200,
+            )
+            if r.returncode == 0:
+                break
+            if not is_transient_error(r.stderr) or attempt == MAX_GRADING_RETRIES + 1:
+                logger.error("[%s] Grading script execution failed: %s", task_id, r.stderr)
+                return _grading_error(
+                    output_dir,
+                    task_id,
+                    f"grade script failed: {r.stderr}",
+                    write_error_score,
+                )
+            logger.warning(
+                "[%s] Grading script hit a transient error (attempt %d/%d), retrying: %s",
+                task_id, attempt, MAX_GRADING_RETRIES + 1, r.stderr[:300],
             )
 
         try:
