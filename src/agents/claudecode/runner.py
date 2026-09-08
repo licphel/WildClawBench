@@ -16,6 +16,7 @@ from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
+from src.utils.transient_errors import resumable_provider_error
 
 load_dotenv()
 
@@ -25,33 +26,6 @@ CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 CLAUDECODE_RESUME_ATTEMPTS = int(os.environ.get("CLAUDECODE_RESUME_ATTEMPTS", "0"))
 CLAUDECODE_RETRY_DELAY_SECONDS = float(os.environ.get("CLAUDECODE_RETRY_DELAY_SECONDS", "2"))
-CLAUDECODE_PROVIDER_ERROR_MARKERS = (
-    "insufficient quota",
-    "no available channel",
-    "current group has no available channels",
-    "invalid_encrypted_content",
-    "encrypted content could not be verified",
-    "could not be decrypted or parsed",
-    "api call failed",
-    "badrequesterror",
-    "non-retryable",
-    "peer closed connection",
-    "incomplete chunked read",
-    "read operation timed out",
-    "connection reset",
-    "connection error",
-    "connection aborted",
-    "network error",
-    "network aborted",
-    "econnreset",
-    "etimedout",
-    "eai_again",
-    "bad gateway",
-    "service unavailable",
-    "api error: 5",
-    "http 400",
-    "http 429",
-)
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -66,7 +40,11 @@ class ClaudeCodeAgent(BaseAgent):
             image
             or os.environ.get("DOCKER_IMAGE_CLAUDECODE")
             or os.environ.get("CLAUDECODE_DOCKER_IMAGE")
-            or "wildclawbench-claudecode-ubuntu:v0.2"
+            # v2.1.90 is the CLI version this harness pins; -grader adds the
+            # shared grading interpreter. The default used to be the official
+            # v0.2, which disagreed with what runner_config.json pins -- two
+            # entry points, two different images for the same baseline.
+            or "wildclawbench-claudecode-ubuntu:v2.1.90-grader"
         )
         explicit_api_key = anthropic_api_key.strip()
         self.api_key = explicit_api_key or os.environ.get("OPENROUTER_API_KEY", "")
@@ -183,14 +161,30 @@ class ClaudeCodeAgent(BaseAgent):
             )
             run_warmup(task_id, spec.task.get("warmup", ""))
             snapshot_workspace_state(task_id)
-            excluded_retry_time = self._run_prompt(
+            wrapper_retry_seconds = self._run_prompt(
                 task_id,
                 spec.prompt,
                 spec.model,
                 spec.timeout_seconds,
                 spec.output_dir,
             )
-            elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
+            # Retry time stays INSIDE elapsed_time, deliberately.  Every
+            # baseline retries, but only three of the five retry in a place
+            # their Python wrapper can see: openclaw reconnects inside the
+            # openclaw CLI and perdura retries inside its own runtime, so no
+            # wrapper there can deduct anything.  "Includes retries" is the
+            # only definition all five can actually satisfy, and a column
+            # where two bars silently mean something else is worse than a
+            # column that is uniformly inclusive.  _run_prompt still measures
+            # the wrapper's retry time and still keeps it off the *task
+            # budget* -- a resumed run gets its full timeout -- it is simply
+            # not subtracted from the reported wall clock.
+            elapsed_time = time.perf_counter() - start_time
+            if wrapper_retry_seconds:
+                logger.info(
+                    "[%s] ClaudeCode elapsed %.2fs, including %.2fs of wrapper retry time",
+                    task_id, elapsed_time, wrapper_retry_seconds,
+                )
             return AgentExecution(elapsed_time=elapsed_time, error=None, gateway_proc=None, agent_proc=None)
         except subprocess.TimeoutExpired:
             logger.info("[%s] ClaudeCode timed out...", task_id)
@@ -626,9 +620,18 @@ PY"""
                 log.write(output)
                 if output and not output.endswith("\n"):
                     log.write("\n")
-            provider_error = any(marker in output.lower() for marker in CLAUDECODE_PROVIDER_ERROR_MARKERS)
-            if r.returncode == 0 and not provider_error:
+            # Keyed on the run having actually failed. This used to retry a
+            # returncode-0 run whose output merely contained a marker, so a
+            # task whose transcript quotes an HTTP 400 from its own in-task
+            # mock API earned a free extra turn on the task budget.
+            if r.returncode == 0:
                 return excluded_retry_time
+            provider_error = resumable_provider_error(output)
+            if provider_error is None:
+                raise RuntimeError(
+                    f"ClaudeCode run failed without a resumable provider error "
+                    f"(rc={r.returncode}):\n{output}"
+                )
             excluded_retry_time += attempt_elapsed
             if CLAUDECODE_RESUME_ATTEMPTS > 0 and attempt >= CLAUDECODE_RESUME_ATTEMPTS:
                 raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")

@@ -11,7 +11,9 @@ from dotenv import load_dotenv
 
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.grading import extract_usage_from_jsonl
+from src.utils.transient_errors import resumable_provider_error
 from src.utils.docker_utils import (
+    close_proc_log,
     inject_lobster_workspace,
     inject_openclaw_models,
     run_background,
@@ -24,6 +26,15 @@ from src.utils.docker_utils import (
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+OPENCLAW_RESUME_ATTEMPTS = int(os.environ.get("OPENCLAW_RESUME_ATTEMPTS", "0"))
+OPENCLAW_RETRY_DELAY_SECONDS = float(os.environ.get("OPENCLAW_RETRY_DELAY_SECONDS", "2"))
+OPENCLAW_RESUME_PREFIX = (
+    "A previous attempt of this same task was interrupted by a transient "
+    "provider error. Continue from the current workspace, preserve and "
+    "verify completed work, and finish every required output. Do not "
+    "restart the task or discuss the interruption. The original task is:\n\n"
+)
 
 
 class OpenClawAgent(BaseAgent):
@@ -92,27 +103,85 @@ class OpenClawAgent(BaseAgent):
             time.sleep(2)
 
             safe_prompt = spec.prompt.replace("'", "'\\''")
-            start_time = time.perf_counter()
-            agent_proc = run_background(
-                spec.task_id,
-                bash_cmd=f"openclaw agent --session-id chat --timeout {spec.timeout_seconds} --message '{safe_prompt}'",
-                log_path=spec.output_dir / "agent.log",
+            safe_resume_prompt = (OPENCLAW_RESUME_PREFIX + spec.prompt).replace(
+                "'", "'\\''"
             )
-
-            logger.info("[%s] Waiting for agent to finish...", spec.task_id)
-            try:
-                agent_proc.wait(timeout=spec.timeout_seconds)
-                elapsed_time = time.perf_counter() - start_time
-                logger.info(
-                    "[%s] Agent finished successfully, elapsed: %.2f seconds",
+            agent_log = spec.output_dir / "agent.log"
+            start_time = time.perf_counter()
+            excluded_retry_time = 0.0
+            resume_attempt = 0
+            while True:
+                log_offset = agent_log.stat().st_size if agent_log.exists() else 0
+                counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
+                remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
+                message = safe_prompt if resume_attempt == 0 else safe_resume_prompt
+                agent_proc = run_background(
                     spec.task_id,
-                    elapsed_time,
+                    bash_cmd=f"openclaw agent --session-id chat --timeout {remaining} --message '{message}'",
+                    log_path=agent_log,
+                    append=resume_attempt > 0,
                 )
-            except subprocess.TimeoutExpired:
-                logger.info("[%s] Agent timed out...", spec.task_id)
-                elapsed_time = float(spec.timeout_seconds)
-                agent_proc.kill()
-                agent_proc.wait()
+
+                logger.info("[%s] Waiting for agent to finish...", spec.task_id)
+                attempt_started = time.perf_counter()
+                try:
+                    agent_proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    logger.info("[%s] Agent timed out...", spec.task_id)
+                    elapsed_time = float(spec.timeout_seconds)
+                    agent_proc.kill()
+                    agent_proc.wait()
+                    break
+                attempt_elapsed = time.perf_counter() - attempt_started
+                # Retry time stays INSIDE elapsed_time, deliberately; see the
+                # note in the claudecode runner.  This runner could never
+                # deduct the openclaw CLI's own reconnects (MAX_RETRIES = 5
+                # with 1s/2s/4s/8s/16s backoff, in
+                # baselines/openclaw/src/agents/openai-ws-connection.ts)
+                # anyway, so deducting only the wrapper's half made the number
+                # neither inclusive nor exclusive.  excluded_retry_time is
+                # still accumulated: the task budget still refunds a resumed
+                # attempt.
+                elapsed_time = time.perf_counter() - start_time
+                if agent_proc.returncode == 0:
+                    logger.info(
+                        "[%s] Agent finished successfully, elapsed: %.2f seconds",
+                        spec.task_id,
+                        elapsed_time,
+                    )
+                    break
+                provider_error_reason = self._find_error_marker(agent_log, log_offset)
+                if provider_error_reason is None:
+                    # Unchanged from before this loop existed: a non-zero exit
+                    # carrying no provider signature is the agent's own failure,
+                    # and the workspace it left behind is still the measurement.
+                    break
+                excluded_retry_time += attempt_elapsed
+                if OPENCLAW_RESUME_ATTEMPTS > 0 and resume_attempt >= OPENCLAW_RESUME_ATTEMPTS:
+                    raise RuntimeError(
+                        f"OpenClaw agent failed after a provider error "
+                        f"({provider_error_reason}) with no resume attempts left "
+                        f"(rc={agent_proc.returncode})"
+                    )
+                if remaining <= 30:
+                    raise RuntimeError(
+                        f"OpenClaw agent failed after a provider error "
+                        f"({provider_error_reason}) and no useful time remains for resume"
+                    )
+                if OPENCLAW_RETRY_DELAY_SECONDS > 0:
+                    delay_started = time.perf_counter()
+                    time.sleep(OPENCLAW_RETRY_DELAY_SECONDS)
+                    excluded_retry_time += time.perf_counter() - delay_started
+                close_proc_log(agent_proc)
+                resume_attempt += 1
+                logger.warning(
+                    "[%s] OpenClaw agent exited non-zero after a provider error (%s); "
+                    "retrying the same session (%s/%s)",
+                    spec.task_id,
+                    provider_error_reason,
+                    resume_attempt,
+                    OPENCLAW_RESUME_ATTEMPTS or "unlimited",
+                )
 
             logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)
             return AgentExecution(
@@ -129,6 +198,16 @@ class OpenClawAgent(BaseAgent):
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
             )
+
+    @staticmethod
+    def _find_error_marker(log_path: Path, offset: int) -> str | None:
+        """Return the provider-failure signature this attempt logged, if any."""
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                return resumable_provider_error(log.read())
+        except OSError:
+            return None
 
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict:
         transcript_host = output_dir / "chat.jsonl"

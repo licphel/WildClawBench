@@ -20,6 +20,7 @@ from src.agents.codex.backend import (
 )
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_openclaw
+from src.utils.transient_errors import resumable_provider_error
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,6 @@ CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
-ENCRYPTED_CONTENT_ERROR_MARKER = "invalid_encrypted_content"
-INSTANT_INFERENCE_QUOTA_ERROR_MARKER = "Insufficient quota available for instant inference"
-GENERIC_CODEX_RUN_FAILED_REASON = "codex_run_failed"
-RETRYABLE_CODEX_ERROR_MARKERS = (
-    ENCRYPTED_CONTENT_ERROR_MARKER,
-    INSTANT_INFERENCE_QUOTA_ERROR_MARKER,
-)
 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = int(
     os.environ.get("CODEX_ENCRYPTED_CONTENT_RESUME_ATTEMPTS", "0")
 )
@@ -133,7 +127,13 @@ class CodexAgent(BaseAgent):
         openrouter_base_url: str = "",
         reasoning_effort_default: str = DEFAULT_REASONING_EFFORT,
     ) -> None:
-        resolved_image = image or os.environ.get("DOCKER_IMAGE_CODEX") or "wildclawbench-codex-ubuntu:v0.0"
+        resolved_image = (
+            image
+            or os.environ.get("DOCKER_IMAGE_CODEX")
+            # -grader adds only the shared grading interpreter; the official
+            # v0.0 agent environment underneath is untouched.
+            or "wildclawbench-codex-ubuntu:v0.0-grader"
+        )
         self.image: str = resolved_image
         self.openrouter_api_key = (
             openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
@@ -209,7 +209,7 @@ class CodexAgent(BaseAgent):
                     self._install_image_helper(task_id, spec.model)
                 snapshot_workspace_state(task_id)
                 write_execution_status(spec.output_dir, status="codex_running")
-                excluded_retry_time = self._run_prompt(
+                wrapper_retry_seconds = self._run_prompt(
                     task_id=task_id,
                     prompt=self._build_task_prompt(
                         spec.prompt,
@@ -219,7 +219,20 @@ class CodexAgent(BaseAgent):
                     timeout_seconds=spec.timeout_seconds,
                     output_dir=spec.output_dir,
                 )
-                elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
+                # Retry time stays INSIDE elapsed_time, deliberately; see
+                # the same note in the claudecode runner.  openclaw's and
+                # perdura's retries happen inside their own processes, where
+                # no wrapper can see or deduct them, so "includes retries" is
+                # the only definition all five baselines can satisfy.
+                # _run_prompt still measures the wrapper's retry time and
+                # still keeps it off the task budget; it is just no longer
+                # taken off the reported clock.
+                elapsed_time = time.perf_counter() - start_time
+                if wrapper_retry_seconds:
+                    logger.info(
+                        "[%s] Codex elapsed %.2fs, including %.2fs of wrapper retry time",
+                        task_id, elapsed_time, wrapper_retry_seconds,
+                    )
                 write_execution_status(
                     spec.output_dir,
                     status="finished",
@@ -789,7 +802,18 @@ if __name__ == "__main__":
                 return excluded_retry_time
 
             combined = self._combined_process_output(r)
-            retry_reason = self._codex_error_reason(combined)
+            retry_reason = resumable_provider_error(combined)
+            if retry_reason is None:
+                # All five baselines now read the same table
+                # (src/utils/transient_errors.py). A non-zero exit with no
+                # provider signature is the agent's own failure: resuming it
+                # would refund budget for time the agent really did spend.
+                if is_resume:
+                    excluded_retry_time += attempt_elapsed
+                raise RuntimeError(
+                    f"Codex run failed without a resumable provider error "
+                    f"(rc={r.returncode}):\n{r.stderr or r.stdout}"
+                )
             resume_limit_reached = (
                 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
                 and attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
@@ -802,8 +826,11 @@ if __name__ == "__main__":
                 )
 
             consecutive_retryable_failures += 1
-            if is_resume:
-                excluded_retry_time += attempt_elapsed
+            # Every transiently-failed attempt is refunded, the first one
+            # included -- claudecode and hermes already refund theirs, and a
+            # provider failure on attempt 1 says no more about the agent than
+            # the same failure on attempt 2.
+            excluded_retry_time += attempt_elapsed
 
             if remaining <= 30:
                 raise RuntimeError(
@@ -962,14 +989,6 @@ if __name__ == "__main__":
         )
 
     @staticmethod
-    def _codex_error_reason(combined_output: str) -> str:
-        combined_lower = combined_output.lower()
-        for marker in RETRYABLE_CODEX_ERROR_MARKERS:
-            if marker.lower() in combined_lower:
-                return marker
-        return GENERIC_CODEX_RUN_FAILED_REASON
-
-    @staticmethod
     def _terminate_codex_processes(task_id: str) -> None:
         subprocess.run(
             [
@@ -1009,38 +1028,26 @@ if __name__ == "__main__":
         image_helper_enabled: bool,
         skill_docs: list[dict[str, str]] | None = None,
     ) -> str:
-        sections: list[str] = []
-        if image_helper_enabled:
-            sections.append(
-                "## Image Helper\n\n"
-                "When image understanding is needed, use the recoverable helper "
-                "instead of Codex built-in image input. Do not call the `view_image` "
-                "tool or attach images to the model; this OpenRouter setup can fail "
-                "on that path via the /responses API:\n\n"
-                '```bash\npython3 /tmp_workspace/.wildclaw_image.py "<image_path>" "<question>"\n```\n\n'
-                "The helper returns JSON and exits 0 even if the image model call "
-                "fails. It defaults to the task model. Call it at most twice per task. "
-                "Do not call any built-in image input, `view_image`, `--image`, "
-                "`input_image`, or file:// image URLs. If the helper returns "
-                "ok=false because the model or endpoint cannot handle the request, "
-                "you may make a direct OpenRouter /chat/completions request using "
-                "OPENROUTER_API_KEY, OPENROUTER_BASE_URL, and an image-capable model. "
-                "Otherwise, continue with other available methods and still write the required output files. "
-                "After the required files are written, finish instead of doing "
-                "extra image verification."
-            )
-        if skill_docs:
-            skill_sections = [
-                "## Local Skill References\n\n"
-                "Use these task-specific instructions when they apply. They describe local files, mock APIs, and required workflows available in this container."
-            ]
-            for skill in skill_docs:
-                skill_sections.append(
-                    f"### Skill: {skill['name']}\n\n{skill['content'].strip()}"
-                )
-            sections.append("\n\n".join(skill_sections))
-        sections.append("## Task\n\n" + prompt.strip())
-        return "\n\n".join(sections).strip() + "\n"
+        """The benchmark's own prompt, and nothing else.
+
+        This used to prepend two codex-only sections. `## Image Helper` was ~180
+        words telling the model not to use `view_image` and to call a harness
+        script instead; `## Local Skill References` inlined the full text of
+        every SKILL.md the task ships -- 5.5 KB for agent-browser, 19.7 KB for
+        self-improving-agent, across 27 of the 60 tasks. No other baseline
+        received either: claudecode, hermesagent, openclaw and pylm all forward
+        `spec.prompt` after the one shared preamble in eval/run_batch.py, and
+        they discover skills from disk the way the task intends. Handing codex
+        the skills pre-read into context was a backend-specialized prompt, which
+        the fairness rule forbids outright.
+
+        The parameters stay so callers need no change and the decision of
+        whether an image task is in play is still recorded; they no longer
+        reach the model.
+        """
+
+        del image_helper_enabled, skill_docs
+        return prompt.strip() + "\n"
 
     @staticmethod
     def _should_enable_image_helper(prompt: str, workspace_path: str) -> bool:

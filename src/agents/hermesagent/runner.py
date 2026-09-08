@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -20,24 +20,23 @@ from src.utils.docker_utils import (
     TMP_WORKSPACE,
 )
 from src.utils.grading import extract_usage_from_jsonl
+from src.utils.transient_errors import (
+    resumable_provider_error,
+    unrecoverable_session_error,
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "wildclawbench-hermes-agent:v0.5")
+# -grader adds only the shared grading interpreter; the official v0.5 agent
+# environment underneath is untouched.
+HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "wildclawbench-hermes-agent:v0.5-grader")
 HERMES_HOME = "/root/.hermes"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
 HERMES_RESUME_ATTEMPTS = int(os.environ.get("HERMES_RESUME_ATTEMPTS", "0"))
 HERMES_RETRY_DELAY_SECONDS = float(os.environ.get("HERMES_RETRY_DELAY_SECONDS", "2"))
-HERMES_RESUMABLE_ERROR_MARKERS = (
-    "invalid_encrypted_content",
-    "encrypted content could not be verified",
-    "could not be decrypted or parsed",
-    "insufficient quota for instant inference",
-    "quota for instant inference",
-)
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 BENCH_RUNNER_HOST_PATH = Path(__file__).with_name("bench_runner.py")
@@ -139,7 +138,8 @@ class HermesAgentAgent(BaseAgent):
                             break
                         except subprocess.TimeoutExpired:
                             provider_error_reason = self._find_error_marker(
-                                spec.output_dir / "agent.log", log_offset
+                                spec.output_dir / "agent.log", log_offset,
+                                unrecoverable_session_error,
                             )
                             if provider_error_reason:
                                 logger.warning(
@@ -168,7 +168,17 @@ class HermesAgentAgent(BaseAgent):
                 attempt_elapsed = time.perf_counter() - attempt_started
                 self._close_runner_streams(agent_proc)
                 if agent_proc.returncode == 0 and not provider_error_reason:
-                    elapsed_time = max(0.0, time.perf_counter() - start_time - excluded_retry_time)
+                    # Retry time stays INSIDE elapsed_time, deliberately; see
+                    # the note in the claudecode runner.  excluded_retry_time
+                    # is still accumulated below because the *task budget*
+                    # still refunds a resumed attempt -- only the reported
+                    # wall clock stopped deducting it.
+                    elapsed_time = time.perf_counter() - start_time
+                    if excluded_retry_time:
+                        logger.info(
+                            "[%s] hermes-agent elapsed %.2fs, including %.2fs of wrapper retry time",
+                            spec.task_id, elapsed_time, excluded_retry_time,
+                        )
                     break
                 if not provider_error_reason:
                     raise RuntimeError(
@@ -210,7 +220,7 @@ class HermesAgentAgent(BaseAgent):
             if start_time is not None:
                 elapsed_time = min(
                     float(spec.timeout_seconds),
-                    max(0.0, time.perf_counter() - start_time - excluded_retry_time),
+                    max(0.0, time.perf_counter() - start_time),
                 )
             return AgentExecution(
                 elapsed_time=elapsed_time,
@@ -585,7 +595,12 @@ class HermesAgentAgent(BaseAgent):
                 pass
 
     @classmethod
-    def _find_error_marker(cls, log_path: Path, offset: int) -> str | None:
+    def _find_error_marker(
+        cls,
+        log_path: Path,
+        offset: int,
+        matcher: Callable[[str], str | None] = resumable_provider_error,
+    ) -> str | None:
         try:
             with log_path.open("r", encoding="utf-8", errors="replace") as log:
                 log.seek(offset)
@@ -599,9 +614,9 @@ class HermesAgentAgent(BaseAgent):
             # normal in the benchmark image and must not trigger a resume.
             if "tools.registry" in line and "unavailable (check failed)" in line:
                 continue
-            for marker in HERMES_RESUMABLE_ERROR_MARKERS:
-                if marker in line:
-                    return marker
+            marker = matcher(line)
+            if marker:
+                return marker
         return None
 
     @staticmethod
