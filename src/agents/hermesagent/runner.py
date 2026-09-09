@@ -439,7 +439,7 @@ class HermesAgentAgent(BaseAgent):
             "  provider: custom",
             f"  base_url: {base_value}",
             f"  api_key: {key_value}",
-            "  api_mode: chat_completions",
+            "  api_mode: codex_responses",
             "  context_length: 128000",
             "terminal:",
             f"  cwd: {TMP_WORKSPACE}",
@@ -453,7 +453,7 @@ class HermesAgentAgent(BaseAgent):
                     f"    model: {model_value}",
                     f"    base_url: {base_value}",
                     f"    api_key: {key_value}",
-                    "    api_mode: chat_completions",
+                    "    api_mode: codex_responses",
                 ]
             )
         lines.extend(
