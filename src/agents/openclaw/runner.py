@@ -202,8 +202,14 @@ PY"""
                 bash_cmd=(
                     f"export OPENROUTER_API_KEY='{self.openrouter_api_key}' && "
                     f"export OPENROUTER_BASE_URL='{self.openrouter_base_url}' && "
+                    "for attempt in 1 2; do "
                     f"openclaw gateway run --port {self.gateway_port} "
-                    "--bind loopback --auth none --allow-unconfigured"
+                    "--bind loopback --auth none --allow-unconfigured; "
+                    "status=$?; "
+                    "if [ $status -eq 0 ] || [ $attempt -eq 2 ]; then "
+                    "exit $status; fi; "
+                    "sleep 1; "
+                    "done"
                 ),
                 log_path=spec.output_dir / "gateway.log",
             )
