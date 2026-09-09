@@ -358,7 +358,6 @@ class HermesAgentAgent(BaseAgent):
             "-e", f"OPENROUTER_API_KEY={api_key}",
             "-e", f"OPENROUTER_BASE_URL={base_url}",
             "-e", "HERMES_INFERENCE_PROVIDER=custom",
-            "-e", "HERMES_EVAL_ALLOW_CUSTOM_RESPONSES=1",
             "-e", f"TERMINAL_CWD={TMP_WORKSPACE}",
             "-e", f"no_proxy={'' if not proxy_http else os.environ.get('NO_PROXY_INNER', '')}",
         ]
