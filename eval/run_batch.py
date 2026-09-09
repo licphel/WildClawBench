@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import json
@@ -142,19 +143,20 @@ def grade_the_task(
 
 def save_usage(output_dir: Path, result: dict, usage: dict, task_id: str) -> dict:
     result["usage"] = usage
-    if usage["request_count"] > 0:
+    request_count = usage.get("request_count")
+    if isinstance(request_count, int) and request_count > 0:
         # usage_source/cache_semantics are logged, not just written: the whole
         # point of the record is that a number is meaningless without them, and
         # the console is where an operator first sees it.
         logger.info(
-            "[%s] Token usage (%s, cache=%s) - input:%d output:%d cache_read:%d "
-            "total:%d cost:$%.4f",
+            "[%s] Token usage (%s, cache=%s) - input:%s output:%s cache_read:%s "
+            "total:%s cost:$%s",
             task_id,
             usage.get("usage_source", gateway_usage.USAGE_SOURCE_BACKEND),
             usage.get("cache_semantics", gateway_usage.CACHE_UNKNOWN),
-            usage["input_tokens"], usage["output_tokens"],
-            usage["cache_read_tokens"], usage["total_tokens"],
-            usage["cost_usd"],
+            usage.get("input_tokens"), usage.get("output_tokens"),
+            usage.get("cache_read_tokens"), usage.get("total_tokens"),
+            usage.get("cost_usd"),
         )
     usage_path = output_dir / "usage.json"
     usage_path.write_text(
@@ -178,6 +180,26 @@ def collect_task_output(
         )
     except Exception as exc:
         logger.warning("[%s] Failed to collect task output: %s", task_id, exc)
+
+
+def _publish_task_result(result: dict) -> None:
+    """Publish exactly one canonical result for the logical Task."""
+    output_dir = result.get("_output_dir")
+    if not output_dir:
+        return
+    payload = {
+        key: value for key, value in result.items()
+        if not key.startswith("_")
+        and key not in {"retry_adjudication", "attempt", "attempt_id", "history"}
+    }
+    payload.setdefault("status", "all_attempts_failed" if result.get("error") else "ok")
+    if result.get("error"):
+        payload["score"] = 0.0
+    path = Path(output_dir) / "task_result.json"
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
 
 
 def load_models_config(models_config_path: Path) -> dict:
@@ -232,7 +254,14 @@ def run_single_task(
     output_dir = output_root / task["category"] / f"{task_id_ori}" / f"{suffix}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    result = {"task_id": task_id, "scores": {}, "error": None}
+    result = {
+        "task_id": task_id,
+        "scores": {},
+        "error": None,
+        # Private runner state. Consumed by run_single_task_with_retry before
+        # the published Task result is returned.
+        "_output_dir": str(output_dir),
+    }
 
     gateway_proc = None
     agent_proc = None
@@ -384,8 +413,9 @@ MAX_TRANSIENT_RETRIES = max(0, MAX_TASK_ATTEMPTS - 1)
 def run_single_task_with_retry(*args, **kwargs) -> dict:
     """run_single_task, retried only on a demonstrated inference anomaly.
 
-    Each attempt gets its own output_dir (fresh run_id from run_single_task),
-    so a retry never clobbers a prior attempt's artifacts.
+    Each execution gets a temporary output_dir. When the policy replaces it,
+    that directory is deleted before the next execution starts, so the final
+    output tree contains exactly one execution for the logical Task.
 
     The decision itself is not made here -- ``should_retry_attempt`` in
     src/utils/transient_errors.py is the one place in the repo that decides it,
@@ -415,12 +445,28 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
                     result.get("task_id"), why,
                 )
             break
+        stale_output = result.pop("_output_dir", None)
+        if stale_output:
+            try:
+                shutil.rmtree(Path(stale_output))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "[%s] Failed to remove replaced Task output %s: %s",
+                    result.get("task_id"), stale_output, exc,
+                )
         logger.warning(
-            "[%s] Rebuilding container (attempt %d/%d): %s",
-            result.get("task_id"), attempt, MAX_TRANSIENT_RETRIES, why,
+            "[%s] Rebuilding container after an upstream inference anomaly: %s",
+            result.get("task_id"), why,
         )
         result = run_single_task(*args, **kwargs)
         attempt += 1
+    if result.get("error") and attempt > 1:
+        result["status"] = "all_attempts_failed"
+        result["score"] = 0.0
+    _publish_task_result(result)
+    result.pop("_output_dir", None)
     return result
 
 

@@ -357,12 +357,13 @@ def timeout_was_inference_anomaly(
     * A request open for minutes is the stall, because no completed request has
       ever taken longer than 70s (see STALLED_REQUEST_AGE_S).
 
-    Two further legs, both of which are also "the upstream, not the agent":
-    the Gateway recorded an anomaly of its own during the run (it classifies
-    upstream stalls and repudiated sessions itself -- see
-    ``inference_gateway.py::note_anomaly``), or it served this task nothing at
-    all, in which case no inference reached the agent and there is nothing to
-    measure.
+    A further leg is also "the upstream, not the agent": the Gateway recorded
+    an anomaly of its own during the run (it classifies upstream stalls and
+    repudiated sessions itself -- see ``inference_gateway.py::note_anomaly``).
+    Merely serving zero requests is deliberately *not* evidence of an upstream
+    failure: the agent, container, or Gateway itself may have failed before a
+    request was sent, and task-level retry is reserved for upstream inference
+    anomalies.
 
     Absence of evidence is not an anomaly. When the Gateway could not be
     reached, is too old to report request timing, or the window overlapped
@@ -384,11 +385,6 @@ def timeout_was_inference_anomaly(
         return True, standing
 
     requests = _as_int(evidence.get("request_count"))
-    if requests == 0:
-        return True, (
-            "the gateway served this task zero inference requests, so the "
-            "attempt measured nothing about the agent"
-        )
 
     age = evidence.get("in_flight_age_s")
     if isinstance(age, (int, float)) and age >= STALLED_REQUEST_AGE_S:
