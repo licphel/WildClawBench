@@ -14,15 +14,15 @@ from src.agents.approval_posture import CODEX as CODEX_POSTURE
 
 logger = logging.getLogger(__name__)
 
-TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE", "/tmp_workspace")
+TMP_WORKSPACE = "/tmp_workspace"
 OPENCLAW_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 CODEX_PROMPT_PATH = "/tmp/codex_prompt.txt"
 CODEX_LAST_MESSAGE_PATH = "/tmp/codex_last_message.txt"
 CONTAINER_CODEX_HOME = "/root/.codex"
-DEFAULT_CODEX_NPM_PACKAGE = os.environ.get("CODEX_NPM_PACKAGE", "@openai/codex")
-DEFAULT_CODEX_NPM_VERSION = os.environ.get("CODEX_NPM_VERSION", "0.117.0")
-CODEX_BOOTSTRAP_RETRIES = int(os.environ.get("CODEX_BOOTSTRAP_RETRIES", "2"))
-CODEX_BOOTSTRAP_RETRY_BASE_DELAY = float(os.environ.get("CODEX_BOOTSTRAP_RETRY_BASE_DELAY", "3"))
+DEFAULT_CODEX_NPM_PACKAGE = "@openai/codex"
+DEFAULT_CODEX_NPM_VERSION = "0.153.4"
+CODEX_BOOTSTRAP_RETRIES = 2
+CODEX_BOOTSTRAP_RETRY_BASE_DELAY = 3.0
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 

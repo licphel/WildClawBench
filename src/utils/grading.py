@@ -13,7 +13,7 @@ from src.utils.transient_errors import is_transient_error
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE", "/tmp_workspace")
+TMP_WORKSPACE = "/tmp_workspace"
 MAX_GRADING_RETRIES = 2
 
 GRADER_PYTHON = "/opt/wildclaw-grader/bin/python"

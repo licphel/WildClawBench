@@ -33,9 +33,7 @@ CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
-DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = int(
-    os.environ.get("CODEX_ENCRYPTED_CONTENT_RESUME_ATTEMPTS", "0")
-)
+DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = 0
 # 0 = unlimited resumes, bounded in practice by the `remaining <= 30` budget
 # stop below.  Same default and same bound as the other four baselines.
 #
@@ -405,9 +403,6 @@ class CodexAgent(BaseAgent):
         env_map: dict[str, str] = {
             "OPENROUTER_API_KEY": self.openrouter_api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
-            "OPENROUTER_IMAGE_MODEL": os.environ.get("OPENROUTER_IMAGE_MODEL", "").strip(),
-            "WILDCLAW_IMAGE_MODEL": os.environ.get("WILDCLAW_IMAGE_MODEL", "").strip(),
-            "BRAVE_API_KEY": os.environ.get("BRAVE_API_KEY", ""),
             "http_proxy": proxy_http,
             "https_proxy": proxy_https,
             "HTTP_PROXY": proxy_http,
@@ -500,30 +495,14 @@ class CodexAgent(BaseAgent):
                 raise RuntimeError(f"Codex tmp copy failed:\n{copied.stderr}")
 
     def _default_reasoning_effort_for_model(self, model: str) -> str | None:
-        """Return an explicit reasoning override if one is configured.
-
-        By default we let Codex CLI and the underlying model choose their
-        native reasoning settings. The only automatic override we keep is the
-        explicit ``CODEX_REASONING_EFFORT`` env knob, which is useful for
-        controlled experiments or emergency rollouts.
-        """
-        override = os.environ.get("CODEX_REASONING_EFFORT", "").strip().lower()
-        if override:
-            return override
-        return None
+        """Keep the benchmark's explicit medium reasoning default."""
+        _ = model
+        return self.reasoning_effort_default
 
     def _default_wire_api_for_model(self, model: str) -> str | None:
-        """Return an explicit wire API override.
-
-        Codex v0.121 rejects provider-level ``wire_api = "chat"``. Keep this
-        as an emergency knob only; do not default MiniMax to chat here.
-        """
+        """Codex is the native Responses passthrough baseline."""
         _ = model
-        override = os.environ.get("CODEX_WIRE_API", "").strip().lower()
-        if override == "chat":
-            logger.warning("CODEX_WIRE_API=chat ignored: Codex CLI no longer supports it")
-            return None
-        return override or None
+        return "responses"
 
     @staticmethod
     def _is_minimax_model(model: str) -> bool:
@@ -660,7 +639,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_MODEL = {json.dumps(default_model)}
-CALL_LIMIT = int(os.environ.get("WILDCLAW_IMAGE_HELPER_CALL_LIMIT", "2") or "2")
+CALL_LIMIT = 2
 CALL_STATE_PATH = "/tmp_workspace/.wildclaw_image_calls.json"
 
 
@@ -735,11 +714,7 @@ def main() -> int:
         return emit({{"ok": False, "error": "OPENROUTER_API_KEY is not set"}})
 
     base_url = (os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
-    model = (
-        os.environ.get("WILDCLAW_IMAGE_MODEL")
-        or os.environ.get("OPENROUTER_IMAGE_MODEL")
-        or DEFAULT_MODEL
-    )
+    model = DEFAULT_MODEL
     if model.startswith("openrouter/"):
         model = model.split("/", 1)[1]
 

@@ -25,17 +25,10 @@ logger = logging.getLogger(__name__)
 CLAUDECODE_SKILLS_DIR = "/root/.claude/skills"
 CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
-CLAUDECODE_RESUME_ATTEMPTS = int(os.environ.get("CLAUDECODE_RESUME_ATTEMPTS", "0"))
-# Zero, and shared: RESUME_BACKOFF_S is the one place in the repo that
-# decides how long a runner waits before resuming an agent whose attempt
-# died on a provider error.  Backoff is the Gateway Pacer's job -- it reads
-# the upstream's own Retry-After and gates every client through one
-# schedule, which five runners sleeping privately cannot do.  The env var
-# still overrides, for an operator who needs to slow one baseline down by
-# hand.
-CLAUDECODE_RETRY_DELAY_SECONDS = float(
-    os.environ.get("CLAUDECODE_RETRY_DELAY_SECONDS", str(RESUME_BACKOFF_S))
-)
+# Same-session resumes are deliberately unlimited and use the shared gateway
+# backoff. They are an internal recovery mechanism, not a benchmark knob.
+CLAUDECODE_RESUME_ATTEMPTS = 0
+CLAUDECODE_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -473,19 +466,15 @@ class ClaudeCodeAgent(BaseAgent):
             "ANTHROPIC_BASE_URL": self.api_base_url,
             # ClaudeCode's built-in WebSearchTool and other side queries use
             # getSmallFastModel(); route them through the benchmark model.
-            "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model
-            or os.environ.get("ANTHROPIC_SMALL_FAST_MODEL", ""),
+            "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model,
             "OPENROUTER_API_KEY": self.api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
-            # Not defaulted on: the env map below only injects truthy values, so
-            # leaving this empty lets the CLI keep its own prompt caching,
-            # which a default of "1" was disabling for every trial. Still
-            # settable from outside when a run wants caching off.
-            "DISABLE_PROMPT_CACHING": os.environ.get("DISABLE_PROMPT_CACHING", ""),
-            "DISABLE_INTERLEAVED_THINKING": os.environ.get("DISABLE_INTERLEAVED_THINKING", "1"),
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": os.environ.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1"),
-            "IS_SANDBOX": os.environ.get("IS_SANDBOX", "1"),
-            "CLAUDE_CODE_FULL_LOG_PATH": os.environ.get("CLAUDE_CODE_FULL_LOG_PATH", "./log"),
+            # Keep the official CLI's fixed sandbox/compatibility flags; do
+            # not expose prompt-cache or reasoning overrides as environment
+            # variables that can silently change a benchmark run.
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            "IS_SANDBOX": "1",
+            "CLAUDE_CODE_FULL_LOG_PATH": "./log",
             "http_proxy": proxy_http,
             "https_proxy": proxy_https,
             "HTTP_PROXY": proxy_http,

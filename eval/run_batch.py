@@ -54,14 +54,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GATEWAY_PORT     = int(os.environ.get("GATEWAY_PORT", "18789"))
+# OpenClaw's in-container gateway gets an ephemeral port. A fixed default
+# creates avoidable collisions when tasks run in parallel.
+GATEWAY_PORT     = 0
 
 ROOT_DIR         = Path(__file__).resolve().parent.parent
-TASKS_DIR        = ROOT_DIR / os.environ.get("TASKS_SUBDIR",  "tasks")
+TASKS_DIR        = ROOT_DIR / "tasks"
+# OUTPUT_SUBDIR is intentionally still overridable by config_lib.sh so the
+# run-layout wrapper can stage each experiment before publishing it.
 OUTPUT_DIR       = ROOT_DIR / os.environ.get("OUTPUT_SUBDIR", "output")
 
-DEFAULT_MODEL    = os.environ.get("DEFAULT_MODEL",    "gpt-5.6-terra")
-DEFAULT_PARALLEL = int(os.environ.get("DEFAULT_PARALLEL", "1"))
+DEFAULT_MODEL    = "gpt-5.6-terra"
+DEFAULT_PARALLEL = 1
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
