@@ -854,6 +854,16 @@ def annotate_usage(
 
     record["gateway_usage"] = gateway_block
 
+    # The baseline's own collector is the task-level source of truth. The
+    # Gateway delta is retained for audit and only fills in when the baseline
+    # exported no usage at all.
+    if gateway_block["authoritative"] and not _reported_nothing(self_reported):
+        gateway_block["native_usage_authoritative"] = True
+        gateway_block["authoritative"] = False
+        gateway_block["note"] = (
+            "native task usage is authoritative; Gateway delta is audit-only"
+        )
+
     if gateway_block["authoritative"]:
         for key in _COUNTERS:
             record[key] = delta[key]
