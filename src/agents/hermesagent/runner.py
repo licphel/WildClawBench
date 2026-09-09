@@ -587,7 +587,7 @@ class HermesAgentAgent(BaseAgent):
                 "api_key": api_key,
                 "provider": "custom",
                 "base_url": base_url,
-                "api_mode": "chat_completions",
+                "api_mode": "codex_responses",
                 "max_iterations": 90,
                 "reasoning_config": reasoning_config,
                 "session_id": f"wildclaw-{task_id}",
