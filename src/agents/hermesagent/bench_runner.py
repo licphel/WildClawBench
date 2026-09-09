@@ -116,7 +116,7 @@ def main() -> int:
         api_key=cfg.get("api_key") or None,
         provider=cfg.get("provider", "custom"),
         base_url=cfg.get("base_url", ""),
-        api_mode=cfg.get("api_mode", "chat_completions"),
+        api_mode=cfg.get("api_mode", "codex_responses"),
         max_iterations=cfg.get("max_iterations", 90),
         save_trajectories=True,
         verbose_logging=True,

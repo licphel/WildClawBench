@@ -36,20 +36,11 @@ OPENCLAW_HOME = "/root/.openclaw"
 #: promises.
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_HOME}/agents/main/sessions/chat.jsonl"
 
-OPENCLAW_RESUME_ATTEMPTS = int(os.environ.get("OPENCLAW_RESUME_ATTEMPTS", "0"))
-# Zero, and shared: RESUME_BACKOFF_S is the one place in the repo that
-# decides how long a runner waits before resuming an agent whose attempt
-# died on a provider error.  Backoff is the Gateway Pacer's job -- it reads
-# the upstream's own Retry-After and gates every client through one
-# schedule, which five runners sleeping privately cannot do.  The env var
-# still overrides, for an operator who needs to slow one baseline down by
-# hand.
-OPENCLAW_RETRY_DELAY_SECONDS = float(
-    os.environ.get("OPENCLAW_RETRY_DELAY_SECONDS", str(RESUME_BACKOFF_S))
-)
-OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = float(
-    os.environ.get("OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS", "120")
-)
+# Same-session resumes are deliberately unlimited and use the shared gateway
+# backoff. They are an internal recovery mechanism, not a benchmark knob.
+OPENCLAW_RESUME_ATTEMPTS = 0
+OPENCLAW_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
+OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = 120.0
 OPENCLAW_RESUME_PREFIX = (
     "A previous attempt of this same task was interrupted by a transient "
     "provider error. Continue from the current workspace, preserve and "
@@ -69,7 +60,7 @@ class OpenClawAgent(BaseAgent):
         self.gateway_port = gateway_port
         self.openrouter_api_key = openrouter_api_key
         self.openrouter_base_url = openrouter_base_url
-        self.image_model = image_model if image_model is not None else os.environ.get("OPENCLAW_IMAGE_MODEL", "").strip()
+        self.image_model = image_model or ""
 
     @property
     def expects_gateway(self) -> bool:

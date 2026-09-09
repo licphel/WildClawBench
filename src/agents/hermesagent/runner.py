@@ -22,6 +22,7 @@ from src.utils.docker_utils import (
 )
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.transient_errors import (
+    RESUME_BACKOFF_S,
     resumable_provider_error,
     unrecoverable_session_error,
 )
@@ -37,8 +38,10 @@ HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "").strip()
 HERMES_HOME = "/root/.hermes"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
-HERMES_RESUME_ATTEMPTS = int(os.environ.get("HERMES_RESUME_ATTEMPTS", "0"))
-HERMES_RETRY_DELAY_SECONDS = float(os.environ.get("HERMES_RETRY_DELAY_SECONDS", "2"))
+# Same-session resumes are deliberately unlimited and use the shared gateway
+# backoff. They are an internal recovery mechanism, not a benchmark knob.
+HERMES_RESUME_ATTEMPTS = 0
+HERMES_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 BENCH_RUNNER_HOST_PATH = Path(__file__).with_name("bench_runner.py")

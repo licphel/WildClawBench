@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 # and became a build argument (Dockerfile.openclaw ARG OPENCLAW_VERSION);
 # the tag now names the CLI release, as the codex and claudecode tags do.
 DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE", "").strip()
-TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE",  "/tmp_workspace")
+TMP_WORKSPACE = "/tmp_workspace"
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
-BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
 
 
 _DEFAULT_CONTAINER_NO_PROXY = "localhost,127.0.0.1,::1,host.docker.internal"
@@ -114,7 +114,8 @@ def start_container(task_id: str, workspace_path: str, extra_env: str = "",
         "NO_PROXY", "no_proxy",
     ):
         env_args += ["-e", f"{key}={proxy_env.get(key, '')}"]
-    env_args += ["-e", f"BRAVE_API_KEY={BRAVE_API_KEY}"]
+    if BRAVE_API_KEY:
+        env_args += ["-e", f"BRAVE_API_KEY={BRAVE_API_KEY}"]
     for line in extra_env.splitlines():
         key = line.strip()
         if not key or key.startswith("#"):
@@ -300,9 +301,8 @@ def run_warmup(
     if not commands:
         return
 
-    retry_delay = float(os.environ.get("WCB_WARMUP_RETRY_DELAY_SECONDS", "10"))
-    max_retries_raw = os.environ.get("WCB_WARMUP_MAX_RETRIES", "0").strip()
-    max_retries = int(max_retries_raw) if max_retries_raw else 0
+    retry_delay = 10.0
+    max_retries = 0
     retry_desc = "unlimited" if max_retries <= 0 else str(max_retries)
 
     logger.info(
