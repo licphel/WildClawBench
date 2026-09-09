@@ -197,6 +197,7 @@ class PyLMAgent(BaseAgent):
     def collect_usage(
         self, task_id: str, output_dir: Path, elapsed_time: float
     ) -> dict:
+        cli_runner = self._import_cli_runner()
         summary = self._summaries.get(task_id, {})
         result_path = output_dir / "cli_result.json"
         if not summary and result_path.is_file():
@@ -207,26 +208,9 @@ class PyLMAgent(BaseAgent):
             except (OSError, json.JSONDecodeError):
                 pass
 
-        input_tokens = int(summary.get("prompt_tokens") or 0)
-        output_tokens = int(summary.get("completion_tokens") or 0)
-        return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            # The container entry emits these under the names perdura's own
-            # RunResult uses; reading "cache_read_tokens"/"cache_write_tokens"
-            # matched nothing and reported 0 cache for every run.
-            "cache_read_tokens": int(summary.get("cached_input_tokens") or 0),
-            "cache_write_tokens": int(summary.get("cache_write_input_tokens") or 0),
-            "total_tokens": input_tokens + output_tokens,
-            "cost_usd": float(summary.get("total_cost") or 0.0),
-            # One inference per step, plus one more for each retried call --
-            # the same definition the other backends report, so the column is
-            # comparable. This used to be int(bool(tokens)), which made every
-            # run that produced any output report exactly one request.
-            "request_count": int(summary.get("step_count") or 0)
-            + int(summary.get("retry_count") or 0),
-            "elapsed_time": round(elapsed_time, 2),
-        }
+        # ``retry_count`` is part of the shared CLI summary contract; the
+        # normalizer preserves it when known and leaves it unknown on timeout.
+        return cli_runner.usage_from_cli_summary(summary, elapsed_time)
 
     def cleanup_staging(self, task_id: str) -> None:
         staging = self._staging_dirs.pop(task_id, None)
