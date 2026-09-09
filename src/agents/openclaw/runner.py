@@ -47,6 +47,9 @@ OPENCLAW_RESUME_ATTEMPTS = int(os.environ.get("OPENCLAW_RESUME_ATTEMPTS", "0"))
 OPENCLAW_RETRY_DELAY_SECONDS = float(
     os.environ.get("OPENCLAW_RETRY_DELAY_SECONDS", str(RESUME_BACKOFF_S))
 )
+OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = float(
+    os.environ.get("OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS", "120")
+)
 OPENCLAW_RESUME_PREFIX = (
     "A previous attempt of this same task was interrupted by a transient "
     "provider error. Continue from the current workspace, preserve and "
@@ -199,12 +202,57 @@ PY"""
                 bash_cmd=(
                     f"export OPENROUTER_API_KEY='{self.openrouter_api_key}' && "
                     f"export OPENROUTER_BASE_URL='{self.openrouter_base_url}' && "
-                    f"openclaw gateway --port {self.gateway_port}"
+                    f"openclaw gateway run --port {self.gateway_port} "
+                    "--bind loopback --auth none --allow-unconfigured"
                 ),
                 log_path=spec.output_dir / "gateway.log",
             )
-            logger.info("[%s] Waiting for gateway to be ready (2s)...", spec.task_id)
-            time.sleep(2)
+            logger.info(
+                "[%s] Waiting for OpenClaw gateway health (timeout=%ss)...",
+                spec.task_id,
+                OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS,
+            )
+            gateway_deadline = (
+                time.monotonic() + OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS
+            )
+            while True:
+                if gateway_proc.poll() is not None:
+                    gateway_log = spec.output_dir / "gateway.log"
+                    detail = ""
+                    if gateway_log.exists():
+                        detail = gateway_log.read_text(
+                            encoding="utf-8", errors="replace"
+                        )[-2000:]
+                    raise RuntimeError(
+                        "OpenClaw gateway exited before becoming ready "
+                        f"(rc={gateway_proc.returncode}):\n{detail}"
+                    )
+                health = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        spec.task_id,
+                        "/bin/bash",
+                        "-c",
+                        "openclaw health",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if health.returncode == 0:
+                    logger.info(
+                        "[%s] OpenClaw gateway is ready: %s",
+                        spec.task_id,
+                        (health.stdout or "").strip()[:300],
+                    )
+                    break
+                if time.monotonic() >= gateway_deadline:
+                    detail = (health.stderr or health.stdout or "").strip()
+                    raise RuntimeError(
+                        "OpenClaw gateway did not become ready within "
+                        f"{OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS}s: {detail}"
+                    )
+                time.sleep(0.5)
 
             safe_prompt = spec.prompt.replace("'", "'\\''")
             safe_resume_prompt = (OPENCLAW_RESUME_PREFIX + spec.prompt).replace(
