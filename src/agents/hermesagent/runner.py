@@ -352,15 +352,12 @@ class HermesAgentAgent(BaseAgent):
             "-e", f"https_proxy={proxy_https}",
             "-e", f"HTTP_PROXY={proxy_http}",
             "-e", f"HTTPS_PROXY={proxy_https}",
-            "-e", f"BRAVE_API_KEY={self.brave_api_key}",
             "-e", f"OPENAI_API_KEY={api_key}",
             "-e", f"OPENAI_BASE_URL={base_url}",
-            "-e", f"OPENROUTER_API_KEY={api_key}",
-            "-e", f"OPENROUTER_BASE_URL={base_url}",
-            "-e", "HERMES_INFERENCE_PROVIDER=custom",
-            "-e", f"TERMINAL_CWD={TMP_WORKSPACE}",
             "-e", f"no_proxy={'' if not proxy_http else os.environ.get('NO_PROXY_INNER', '')}",
         ]
+        if self.brave_api_key:
+            env_args += ["-e", f"BRAVE_API_KEY={self.brave_api_key}"]
         for line in extra_env.splitlines():
             key = line.strip()
             if not key or key.startswith("#"):
@@ -529,22 +526,10 @@ class HermesAgentAgent(BaseAgent):
     ) -> None:
         """Configure hermes-agent inside the container with one consistent provider config."""
         hermes_yaml = self._build_hermes_yaml(model, api_key, base_url)
-        hermes_env = (
-            f"OPENAI_API_KEY={api_key}\n"
-            f"OPENAI_BASE_URL={base_url}\n"
-            f"OPENROUTER_API_KEY={api_key}\n"
-            f"OPENROUTER_BASE_URL={base_url}\n"
-            "HERMES_INFERENCE_PROVIDER=custom\n"
-            f"TERMINAL_CWD={TMP_WORKSPACE}\n"
-            f"BRAVE_API_KEY={self.brave_api_key}\n"
-        )
-
         with tempfile.TemporaryDirectory(prefix="hermes_config_") as tmp_dir:
             tmp_root = Path(tmp_dir)
             yaml_host = tmp_root / "hermes.yaml"
-            env_host = tmp_root / ".env"
             yaml_host.write_text(hermes_yaml, encoding="utf-8")
-            env_host.write_text(hermes_env, encoding="utf-8")
 
             r_mkdir = subprocess.run(
                 [
@@ -564,7 +549,6 @@ class HermesAgentAgent(BaseAgent):
             for src, dst in (
                 (yaml_host, f"{HERMES_HOME}/hermes.yaml"),
                 (yaml_host, f"{HERMES_HOME}/config.yaml"),
-                (env_host, f"{HERMES_HOME}/.env"),
             ):
                 copied = subprocess.run(
                     ["docker", "cp", str(src), f"{task_id}:{dst}"],
