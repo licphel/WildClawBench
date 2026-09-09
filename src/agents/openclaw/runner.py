@@ -474,18 +474,28 @@ PY"""
 
         OpenClaw has no bypass flag, so the declaration has to be config -- and
         it used to be config baked into a Docker layer
-        (``/root/.openclaw/openclaw.json`` and
-        ``/root/.openclaw/exec-approvals.json``), which meant the only way to
-        learn what policy an openclaw run had was to open the image. These are
-        the same three keys ``eval_framework/backends/openclaw_backend.py``
-        writes on the outer path, plus the allowlist file the CLI reads
-        separately from ``openclaw.json``; the values agree with the baked ones
-        key for key, so applying them over an image that still carries them is
-        a no-op rather than a change. What is written, and whether each write
+        (``/root/.openclaw/openclaw.json``), which meant the only way to learn
+        what policy an openclaw run had was to open the image. These are the
+        same three keys ``eval_framework/backends/openclaw_backend.py`` writes
+        on the outer path. What is written, and whether each write
         succeeded, is recorded next to the task's other artifacts.
         """
 
         applied: dict[str, object] = {"config": {}, "files": {}}
+        # 2026.9.1 treats this JSON as a legacy-migration marker and refuses
+        # agent requests while it exists. Remove it defensively so an older
+        # image cannot invalidate the declared config posture.
+        legacy_path = "/root/.openclaw/exec-approvals.json"
+        remove_legacy = subprocess.run(
+            ["docker", "exec", task_id, "rm", "-f", legacy_path],
+            capture_output=True,
+            text=True,
+        )
+        applied["legacy_exec_approvals_absent"] = {
+            "path": legacy_path,
+            "returncode": remove_legacy.returncode,
+            "stderr": (remove_legacy.stderr or "").strip()[:400],
+        }
         for key, value in OPENCLAW_POSTURE.config.items():
             r = subprocess.run(
                 ["docker", "exec", task_id, "/bin/bash", "-c",
@@ -523,7 +533,8 @@ PY"""
                 )
         readback = subprocess.run(
             ["docker", "exec", task_id, "/bin/bash", "-c",
-             "cat /root/.openclaw/exec-approvals.json; echo; "
+             "test ! -e /root/.openclaw/exec-approvals.json; "
+             "echo legacy_exec_approvals_absent=$?; "
              "openclaw config get tools.exec.security 2>&1; "
              "openclaw config get tools.exec.ask 2>&1"],
             capture_output=True, text=True,

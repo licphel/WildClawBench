@@ -9,8 +9,7 @@ place and only two of them were in the repository:
     claude     Docker layer    ``/claude_code/start.sh`` ran
                                ``claude --dangerously-skip-permissions``; the
                                harness only set ``IS_SANDBOX=1``
-    openclaw   Docker layer    ``/root/.openclaw/exec-approvals.json`` and
-                               ``/root/.openclaw/openclaw.json``
+    openclaw   config          ``tools.profile`` and ``tools.exec.*``
     hermes     nowhere         it fell through to hermes-agent's own default
                                ``approvals.mode: "manual"`` and was saved only
                                by ``tools/approval.py``'s container
@@ -35,13 +34,9 @@ Two deliberate properties:
   interpolates ``posture.argv`` into the command it execs and writes
   ``posture.config`` through the CLI's own config surface. A comment here can
   go stale silently; a value the run is built from cannot.
-* The image-side settings are, at the time of writing, still present. Claude's
-  ``start.sh`` puts ``--dangerously-skip-permissions`` before its ``"$@"``, so
-  the harness flag arrives as a harmless repeat, and openclaw's baked JSON
-  agrees key for key with what the harness now writes. That overlap is
-  intentional: an interval in which neither side declared the posture would be
-  worse than the state this replaces. Removing the baked files is a Dockerfile
-  change and belongs to whoever owns the image build.
+* OpenClaw 2026.9.1 stores exec approvals in its state SQLite database. The
+  old ``exec-approvals.json`` must not be recreated: its presence is treated as
+  a legacy migration marker and makes the gateway reject agent requests.
 """
 
 from __future__ import annotations
@@ -109,27 +104,19 @@ CLAUDE = ApprovalPosture(
 
 OPENCLAW = ApprovalPosture(
     baseline="openclaw",
-    mechanism="argv+config",
+    mechanism="config",
     config={
         "tools.profile": "full",
         "tools.exec.security": "full",
         "tools.exec.ask": "off",
     },
-    files={
-        "/root/.openclaw/exec-approvals.json": {
-            "version": 1,
-            "defaults": {"security": "full", "ask": "off"},
-            "agents": {"*": {"allowlist": [{"pattern": "*"}]}},
-        }
-    },
     rationale=(
         "OpenClaw has no bypass flag; its exec defaults are security \"deny\" "
         "with ask \"on-miss\" and an askFallback of deny, so a headless run "
         "either blocks on an approval nobody will give or has every exec "
-        "denied. The same three keys the outer "
-        "eval_framework/backends/openclaw_backend.py writes are written here, "
-        "plus the exec-approvals allowlist the CLI reads separately from "
-        "openclaw.json."
+        "denied. The three tools.* keys are the current 2026.9.1 config "
+        "surface. The legacy exec-approvals JSON is intentionally absent "
+        "because the current gateway stores that state in SQLite."
     ),
 )
 
