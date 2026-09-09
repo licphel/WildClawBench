@@ -140,6 +140,7 @@ class PyLMAgent(BaseAgent):
                 "WILDCLAW_PYLM_SANDBOX_MODE", PERDURA_POSTURE.argv[1]
             )
             confirm_dangerous_skip = sandbox_mode == "dangerous_skip"
+            non_interactive = "--non-interactive" in PERDURA_POSTURE.argv
             # Written twice on purpose. Once here, so a task that dies
             # mid-run still leaves its intended posture on disk; then again
             # below with what the CLI actually accepted, which is the value
@@ -155,6 +156,7 @@ class PyLMAgent(BaseAgent):
                 # current perdura does not (sandbox_confirmation.py: "no
                 # separate confirmation flag exists").
                 "confirm_dangerous_skip_requested": confirm_dangerous_skip,
+                "non_interactive_requested": non_interactive,
                 "resolved": "pending: container has not reported yet",
             }
             record_posture(spec.output_dir, PERDURA_POSTURE, applied=posture_intent)
@@ -166,6 +168,7 @@ class PyLMAgent(BaseAgent):
                 reasoning_effort=spec.thinking,
                 sandbox_mode=sandbox_mode,
                 confirm_dangerous_skip=confirm_dangerous_skip,
+                non_interactive=non_interactive,
                 timeout_seconds=spec.timeout_seconds,
                 output_dir=spec.output_dir,
                 plugin_paths=self._skill_paths(spec.task),
