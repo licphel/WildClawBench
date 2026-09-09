@@ -115,9 +115,7 @@ class PyLMAgent(BaseAgent):
                 extra_env=str(spec.task.get("env") or ""),
                 tmp_path=tmp_path,
                 image=self.image,
-                enable_nested_isolation=os.environ.get(
-                    "WILDCLAW_PYLM_NESTED_ISOLATION", ""
-                ).lower() in {"1", "true", "yes"},
+                enable_nested_isolation=False,
                 pylm_store_host_dir=spec.output_dir / "pylm_store",
             )
             setup_workspace(spec.task_id)
@@ -136,9 +134,7 @@ class PyLMAgent(BaseAgent):
             # Default from src/agents/approval_posture.py rather than a
             # literal here, so the declared posture and the launched one cannot
             # drift apart. The env var stays as the override.
-            sandbox_mode = os.environ.get(
-                "WILDCLAW_PYLM_SANDBOX_MODE", PERDURA_POSTURE.argv[1]
-            )
+            sandbox_mode = PERDURA_POSTURE.argv[1]
             confirm_dangerous_skip = sandbox_mode == "dangerous_skip"
             non_interactive = "--non-interactive" in PERDURA_POSTURE.argv
             # Written twice on purpose. Once here, so a task that dies
