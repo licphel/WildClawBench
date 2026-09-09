@@ -70,7 +70,7 @@ OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
 OPENROUTER_BASE_URL_CLAUDECODE = normalize_openrouter_base_url_for_claudecode(
     os.environ.get("OPENROUTER_BASE_URL", "")
 )
-MODELS_API_KEY_PLACEHOLDER = "${MY_PROXY_API_KEY}"
+MODELS_API_KEY_PLACEHOLDER = "${GATEWAY_TOKEN}"
 
 #: Baselines graded even when the run reported an error, so a failed task keeps
 #: its real (usually near-zero) per-check breakdown instead of empty scores.
@@ -204,15 +204,15 @@ def _publish_task_result(result: dict) -> None:
 
 def load_models_config(models_config_path: Path) -> dict:
     raw_config = models_config_path.read_text(encoding="utf-8")
-    proxy_api_key = os.environ.get("MY_PROXY_API_KEY")
-    if MODELS_API_KEY_PLACEHOLDER in raw_config and not proxy_api_key:
+    gateway_token = os.environ.get("GATEWAY_TOKEN")
+    if MODELS_API_KEY_PLACEHOLDER in raw_config and not gateway_token:
         raise ValueError(
-            "MY_PROXY_API_KEY must be set to a non-empty value when models config uses ${MY_PROXY_API_KEY}"
+            "GATEWAY_TOKEN must be set to a non-empty value when models config uses ${GATEWAY_TOKEN}"
         )
 
     expanded_config = raw_config.replace(
         MODELS_API_KEY_PLACEHOLDER,
-        proxy_api_key or "",
+        gateway_token or "",
     )
     parsed_models_config = json.loads(expanded_config)
     if not isinstance(parsed_models_config, dict):
