@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path, PurePosixPath
 from dotenv import load_dotenv
 
@@ -25,6 +26,73 @@ WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 
+
+_DEFAULT_CONTAINER_NO_PROXY = "localhost,127.0.0.1,::1,host.docker.internal"
+
+
+def _rewrite_proxy_host(value: str) -> str:
+    """Make a host-local proxy reachable from a bridged task container."""
+    if not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return value
+    replacement = os.environ.get("BENCHMARK_CONTAINER_PROXY_HOST", "host.docker.internal")
+    netloc = replacement
+    if parsed.port is not None:
+        netloc = f"{replacement}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def container_proxy_env(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Resolve the proxy environment from the host to the container viewpoint.
+
+    ``HTTP_PROXY_INNER`` is already a container-reachable value and therefore
+    wins.  The old code only read that pair, while the normal benchmark proxy
+    launcher exports ``BENCHMARK_CONTAINER_*`` and many invocations only have
+    host-side ``HTTP_PROXY``.  The latter is rewritten only when proxy use was
+    explicitly enabled, so an ambient developer proxy is not silently adopted.
+    """
+    source = source if source is not None else os.environ
+    http = source.get("HTTP_PROXY_INNER") or source.get("BENCHMARK_CONTAINER_HTTP_PROXY")
+    https = source.get("HTTPS_PROXY_INNER") or source.get("BENCHMARK_CONTAINER_HTTPS_PROXY")
+    all_proxy = source.get("ALL_PROXY_INNER") or source.get("BENCHMARK_CONTAINER_ALL_PROXY")
+    no_proxy = (
+        source.get("NO_PROXY_INNER")
+        or source.get("BENCHMARK_CONTAINER_NO_PROXY")
+        or source.get("NO_PROXY")
+        or source.get("no_proxy")
+    )
+
+    if not http and source.get("BENCHMARK_USE_PROXY") == "1":
+        http = _rewrite_proxy_host(source.get("HTTP_PROXY", ""))
+    if not https and source.get("BENCHMARK_USE_PROXY") == "1":
+        https = _rewrite_proxy_host(source.get("HTTPS_PROXY") or http or "")
+    if not all_proxy and source.get("BENCHMARK_USE_PROXY") == "1":
+        all_proxy = _rewrite_proxy_host(source.get("ALL_PROXY", "") or http or "")
+
+    if http and not https:
+        https = http
+    if http or https or all_proxy:
+        no_proxy = no_proxy or _DEFAULT_CONTAINER_NO_PROXY
+
+    resolved: dict[str, str] = {}
+    for upper, lower, value in (
+        ("HTTP_PROXY", "http_proxy", http),
+        ("HTTPS_PROXY", "https_proxy", https),
+        ("ALL_PROXY", "all_proxy", all_proxy),
+    ):
+        if value:
+            resolved[upper] = value
+            resolved[lower] = value
+    if no_proxy:
+        resolved["NO_PROXY"] = no_proxy
+        resolved["no_proxy"] = no_proxy
+    return resolved
+
 def remove_container(name: str) -> None:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
@@ -36,16 +104,17 @@ def start_container(task_id: str, workspace_path: str, extra_env: str = "",
     if not workspace.is_dir():
         raise RuntimeError(f"Workspace path does not exist or is not a directory: {workspace}")
 
-    proxy_http = os.environ.get('HTTP_PROXY_INNER', '')
-    proxy_https = os.environ.get('HTTPS_PROXY_INNER', '')
-    env_args = [
-        "-e", f"http_proxy={proxy_http}",
-        "-e", f"https_proxy={proxy_https}",
-        "-e", f"HTTP_PROXY={proxy_http}",
-        "-e", f"HTTPS_PROXY={proxy_https}",
-        "-e", f"BRAVE_API_KEY={BRAVE_API_KEY}",
-        "-e", f"no_proxy={'' if not proxy_http else os.environ.get('NO_PROXY_INNER', '')}",
-    ]
+    proxy_env = container_proxy_env()
+    env_args = []
+    # Explicitly clear image-baked proxy values when no runtime proxy was
+    # selected. Some legacy WildClaw images carried a dead proxy in ENV.
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+        "NO_PROXY", "no_proxy",
+    ):
+        env_args += ["-e", f"{key}={proxy_env.get(key, '')}"]
+    env_args += ["-e", f"BRAVE_API_KEY={BRAVE_API_KEY}"]
     for line in extra_env.splitlines():
         key = line.strip()
         if not key or key.startswith("#"):
