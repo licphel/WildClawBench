@@ -10,6 +10,8 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from src.agents.approval_posture import CODEX as CODEX_POSTURE
+
 logger = logging.getLogger(__name__)
 
 TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE", "/tmp_workspace")
@@ -253,9 +255,15 @@ def build_codex_exec_command(
     env_prefix = ""
     for key, value in (env_vars or {}).items():
         env_prefix += f"export {key}={shlex.quote(value)} && "
+    # From src/agents/approval_posture.py rather than a literal, for the same
+    # reason as codex/runner.py.  NOTE: nothing calls run_codex_process (and so
+    # nothing calls this) on the current harness path -- runner.py builds its
+    # own command -- but a fourth spelling of the bypass sitting in the tree is
+    # what a future revival would drift from.
+    approval_flags = " ".join(CODEX_POSTURE.argv)
     return (
         f"{env_prefix}cat {shlex.quote(prompt_path)} | "
-        f"codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "
+        f"codex exec --json --skip-git-repo-check {approval_flags} "
         f"--cd {shlex.quote(TMP_WORKSPACE)} "
         f"{model_arg}"
         f"--output-last-message {shlex.quote(CODEX_LAST_MESSAGE_PATH)} -"
