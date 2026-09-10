@@ -27,7 +27,7 @@ CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 # Same-session resumes are deliberately unlimited and use the shared gateway
 # backoff. They are an internal recovery mechanism, not a benchmark knob.
-CLAUDECODE_RESUME_ATTEMPTS = 0
+CLAUDECODE_RESUME_ATTEMPTS = 3
 CLAUDECODE_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 
 
@@ -646,7 +646,7 @@ PY"""
                     f"(rc={r.returncode}):\n{output}"
                 )
             excluded_retry_time += attempt_elapsed
-            if CLAUDECODE_RESUME_ATTEMPTS > 0 and attempt >= CLAUDECODE_RESUME_ATTEMPTS:
+            if attempt >= CLAUDECODE_RESUME_ATTEMPTS:
                 raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")
             if remaining <= 30:
                 raise RuntimeError(
@@ -659,7 +659,7 @@ PY"""
             attempt += 1
             logger.warning(
                 "[%s] ClaudeCode exited non-zero; retrying --continue (%s/%s)",
-                task_id, attempt, CLAUDECODE_RESUME_ATTEMPTS or "unlimited",
+                    task_id, attempt, CLAUDECODE_RESUME_ATTEMPTS,
             )
 
     def _extract_usage_from_logs(self, log_dir: Path) -> dict[str, Any]:

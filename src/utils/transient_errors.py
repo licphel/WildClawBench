@@ -104,7 +104,6 @@ UNRECOVERABLE_SESSION_PATTERNS = (
 # not killing a live run that is retrying them internally.
 UPSTREAM_FAILURE_PATTERNS = (
     "Upstream service temporarily unavailable",
-    "Upstream error",  # covers e.g. "HTTP 400: Upstream error: 400" from the relay
     "ECONNRESET",
     # The same reset spelled the way Python's socket layer reports it
     # ("[Errno 104] Connection reset by peer"); the Node-style token above
@@ -199,6 +198,31 @@ NON_RETRYABLE_MARKERS = (
     "export trajectory",
 )
 
+# These are deterministic request failures. Retrying the same prompt/session
+# cannot change the request shape, so they must not enter either in-session
+# resume or task-level retry. ``invalid_encrypted_content`` is deliberately
+# excluded: that is the one observed 400-class upstream failure that merits a
+# fresh Task/container, because the upstream repudiated the old session state.
+DETERMINISTIC_REQUEST_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "maximum context window",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "invalid_request_error",
+    "unsupported parameter",
+    "invalid parameter",
+    "extra inputs are not permitted",
+)
+
+SESSION_ONLY_MARKERS = (
+    "invalid_encrypted_content",
+    "encrypted content could not be verified",
+    "could not be decrypted or parsed",
+)
+
 
 def non_retryable_phase(error: str | None) -> str | None:
     """The NON_RETRYABLE_MARKERS signature in ``error``, or None.
@@ -221,6 +245,26 @@ def non_retryable_phase(error: str | None) -> str | None:
     return None
 
 
+def deterministic_request_error(error: str | None) -> str | None:
+    """Return a request-shape failure that must never be retried."""
+
+    if not error:
+        return None
+    lowered = error.lower()
+    # The encrypted-session signature has its own bounded same-session policy.
+    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
+        return None
+    for marker in DETERMINISTIC_REQUEST_MARKERS:
+        if marker in lowered:
+            return marker
+    if any(
+        marker in lowered
+        for marker in ("http 400", "status 400", "status=400", "code 400", "returned 400")
+    ):
+        return "HTTP 400 request error"
+    return None
+
+
 def _matched_pattern(error: str | None, patterns: tuple[str, ...]) -> str | None:
     if not error:
         return None
@@ -229,7 +273,7 @@ def _matched_pattern(error: str | None, patterns: tuple[str, ...]) -> str | None
     # the Python stacks log "econnreset" after lowercasing their own output.
     # The runners each used to lowercase before matching their private lists;
     # doing it here keeps that working for all of them.
-    if non_retryable_phase(error) is not None:
+    if non_retryable_phase(error) is not None or deterministic_request_error(error) is not None:
         return None
     lowered = error.lower()
     for pattern in patterns:
@@ -440,6 +484,15 @@ def resumable_provider_error(output: str | None) -> str | None:
     appearing in the output of a *successful* run is the task's own transcript
     quoting it (a task whose mock API returns HTTP 400, say), not a failure.
     """
+    session_only = _matched_pattern(output, SESSION_ONLY_MARKERS)
+    if session_only is not None:
+        return session_only
+    return _matched_pattern(output, UPSTREAM_FAILURE_PATTERNS)
+
+
+def task_retryable_provider_error(output: str | None) -> str | None:
+    """Return an upstream signature eligible for a fresh Task retry."""
+
     return _matched_pattern(output, PROVIDER_ERROR_PATTERNS)
 
 
@@ -541,7 +594,21 @@ def should_retry_attempt(
     # decisive: an upstream that repudiated the session, ran out of quota or
     # dropped the connection is an inference anomaly by construction, and
     # needs no second opinion from the Gateway.
-    provider = resumable_provider_error(error)
+    deterministic = deterministic_request_error(error)
+    if deterministic is not None:
+        return False, (
+            f"the attempt failed with a deterministic request error ({deterministic!r}); "
+            "the same input cannot succeed by retrying"
+        )
+
+    session_only = _matched_pattern(error, SESSION_ONLY_MARKERS)
+    if session_only is not None:
+        return False, (
+            f"the attempt failed with the session-only signature ({session_only!r}); "
+            "its bounded in-session resumes are exhausted, so no new Task/container retry"
+        )
+
+    provider = task_retryable_provider_error(error)
     if provider:
         return True, (
             f"the attempt failed on an upstream signature ({provider!r}), which "

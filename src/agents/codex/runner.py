@@ -33,7 +33,7 @@ CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
-DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = 0
+DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = 3
 # 0 = unlimited resumes, bounded in practice by the `remaining <= 30` budget
 # stop below.  Same default and same bound as the other four baselines.
 #
@@ -839,8 +839,7 @@ if __name__ == "__main__":
                     f"(rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
             resume_limit_reached = (
-                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
-                and attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
             )
             if resume_limit_reached:
                 if is_resume:
@@ -867,8 +866,6 @@ if __name__ == "__main__":
             resume_no = attempt + 1
             max_resume_attempts: int | str = (
                 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
-                if DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS > 0
-                else "unlimited"
             )
             append_agent_log_event(
                 output_dir,
