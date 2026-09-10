@@ -302,14 +302,23 @@ def print_summary(results: list[dict], category: str, output_dir: Path, model_na
     print(f"    {'-'*55} {'-'*12} {'-'*12}")
     total_output_tokens = 0
     total_cost_usd = 0.0
+    unknown_cost_tasks = []
     for r in sorted(results, key=lambda x: x["task_id"]):
         usage = r.get("usage", {})
-        out_tok = usage.get("output_tokens", 0)
-        cost = usage.get("cost_usd", 0.0)
+        out_tok = usage.get("output_tokens")
+        if not isinstance(out_tok, (int, float)):
+            out_tok = 0
+        raw_cost = usage.get("cost_usd")
+        cost = raw_cost if isinstance(raw_cost, (int, float)) else 0.0
+        if not isinstance(raw_cost, (int, float)):
+            unknown_cost_tasks.append(r["task_id"])
         total_output_tokens += out_tok
         total_cost_usd += cost
-        print(f"    {r['task_id']:<55} {out_tok:>12} {cost:>11.4f}$")
+        cost_display = f"{cost:>11.4f}$" if isinstance(raw_cost, (int, float)) else "        N/A"
+        print(f"    {r['task_id']:<55} {out_tok:>12} {cost_display}")
     print(f"    {'Total':<55} {total_output_tokens:>12} {total_cost_usd:>11.4f}$")
+    if unknown_cost_tasks:
+        print(f"    Cost unavailable for {len(unknown_cost_tasks)} task(s); total is known costs only")
 
     summary_path = output_dir / category / f"summary_{model_name}.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
