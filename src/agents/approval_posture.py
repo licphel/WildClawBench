@@ -138,14 +138,16 @@ HERMES = ApprovalPosture(
 PERDURA = ApprovalPosture(
     baseline="perdura",
     mechanism="argv",
-    argv=("--sandbox-mode", "dangerous_skip"),
+    argv=("--sandbox-mode", "dangerous_skip", "--non-interactive"),
     rationale=(
         "Perdura denies a tool call under its default policy and falls back to "
         "request_access(), which suspends a headless run waiting for an "
-        "operator approval that never arrives. Naming dangerous_skip is itself "
-        "the complete statement of intent -- see "
-        "apps/perdura-cli/src/perdura/cli/sandbox_confirmation.py, which says "
-        "outright that no separate confirmation flag exists -- and it forces "
+        "operator approval that never arrives. The benchmark therefore enables "
+        "the explicit non-interactive Run mode together with dangerous_skip: "
+        "the combination auto-confirms canonical confirmation requests while "
+        "returning other human-input requests as awaiting_interaction. See "
+        "apps/perdura-cli/src/perdura/cli/sandbox_confirmation.py: naming "
+        "dangerous_skip is itself the complete authority grant and forces "
         "access_level=full plus the File/Network/Tool ANY wildcard."
     ),
 )
