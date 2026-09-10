@@ -38,7 +38,7 @@ OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_HOME}/agents/main/sessions/chat.jsonl"
 
 # Same-session resumes are deliberately unlimited and use the shared gateway
 # backoff. They are an internal recovery mechanism, not a benchmark knob.
-OPENCLAW_RESUME_ATTEMPTS = 0
+OPENCLAW_RESUME_ATTEMPTS = 3
 OPENCLAW_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = 120.0
 OPENCLAW_RESUME_PREFIX = (
@@ -306,7 +306,7 @@ PY"""
                     # and the workspace it left behind is still the measurement.
                     break
                 excluded_retry_time += attempt_elapsed
-                if OPENCLAW_RESUME_ATTEMPTS > 0 and resume_attempt >= OPENCLAW_RESUME_ATTEMPTS:
+                if resume_attempt >= OPENCLAW_RESUME_ATTEMPTS:
                     raise RuntimeError(
                         f"OpenClaw agent failed after a provider error "
                         f"({provider_error_reason}) with no resume attempts left "
@@ -329,7 +329,7 @@ PY"""
                     spec.task_id,
                     provider_error_reason,
                     resume_attempt,
-                    OPENCLAW_RESUME_ATTEMPTS or "unlimited",
+                    OPENCLAW_RESUME_ATTEMPTS,
                 )
 
             logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)

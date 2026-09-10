@@ -40,7 +40,7 @@ HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
 # Same-session resumes are deliberately unlimited and use the shared gateway
 # backoff. They are an internal recovery mechanism, not a benchmark knob.
-HERMES_RESUME_ATTEMPTS = 0
+HERMES_RESUME_ATTEMPTS = 3
 HERMES_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
@@ -213,7 +213,7 @@ class HermesAgentAgent(BaseAgent):
                         f"(rc={agent_proc.returncode})"
                     )
                 excluded_retry_time += attempt_elapsed
-                if HERMES_RESUME_ATTEMPTS > 0 and resume_attempt >= HERMES_RESUME_ATTEMPTS:
+                if resume_attempt >= HERMES_RESUME_ATTEMPTS:
                     raise RuntimeError(f"Hermes runner failed (rc={agent_proc.returncode})")
                 if remaining <= 30:
                     raise RuntimeError("Hermes runner failed and no useful time remains for resume")
@@ -226,7 +226,7 @@ class HermesAgentAgent(BaseAgent):
                     "[%s] Hermes runner exited non-zero%s; retrying same session (%s/%s)",
                     spec.task_id,
                     f" after provider error ({provider_error_reason})" if provider_error_reason else "",
-                    resume_attempt, HERMES_RESUME_ATTEMPTS or "unlimited",
+                    resume_attempt, HERMES_RESUME_ATTEMPTS,
                 )
             self._close_runner_streams(agent_proc)
 

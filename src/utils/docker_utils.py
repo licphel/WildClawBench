@@ -302,8 +302,8 @@ def run_warmup(
         return
 
     retry_delay = 10.0
-    max_retries = 0
-    retry_desc = "unlimited" if max_retries <= 0 else str(max_retries)
+    max_retries = 5
+    retry_desc = str(max_retries)
 
     logger.info(
         "[%s] Running warmup (%d commands, retries=%s, retry_delay=%.1fs)",
