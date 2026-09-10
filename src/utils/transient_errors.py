@@ -104,7 +104,6 @@ UNRECOVERABLE_SESSION_PATTERNS = (
 # not killing a live run that is retrying them internally.
 UPSTREAM_FAILURE_PATTERNS = (
     "Upstream service temporarily unavailable",
-    "Upstream error",  # covers e.g. "HTTP 400: Upstream error: 400" from the relay
     "ECONNRESET",
     # The same reset spelled the way Python's socket layer reports it
     # ("[Errno 104] Connection reset by peer"); the Node-style token above
@@ -218,6 +217,12 @@ DETERMINISTIC_REQUEST_MARKERS = (
     "extra inputs are not permitted",
 )
 
+SESSION_ONLY_MARKERS = (
+    "invalid_encrypted_content",
+    "encrypted content could not be verified",
+    "could not be decrypted or parsed",
+)
+
 
 def non_retryable_phase(error: str | None) -> str | None:
     """The NON_RETRYABLE_MARKERS signature in ``error``, or None.
@@ -246,9 +251,8 @@ def deterministic_request_error(error: str | None) -> str | None:
     if not error:
         return None
     lowered = error.lower()
-    # Preserve the fresh-container recovery for the observed encrypted
-    # session repudiation, even though the relay reports it as HTTP 400.
-    if "invalid_encrypted_content" in lowered:
+    # The encrypted-session signature has its own bounded same-session policy.
+    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
         return None
     for marker in DETERMINISTIC_REQUEST_MARKERS:
         if marker in lowered:
@@ -480,11 +484,9 @@ def resumable_provider_error(output: str | None) -> str | None:
     appearing in the output of a *successful* run is the task's own transcript
     quoting it (a task whose mock API returns HTTP 400, say), not a failure.
     """
-    # Unrecoverable session errors (notably invalid_encrypted_content) are
-    # intentionally excluded: the caller must return to the outer Task loop
-    # and start a fresh container/session instead of resuming poisoned state.
-    if _matched_pattern(output, UNRECOVERABLE_SESSION_PATTERNS) is not None:
-        return None
+    session_only = _matched_pattern(output, SESSION_ONLY_MARKERS)
+    if session_only is not None:
+        return session_only
     return _matched_pattern(output, UPSTREAM_FAILURE_PATTERNS)
 
 
@@ -597,6 +599,13 @@ def should_retry_attempt(
         return False, (
             f"the attempt failed with a deterministic request error ({deterministic!r}); "
             "the same input cannot succeed by retrying"
+        )
+
+    session_only = _matched_pattern(error, SESSION_ONLY_MARKERS)
+    if session_only is not None:
+        return False, (
+            f"the attempt failed with the session-only signature ({session_only!r}); "
+            "its bounded in-session resumes are exhausted, so no new Task/container retry"
         )
 
     provider = task_retryable_provider_error(error)
