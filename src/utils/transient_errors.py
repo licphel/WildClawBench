@@ -201,8 +201,8 @@ NON_RETRYABLE_MARKERS = (
 # These are deterministic request failures. Retrying the same prompt/session
 # cannot change the request shape, so they must not enter either in-session
 # resume or task-level retry. ``invalid_encrypted_content`` is deliberately
-# excluded: that is the one observed 400-class upstream failure that merits a
-# fresh Task/container, because the upstream repudiated the old session state.
+# handled by the separate session-only policy below; it is never a fresh
+# Task/container retry candidate.
 DETERMINISTIC_REQUEST_MARKERS = (
     "context_length_exceeded",
     "context length exceeded",
@@ -491,8 +491,21 @@ def resumable_provider_error(output: str | None) -> str | None:
 
 
 def task_retryable_provider_error(output: str | None) -> str | None:
-    """Return an upstream signature eligible for a fresh Task retry."""
+    """Return an upstream signature eligible for a fresh Task retry.
 
+    This is intentionally a different predicate from
+    ``resumable_provider_error``.  A session-only failure may be resumed by a
+    baseline a bounded number of times, but exhausting that loop is not a
+    reason to create a new Task/container.  Keeping the session-only veto here
+    makes that separation structural instead of depending on a caller to
+    remember it.
+    """
+
+    if not output:
+        return None
+    lowered = output.lower()
+    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
+        return None
     return _matched_pattern(output, PROVIDER_ERROR_PATTERNS)
 
 
@@ -590,10 +603,9 @@ def should_retry_attempt(
         )
 
     # A string can carry both signatures -- perdura's retry-exhausted summary
-    # ends a run that also ran out of clock -- and the provider half is
-    # decisive: an upstream that repudiated the session, ran out of quota or
-    # dropped the connection is an inference anomaly by construction, and
-    # needs no second opinion from the Gateway.
+    # ends a run that also ran out of clock.  Only the independent Task-level
+    # provider predicate below can authorize a fresh Task; the in-session
+    # Resume result is deliberately not used as that authorization.
     deterministic = deterministic_request_error(error)
     if deterministic is not None:
         return False, (
@@ -605,7 +617,8 @@ def should_retry_attempt(
     if session_only is not None:
         return False, (
             f"the attempt failed with the session-only signature ({session_only!r}); "
-            "its bounded in-session resumes are exhausted, so no new Task/container retry"
+            "this signature is handled only by the bounded in-session Resume "
+            "loop and is not a Task/container retry candidate"
         )
 
     provider = task_retryable_provider_error(error)
