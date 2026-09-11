@@ -165,6 +165,7 @@ class ClaudeCodeAgent(BaseAgent):
                 spec.model,
                 spec.timeout_seconds,
                 spec.output_dir,
+                thinking=spec.thinking,
             )
             # Retry time stays INSIDE elapsed_time, deliberately.  Every
             # baseline retries, but only three of the five retry in a place
@@ -569,7 +570,15 @@ PY"""
         if r_cp.returncode != 0:
             raise RuntimeError(f"ClaudeCode tmp copy failed:\n{r_cp.stderr}")
 
-    def _run_prompt(self, task_id: str, prompt: str, model: str, timeout_seconds: int, output_dir: Path) -> float:
+    def _run_prompt(
+        self,
+        task_id: str,
+        prompt: str,
+        model: str,
+        timeout_seconds: int,
+        output_dir: Path,
+        thinking: str | None = None,
+    ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
         excluded_retry_time = 0.0
@@ -594,12 +603,22 @@ PY"""
             # copy can be dropped from the image once whoever owns the build
             # gets to it. See src/agents/approval_posture.py.
             approval_flags = " ".join(CLAUDE_POSTURE.argv)
+            # Confirmed live on wz (2026-09-11): the host's directly-installed
+            # `claude` binary is 2.1.263 -- the exact version pinned into this
+            # image -- and `claude --help` lists `--effort <low|medium|high|
+            # xhigh|max>`. The other four WildClaw baselines (openclaw/codex/
+            # hermesagent/pylm) are aligned to --thinking via
+            # src/utils/cli_args.py (default "medium"); wire the same value
+            # through here via `--effort` so this baseline is no longer the
+            # one baseline running under an uncontrolled default.
+            effort_flag = f"--effort {shlex.quote(thinking)} " if thinking else ""
             cmd = (
                 f"cd /claude_code && IS_SANDBOX=1 ./start.sh {resume_flag}"
                 f"{approval_flags} "
                 f"--add-dir /tmp_workspace -p {shlex.quote(current_prompt)} "
-                f"--model {shlex.quote(model)}"
-            )
+                f"--model {shlex.quote(model)} "
+                f"{effort_flag}"
+            ).rstrip()
             record_posture(
                 output_dir,
                 CLAUDE_POSTURE,
@@ -608,6 +627,7 @@ PY"""
                     "flags": list(CLAUDE_POSTURE.argv),
                     "command": cmd,
                     "image_side_duplicate": "/claude_code/start.sh",
+                    "reasoning_effort": thinking or "uncontrolled_default_claude_code_cli",
                 },
             )
             attempt_started = time.perf_counter()
