@@ -238,6 +238,7 @@ class HermesAgentAgent(BaseAgent):
                 error=None,
                 gateway_proc=None,
                 agent_proc=agent_proc,
+                excluded_retry_time=excluded_retry_time,
             )
         except Exception as exc:
             if agent_proc is not None:
@@ -254,6 +255,7 @@ class HermesAgentAgent(BaseAgent):
                 error=str(exc),
                 gateway_proc=None,
                 agent_proc=agent_proc,
+                excluded_retry_time=excluded_retry_time,
             )
 
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict[str, Any]:

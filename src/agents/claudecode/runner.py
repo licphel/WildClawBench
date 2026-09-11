@@ -146,6 +146,11 @@ class ClaudeCodeAgent(BaseAgent):
         elapsed_time = float(spec.timeout_seconds)
         start_time = time.perf_counter()
         task_id = spec.task_id
+        # _run_prompt only returns excluded_retry_time on success (rc==0); a
+        # RuntimeError/TimeoutExpired it raises loses that return value, so
+        # partial progress is mirrored into this holder as it accumulates and
+        # read back in the except blocks below.
+        retry_time_holder: dict[str, float] = {"excluded_retry_time": 0.0}
 
         try:
             self._start_container(task_id, spec.workspace_path, small_fast_model=spec.model)
@@ -166,6 +171,7 @@ class ClaudeCodeAgent(BaseAgent):
                 spec.timeout_seconds,
                 spec.output_dir,
                 thinking=spec.thinking,
+                retry_time_holder=retry_time_holder,
             )
             # Retry time stays INSIDE elapsed_time, deliberately.  Every
             # baseline retries, but only three of the five retry in a place
@@ -184,7 +190,13 @@ class ClaudeCodeAgent(BaseAgent):
                     "[%s] ClaudeCode elapsed %.2fs, including %.2fs of wrapper retry time",
                     task_id, elapsed_time, wrapper_retry_seconds,
                 )
-            return AgentExecution(elapsed_time=elapsed_time, error=None, gateway_proc=None, agent_proc=None)
+            return AgentExecution(
+                elapsed_time=elapsed_time,
+                error=None,
+                gateway_proc=None,
+                agent_proc=None,
+                excluded_retry_time=wrapper_retry_seconds,
+            )
         except subprocess.TimeoutExpired:
             logger.info("[%s] ClaudeCode timed out...", task_id)
             return AgentExecution(
@@ -192,6 +204,7 @@ class ClaudeCodeAgent(BaseAgent):
                 error="ClaudeCode run timed out",
                 gateway_proc=None,
                 agent_proc=None,
+                excluded_retry_time=retry_time_holder["excluded_retry_time"],
             )
         except Exception as exc:
             logger.error("[%s] ClaudeCode execution error: %s", task_id, exc)
@@ -200,6 +213,7 @@ class ClaudeCodeAgent(BaseAgent):
                 error=str(exc),
                 gateway_proc=None,
                 agent_proc=None,
+                excluded_retry_time=retry_time_holder["excluded_retry_time"],
             )
 
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict[str, Any]:
@@ -578,6 +592,7 @@ PY"""
         timeout_seconds: int,
         output_dir: Path,
         thinking: str | None = None,
+        retry_time_holder: dict[str, float] | None = None,
     ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
@@ -666,6 +681,8 @@ PY"""
                     f"(rc={r.returncode}):\n{output}"
                 )
             excluded_retry_time += attempt_elapsed
+            if retry_time_holder is not None:
+                retry_time_holder["excluded_retry_time"] = excluded_retry_time
             if attempt >= CLAUDECODE_RESUME_ATTEMPTS:
                 raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")
             if remaining <= 30:
@@ -676,6 +693,8 @@ PY"""
                 delay_started = time.perf_counter()
                 time.sleep(CLAUDECODE_RETRY_DELAY_SECONDS)
                 excluded_retry_time += time.perf_counter() - delay_started
+                if retry_time_holder is not None:
+                    retry_time_holder["excluded_retry_time"] = excluded_retry_time
             attempt += 1
             logger.warning(
                 "[%s] ClaudeCode exited non-zero; retrying --continue (%s/%s)",
