@@ -160,6 +160,10 @@ PY"""
         gateway_proc = None
         agent_proc = None
         elapsed_time = float(spec.timeout_seconds)
+        # Initialized here (not just where the retry loop starts) so the
+        # except block below can always report it, even if a failure happens
+        # before the agent loop starts accumulating retries.
+        excluded_retry_time = 0.0
 
         try:
             exec_path = os.path.join(spec.workspace_path, "exec")
@@ -259,7 +263,6 @@ PY"""
             )
             agent_log = spec.output_dir / "agent.log"
             start_time = time.perf_counter()
-            excluded_retry_time = 0.0
             resume_attempt = 0
             while True:
                 log_offset = agent_log.stat().st_size if agent_log.exists() else 0
@@ -340,6 +343,7 @@ PY"""
                 error=None,
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
+                excluded_retry_time=excluded_retry_time,
             )
         except Exception as exc:
             logger.error("[%s] Execution error: %s", spec.task_id, exc)
@@ -348,6 +352,7 @@ PY"""
                 error=str(exc),
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
+                excluded_retry_time=excluded_retry_time,
             )
 
     @staticmethod

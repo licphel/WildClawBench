@@ -27,6 +27,14 @@ class AgentExecution:
     error: str | None = None
     gateway_proc: subprocess.Popen[str] | None = None
     agent_proc: subprocess.Popen[str] | None = None
+    # Wall-clock time this attempt spent on failed/resumed sub-attempts,
+    # refunded from the *next* attempt's timeout budget so a resumed run
+    # never gets a bigger total budget than a single un-resumed call would
+    # have had. None for a runner that never resumes (nothing to refund);
+    # a float (possibly 0.0) for one that does. Surfaced verbatim into the
+    # task's usage.json as "excluded_retry_time" -- see run_batch.py -- to
+    # match eval_framework/backends/*.py's raw["excluded_retry_time"].
+    excluded_retry_time: float | None = None
 
 
 class BaseAgent(ABC):

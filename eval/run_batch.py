@@ -270,6 +270,10 @@ def run_single_task(
     gateway_proc = None
     agent_proc = None
     elapsed_time = float(timeout_seconds)
+    # None means "this backend never resumes, nothing to refund" (pylm).
+    # A float (0.0 included) means the backend computed it; see
+    # AgentExecution.excluded_retry_time in src/agents/base.py.
+    excluded_retry_time: float | None = None
 
     # The inference gateway sees every request on the wire, so it is the one
     # counter that means the same thing for all five baselines.  It is a
@@ -306,6 +310,7 @@ def run_single_task(
         gateway_proc = execution.gateway_proc
         agent_proc = execution.agent_proc
         elapsed_time = execution.elapsed_time
+        excluded_retry_time = execution.excluded_retry_time
         if execution.error:
             result["error"] = execution.error
     except Exception as exc:
@@ -361,6 +366,12 @@ def run_single_task(
             output_dir=output_dir,
             elapsed_time=elapsed_time,
         )
+        if excluded_retry_time is not None:
+            # How much of elapsed_time above is retry overhead refunded from
+            # the next attempt's budget, rather than "real" agent time.  See
+            # AgentExecution.excluded_retry_time; matches the field name
+            # eval_framework/backends/*.py writes as raw["excluded_retry_time"].
+            usage["excluded_retry_time"] = round(excluded_retry_time, 2)
         # Label it and, where the gateway saw this task exclusively, let the
         # gateway's count take the top-level fields.  The backend's own numbers
         # are kept under "self_reported" either way.

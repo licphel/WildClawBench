@@ -174,6 +174,11 @@ class CodexAgent(BaseAgent):
             model=spec.model,
             timeout_seconds=spec.timeout_seconds,
         )
+        # _run_prompt only returns excluded_retry_time on success (rc==0); a
+        # RuntimeError/TimeoutExpired it raises loses that return value, so
+        # partial progress is mirrored into this holder as it accumulates and
+        # read back in the except blocks below.
+        retry_time_holder: dict[str, float] = {"excluded_retry_time": 0.0}
 
         try:
             try:
@@ -263,6 +268,7 @@ class CodexAgent(BaseAgent):
                     ),
                     timeout_seconds=spec.timeout_seconds,
                     output_dir=spec.output_dir,
+                    retry_time_holder=retry_time_holder,
                 )
                 # Retry time stays INSIDE elapsed_time, deliberately; see
                 # the same note in the claudecode runner.  openclaw's and
@@ -286,7 +292,11 @@ class CodexAgent(BaseAgent):
                     exit_code=0,
                 )
                 return AgentExecution(
-                    elapsed_time=elapsed_time, error=None, gateway_proc=None, agent_proc=None
+                    elapsed_time=elapsed_time,
+                    error=None,
+                    gateway_proc=None,
+                    agent_proc=None,
+                    excluded_retry_time=wrapper_retry_seconds,
                 )
             except subprocess.TimeoutExpired:
                 logger.info("[%s] Codex timed out...", task_id)
@@ -312,6 +322,7 @@ class CodexAgent(BaseAgent):
                     error="Codex run timed out",
                     gateway_proc=None,
                     agent_proc=None,
+                    excluded_retry_time=retry_time_holder["excluded_retry_time"],
                 )
             except Exception as exc:
                 elapsed_time = time.perf_counter() - start_time
@@ -336,6 +347,7 @@ class CodexAgent(BaseAgent):
                     error=str(exc),
                     gateway_proc=None,
                     agent_proc=None,
+                    excluded_retry_time=retry_time_holder["excluded_retry_time"],
                 )
         finally:
             sanitize_agent_log(spec.output_dir / "agent.log")
@@ -811,6 +823,7 @@ if __name__ == "__main__":
         prompt: str,
         timeout_seconds: int,
         output_dir: Path,
+        retry_time_holder: dict[str, float] | None = None,
     ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = output_dir / "agent.log"
@@ -853,6 +866,8 @@ if __name__ == "__main__":
                 # would refund budget for time the agent really did spend.
                 if is_resume:
                     excluded_retry_time += attempt_elapsed
+                    if retry_time_holder is not None:
+                        retry_time_holder["excluded_retry_time"] = excluded_retry_time
                 raise RuntimeError(
                     f"Codex run failed without a resumable provider error "
                     f"(rc={r.returncode}):\n{r.stderr or r.stdout}"
@@ -863,6 +878,8 @@ if __name__ == "__main__":
             if resume_limit_reached:
                 if is_resume:
                     excluded_retry_time += attempt_elapsed
+                    if retry_time_holder is not None:
+                        retry_time_holder["excluded_retry_time"] = excluded_retry_time
                 raise RuntimeError(
                     f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
@@ -872,6 +889,8 @@ if __name__ == "__main__":
             # provider failure on attempt 1 says no more about the agent than
             # the same failure on attempt 2.
             excluded_retry_time += attempt_elapsed
+            if retry_time_holder is not None:
+                retry_time_holder["excluded_retry_time"] = excluded_retry_time
 
             if remaining <= 30:
                 raise RuntimeError(
