@@ -104,6 +104,7 @@ UNRECOVERABLE_SESSION_PATTERNS = (
 # not killing a live run that is retrying them internally.
 UPSTREAM_FAILURE_PATTERNS = (
     "Upstream service temporarily unavailable",
+    "Upstream error",  # covers e.g. "HTTP 400: Upstream error: 400" from the relay
     "ECONNRESET",
     # The same reset spelled the way Python's socket layer reports it
     # ("[Errno 104] Connection reset by peer"); the Node-style token above
@@ -112,6 +113,15 @@ UPSTREAM_FAILURE_PATTERNS = (
     "network aborted",
     "ETIMEDOUT",
     "EAI_AGAIN",
+    # Hermes reports a provider-unavailable turn as a successful HTTP
+    # envelope whose payload contains the upstream's concrete failure.  BEAM
+    # promotes that payload into ``error_detail``; these markers make the
+    # existing shared task-level policy recognize it as a transient inference
+    # anomaly.
+    "provider_unavailable",
+    "ConnectError",
+    "UNEXPECTED_EOF_WHILE_READING",
+    "HTTP 500",
     "502 Bad Gateway",
     "503 Service Unavailable",
     # The relay refusing to route because every upstream channel in the group
@@ -224,6 +234,26 @@ SESSION_ONLY_MARKERS = (
 )
 
 
+def deterministic_request_error(error: str | None) -> str | None:
+    """Return a request-shape failure that must never be retried."""
+
+    if not error:
+        return None
+    lowered = error.lower()
+    # The encrypted-session signature has its own bounded same-session policy.
+    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
+        return None
+    for marker in DETERMINISTIC_REQUEST_MARKERS:
+        if marker in lowered:
+            return marker
+    if any(
+        marker in lowered
+        for marker in ("http 400", "status 400", "status=400", "code 400", "returned 400")
+    ):
+        return "HTTP 400 request error"
+    return None
+
+
 def non_retryable_phase(error: str | None) -> str | None:
     """The NON_RETRYABLE_MARKERS signature in ``error``, or None.
 
@@ -242,26 +272,6 @@ def non_retryable_phase(error: str | None) -> str | None:
     for marker in NON_RETRYABLE_MARKERS:
         if marker.lower() in lowered:
             return marker
-    return None
-
-
-def deterministic_request_error(error: str | None) -> str | None:
-    """Return a request-shape failure that must never be retried."""
-
-    if not error:
-        return None
-    lowered = error.lower()
-    # The encrypted-session signature has its own bounded same-session policy.
-    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
-        return None
-    for marker in DETERMINISTIC_REQUEST_MARKERS:
-        if marker in lowered:
-            return marker
-    if any(
-        marker in lowered
-        for marker in ("http 400", "status 400", "status=400", "code 400", "returned 400")
-    ):
-        return "HTTP 400 request error"
     return None
 
 
@@ -541,6 +551,17 @@ def unrecoverable_session_error(output: str | None) -> str | None:
 #: on a task that is telling us something real.
 MAX_TASK_ATTEMPTS = 2
 
+#: A narrower exception to the number above, not a replacement for it.
+#: ``resumable_provider_error`` is upstream's own signature -- a repudiated
+#: session, exhausted quota, a dropped connection -- and by construction says
+#: nothing about the agent; two attempts hitting the same upstream signature
+#: back to back is itself evidence the anomaly is still live, not that a third
+#: attempt is a bigger thumb on the scale.  Every other retry reason (a plain
+#: stall, an agent's own failure) still stops at MAX_TASK_ATTEMPTS -- only a
+#: task whose *every* prior attempt failed on a resumable provider signature
+#: gets the extra try.
+MAX_TASK_ATTEMPTS_RESUMABLE_PROVIDER_ERROR = 3
+
 #: How long a runner waits before resuming an agent whose attempt died on a
 #: provider error.  Zero, for all five baselines.
 #:
@@ -562,6 +583,32 @@ MAX_TASK_ATTEMPTS = 2
 #: measurement supporting any positive value, and the largest one was
 #: measuring nothing at all.  Zero is the value the data supports.
 RESUME_BACKOFF_S = 0.0
+
+#: How many times one agent turn may be resumed, same-session, after a
+#: resumable_provider_error -- matching WildClaw's own
+#: HERMES_RESUME_ATTEMPTS/OPENCLAW_RESUME_ATTEMPTS (both 3), so a task
+#: resumed under eval_framework's shared runner and one resumed under
+#: WildClaw's eval/run_batch.py get the same number of chances before either
+#: escalates to a fresh Task/container.  This bounds the *resume* layer only:
+#: it is spent before MAX_TASK_ATTEMPTS_RESUMABLE_PROVIDER_ERROR is ever
+#: reached, not instead of it -- exhausting a resume budget is itself the
+#: "still failing" signal the task-level retry then acts on.
+RESUME_ATTEMPTS = 3
+
+
+def should_resume_in_session(error: str | None) -> bool:
+    """Should this attempt continue the same session instead of ending the turn?
+
+    One call, so the five backends that each drive their own resume loop
+    (claude_code, codex, hermes, openclaw, pylm_cli) cannot drift on what
+    counts as resumable -- the same trap ``should_retry_attempt`` exists to
+    close at the task level. Currently identical to
+    ``bool(resumable_provider_error(error))``; kept as its own name so a
+    backend's resume loop reads as answering "should I resume?" rather than
+    re-deriving that from the lower-level pattern matcher.
+    """
+
+    return bool(resumable_provider_error(error))
 
 
 def should_retry_attempt(
