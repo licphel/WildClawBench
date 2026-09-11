@@ -54,8 +54,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# OpenClaw's in-container gateway gets an ephemeral port. A fixed default
-# creates avoidable collisions when tasks run in parallel.
+# OpenClaw's in-container gateway gets an ephemeral port. The OpenClaw runner
+# resolves this zero sentinel to a valid free port inside each task container;
+# passing zero directly to OpenClaw is invalid.
 GATEWAY_PORT     = 0
 
 ROOT_DIR         = Path(__file__).resolve().parent.parent

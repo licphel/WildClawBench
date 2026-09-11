@@ -62,6 +62,56 @@ class OpenClawAgent(BaseAgent):
         self.openrouter_base_url = openrouter_base_url
         self.image_model = image_model or ""
 
+    def _resolve_gateway_port(self, task_id: str) -> int:
+        """Return a valid free gateway port inside the task container.
+
+        ``run_batch.py`` passes ``0`` as the dynamic-port sentinel.  OpenClaw's
+        CLI does not accept ``--port 0`` (unlike Python's socket API), so the
+        allocation has to happen before the CLI starts and in the container's
+        own network namespace.  Each task has its own container; a short
+        bind-and-release probe is therefore sufficient and avoids sharing a
+        host-side port with another task.
+        """
+        if self.gateway_port > 0:
+            return self.gateway_port
+        probe = subprocess.run(
+            [
+                "docker",
+                "exec",
+                task_id,
+                "python3",
+                "-c",
+                (
+                    "import socket; "
+                    "sock = socket.socket(); "
+                    "sock.bind(('127.0.0.1', 0)); "
+                    "print(sock.getsockname()[1]); "
+                    "sock.close()"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            detail = (probe.stderr or probe.stdout or "").strip()
+            raise RuntimeError(
+                f"Could not allocate an OpenClaw gateway port in the container "
+                f"(rc={probe.returncode}): {detail[-500:]}"
+            )
+        raw_port = (probe.stdout or "").strip().splitlines()
+        try:
+            port = int(raw_port[-1])
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError(
+                f"Container returned an invalid OpenClaw gateway port: "
+                f"{probe.stdout!r}"
+            ) from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"Container returned an out-of-range gateway port: {port}")
+        logger.info("[%s] Allocated OpenClaw gateway port inside container: %s", task_id, port)
+        return port
+
     @property
     def expects_gateway(self) -> bool:
         return True
@@ -188,13 +238,16 @@ PY"""
             image_model = self.image_model or spec.model
             self._set_image_model(spec.task_id, image_model)
 
+            gateway_port = self._resolve_gateway_port(spec.task_id)
+
             gateway_proc = run_background(
                 spec.task_id,
                 bash_cmd=(
                     f"export OPENROUTER_API_KEY='{self.openrouter_api_key}' && "
                     f"export OPENROUTER_BASE_URL='{self.openrouter_base_url}' && "
+                    f"export OPENCLAW_GATEWAY_PORT='{gateway_port}' && "
                     "for attempt in 1 2; do "
-                    f"openclaw gateway run --port {self.gateway_port} "
+                    f"openclaw gateway run --port {gateway_port} "
                     "--bind loopback --allow-unconfigured; "
                     "status=$?; "
                     "if [ $status -eq 0 ] || [ $attempt -eq 2 ]; then "
@@ -231,7 +284,7 @@ PY"""
                         spec.task_id,
                         "/bin/bash",
                         "-c",
-                        "openclaw health",
+                        f"OPENCLAW_GATEWAY_PORT='{gateway_port}' openclaw health",
                     ],
                     capture_output=True,
                     text=True,
