@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from src.agents.approval_posture import OPENCLAW as OPENCLAW_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
+from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
 from src.utils.docker_utils import (
@@ -185,6 +186,7 @@ PY"""
             self._apply_approval_posture(spec.task_id, spec.output_dir)
             self._set_model(spec.task_id, spec.model)
             self._inject_openrouter_key(spec.task_id)
+            self._set_gateway_task_header(spec.task_id)
             image_model = self.image_model or spec.model
             self._set_image_model(spec.task_id, image_model)
 
@@ -459,6 +461,38 @@ PY"""
             text=True,
         )
         logger.info("[%s] Injected OPENROUTER_API_KEY into auth-profiles.json", task_id)
+
+    def _set_gateway_task_header(self, task_id: str) -> None:
+        """Stamp this task's correlation id on the ``openrouter`` provider.
+
+        Out-of-band, never inside message content: so the shared inference
+        Gateway can bucket ``request_count`` by task instead of guessing task
+        boundaries from wall-clock window overlap (the failure mode under
+        ``--parallel`` > 1). ``models.providers.<name>.headers`` is a real,
+        documented openclaw config field (confirmed in the vendored source:
+        model-catalog-normalize.ts merges ``providerCatalog.headers`` into the
+        client's ``defaultHeaders`` for both the Anthropic and Responses
+        transports) -- the same field
+        ``eval_framework/backends/openclaw_backend.py`` writes for the same
+        purpose. ``"openrouter"`` is openclaw's own well-known provider id for
+        the ``OPENROUTER_API_KEY``/``OPENROUTER_BASE_URL`` credential this
+        runner already exports before starting the gateway.
+        """
+        headers_json = json.dumps({TASK_ID_HEADER: task_id})
+        r = subprocess.run(
+            [
+                "docker", "exec", task_id, "/bin/bash", "-c",
+                "openclaw config set models.providers.openrouter.headers "
+                + shlex.quote(headers_json),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "[%s] Failed to set gateway task-id header: %s",
+                task_id, (r.stderr or "").strip(),
+            )
 
     def _apply_approval_posture(self, task_id: str, output_dir: Path) -> None:
         """Write openclaw's approval posture from the harness, not the image.

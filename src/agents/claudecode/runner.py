@@ -17,6 +17,7 @@ from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
+from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
 
 load_dotenv()
@@ -483,6 +484,19 @@ class ClaudeCodeAgent(BaseAgent):
             "no_proxy": no_proxy,
             "NO_PROXY": no_proxy,
         }
+        if task_id:
+            # Stamps this task's correlation id on every request the claude
+            # CLI's own Anthropic client sends -- purely at the transport
+            # level, never inside message content -- so the shared inference
+            # Gateway can bucket request_count by task instead of guessing
+            # task boundaries from wall-clock window overlap (the failure
+            # mode under ``--parallel`` > 1). ``ANTHROPIC_CUSTOM_HEADERS`` is
+            # Claude Code's own documented env var for exactly this: one
+            # "Header: Value" pair per line, applied by its Anthropic client
+            # to every outbound request. Matches
+            # ``eval_framework/backends/claude_code_backend.py``'s use of the
+            # same env var for the same purpose.
+            env_map["ANTHROPIC_CUSTOM_HEADERS"] = f"{TASK_ID_HEADER}: {task_id}"
         env_args: list[str] = []
         for key, value in env_map.items():
             if value:

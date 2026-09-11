@@ -21,6 +21,7 @@ from src.agents.codex.backend import (
 )
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_openclaw
+from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.transient_errors import resumable_provider_error
 
 logger = logging.getLogger(__name__)
@@ -524,6 +525,7 @@ class CodexAgent(BaseAgent):
             reasoning_effort=reasoning_effort,
             wire_api=wire_api,
             base_url=base_url,
+            task_id=task_id,
         )
 
         # Mirror the rendered config host-side so future debugging is trivial.
@@ -557,6 +559,7 @@ class CodexAgent(BaseAgent):
         reasoning_effort: str | None,
         wire_api: str | None,
         base_url: str | None = None,
+        task_id: str = "",
     ) -> str:
         bare_model = model.split("/", 1)[1] if model.startswith("openrouter/") else model
         safe_base_url = (base_url or self.openrouter_base_url).replace('"', '\\"')
@@ -566,6 +569,21 @@ class CodexAgent(BaseAgent):
             else ""
         )
         provider_wire_api_line = f'wire_api = "{wire_api}"\n' if wire_api else ""
+        # Stamps this task's correlation id on every request codex's own
+        # Responses client sends to the gateway -- out-of-band, never inside
+        # message content -- so the shared gateway can bucket request_count by
+        # task instead of guessing from wall-clock window overlap (the
+        # failure mode under ``--parallel`` > 1). ``http_headers`` is a real,
+        # documented ``model_providers.<name>`` field, applied by codex's own
+        # HTTP client to every request it sends this provider. Matches
+        # ``eval_framework/backends/codex_backend.py``'s use of the same
+        # field for the same purpose. Inline-table syntax so it can sit
+        # alongside the scalar keys without TOML's table-ordering rules.
+        http_headers_line = (
+            f'http_headers = {{ "{TASK_ID_HEADER}" = "{task_id}" }}\n'
+            if task_id
+            else ""
+        )
         return (
             f'model_provider = "openrouter"\n'
             f"{reasoning_line}"
@@ -585,6 +603,7 @@ class CodexAgent(BaseAgent):
             f'base_url = "{safe_base_url}"\n'
             f'env_key = "OPENROUTER_API_KEY"\n'
             f"{provider_wire_api_line}"
+            f"{http_headers_line}"
         )
 
     def _install_image_helper(self, task_id: str, model: str) -> None:

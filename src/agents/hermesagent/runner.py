@@ -20,6 +20,7 @@ from src.utils.docker_utils import (
     inject_lobster_workspace,
     TMP_WORKSPACE,
 )
+from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.transient_errors import (
     RESUME_BACKOFF_S,
@@ -416,7 +417,9 @@ class HermesAgentAgent(BaseAgent):
         return json.dumps(str(value), ensure_ascii=True)
 
     @classmethod
-    def _build_hermes_yaml(cls, model: str, api_key: str, base_url: str) -> str:
+    def _build_hermes_yaml(
+        cls, model: str, api_key: str, base_url: str, task_id: str = ""
+    ) -> str:
         """Build a config that pins the main and every auxiliary call together."""
         model_value = cls._yaml_quote(model)
         key_value = cls._yaml_quote(api_key)
@@ -518,6 +521,28 @@ class HermesAgentAgent(BaseAgent):
                 "      provider: brave",
             ]
         )
+        if task_id:
+            # Stamps this task's correlation id on every request hermes'
+            # own outbound client sends -- out-of-band, never inside message
+            # content -- so the shared gateway can bucket request_count by
+            # task instead of guessing from wall-clock window overlap (the
+            # failure mode under ``--parallel`` > 1). Matched to the model's
+            # base_url (hermes_cli/config.py's
+            # ``get_custom_provider_extra_headers`` matches ``providers``/
+            # ``custom_providers`` entries by normalized base_url, not by
+            # name), so this needs no named provider id that ``model:``
+            # would otherwise have to reference. Matches
+            # ``eval_framework/backends/hermes_backend.py``'s use of
+            # ``providers.<name>.extra_headers`` for the same purpose.
+            lines.extend(
+                [
+                    "providers:",
+                    "  wildclaw_gateway:",
+                    f"    base_url: {base_value}",
+                    "    extra_headers:",
+                    f"      {TASK_ID_HEADER}: {cls._yaml_quote(task_id)}",
+                ]
+            )
         return "\n".join(lines) + "\n"
 
     def _configure_hermes(
@@ -528,7 +553,10 @@ class HermesAgentAgent(BaseAgent):
         model: str = "",
     ) -> None:
         """Configure hermes-agent inside the container with one consistent provider config."""
-        hermes_yaml = self._build_hermes_yaml(model, api_key, base_url)
+        # ``task_id`` is already this task's stable, unique identity (it is
+        # also the container name), so it doubles as the Gateway correlation
+        # id -- no separate identity to invent or thread in.
+        hermes_yaml = self._build_hermes_yaml(model, api_key, base_url, task_id=task_id)
         with tempfile.TemporaryDirectory(prefix="hermes_config_") as tmp_dir:
             tmp_root = Path(tmp_dir)
             yaml_host = tmp_root / "hermes.yaml"

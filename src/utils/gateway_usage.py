@@ -48,7 +48,13 @@ window.  ``GatewayUsageWindow`` therefore tracks how many task windows were
 open concurrently and stamps every record with the answer: ``attribution:
 "exclusive"`` (trustworthy, promoted to the authoritative top-level numbers) or
 ``attribution: "overlapped"`` (recorded, but the self-reported numbers stay
-authoritative because the delta cannot be attributed to one task).
+authoritative because the delta cannot be attributed to one task) --
+*unless* the caller also sent a per-task correlation id (``TASK_ID_HEADER``)
+and the Gateway confirmed it understood task-scoping, in which case the
+counter this window read was never shared with any other task's window to
+begin with and the record says ``attribution: "task_scoped"`` instead: the
+concurrent-window count is beside the point when nothing else could have
+landed in this task's own bucket.
 
 Elapsed time is NOT consolidated the same way
 ---------------------------------------------
@@ -342,6 +348,17 @@ _GATEWAY_KEY_MAP = {
 
 _PROBE_TIMEOUT_S = float(os.environ.get("WILDCLAW_GATEWAY_USAGE_TIMEOUT", "5"))
 
+#: Same header name as ``eval_framework/backends/inference_gateway.py``'s
+#: ``TASK_ID_HEADER``.  Not imported from there: WildClawBench is its own
+#: checkout with its own interpreter and does not have that module on its
+#: path (see the module docstring's "Vocabulary" section for the same
+#: constraint on ``usage_source``/``cache_semantics``).  Kept identical by
+#: convention.  Sent on the provenance GET so the Gateway can bucket its
+#: answer to just this task's requests instead of the whole process's --
+#: the fix for concurrent WildClaw workers (``--parallel`` > 1) whose windows
+#: used to overlap in wall-clock time and come back unattributable.
+TASK_ID_HEADER = "X-PyLM-Task-Id"
+
 
 def backend_name(backend: Any) -> str:
     """The CLI backend name for an agent object (``codex``, ``pylm``, ...)."""
@@ -446,11 +463,15 @@ def _provenance_url(base: str) -> str:
     return f"{base}/gateway/provenance"
 
 
-def _get_json(url: str, token: str, timeout: float) -> dict[str, Any] | None:
+def _get_json(
+    url: str, token: str, timeout: float, *, task_id: str = ""
+) -> dict[str, Any] | None:
     request = urllib.request.Request(url, method="GET")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
         request.add_header("x-api-key", token)
+    if task_id:
+        request.add_header(TASK_ID_HEADER, task_id)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -510,7 +531,7 @@ def gateway_available() -> bool:
     return bool(url)
 
 
-def fetch_gateway_usage() -> dict[str, Any] | None:
+def fetch_gateway_usage(*, task_id: str = "") -> dict[str, Any] | None:
     """The Gateway's live *cumulative* counter, normalized.
 
     Same payload shape as ``eval_framework.sentinel_gateway.fetch_gateway_usage``
@@ -522,11 +543,20 @@ def fetch_gateway_usage() -> dict[str, Any] | None:
     Cumulative and batch-wide: this counter covers every request the singleton
     Gateway has served since it started, from every client.  One task's slice is
     a delta between two of these -- see ``GatewayUsageWindow``.
+
+    ``task_id``, when given, asks the Gateway to scope its answer to just that
+    correlation id's requests (see ``TASK_ID_HEADER``) instead of the whole
+    process's counters.  Whether it actually understood the request rides back
+    under the private ``_usage_scope`` key: ``"task"`` means the Gateway
+    confirmed the numbers above are genuinely this id's alone; anything else
+    (including a gateway that predates ``TASK_ID_HEADER`` and silently ignores
+    it) means they are still the whole process's, and must not be read as
+    task-exclusive just because a task id was sent.
     """
     url, token, _ = _Endpoint.resolve()
     if not url:
         return None
-    payload = _get_json(url, token, _PROBE_TIMEOUT_S)
+    payload = _get_json(url, token, _PROBE_TIMEOUT_S, task_id=task_id)
     if payload is None:
         return None
     raw = payload.get("usage")
@@ -537,6 +567,7 @@ def fetch_gateway_usage() -> dict[str, Any] | None:
         "status": "observed",
         "source": "inference_gateway_upstream",
         "endpoint": url,
+        "_usage_scope": str(payload.get("usage_scope") or ""),
     }
     for gateway_key, our_key in _GATEWAY_KEY_MAP.items():
         snapshot[our_key] = _int(raw.get(gateway_key))
@@ -576,16 +607,24 @@ class GatewayUsageWindow:
     _registry_lock = threading.Lock()
     _live: set["GatewayUsageWindow"] = set()
 
-    def __init__(self) -> None:
+    def __init__(self, *, task_id: str = "") -> None:
+        # The per-task correlation id this window's caller stamps on its own
+        # outbound requests (see ``TASK_ID_HEADER``).  Optional and backward
+        # compatible: a caller that does not pass one falls back to the old
+        # concurrent-window-counting ``exclusive`` reasoning exactly as
+        # before -- run_batch.py's own ``task_id`` (already a stable,
+        # per-task-unique identity: it is the container name) is what is
+        # passed in practice.
+        self.task_id = task_id
         self.before: dict[str, Any] | None = None
         self.after: dict[str, Any] | None = None
         self.concurrent_tasks_max = 1
         self._closed = False
 
     @classmethod
-    def open(cls) -> "GatewayUsageWindow":
-        window = cls()
-        window.before = fetch_gateway_usage()
+    def open(cls, *, task_id: str = "") -> "GatewayUsageWindow":
+        window = cls(task_id=task_id)
+        window.before = fetch_gateway_usage(task_id=task_id)
         with cls._registry_lock:
             cls._live.add(window)
             live = len(cls._live)
@@ -600,7 +639,7 @@ class GatewayUsageWindow:
         # Snapshot before deregistering: a sibling task opening in between must
         # still count as an overlap of this window.
         if self.before is not None:
-            self.after = fetch_gateway_usage()
+            self.after = fetch_gateway_usage(task_id=self.task_id)
         with self._registry_lock:
             self._live.discard(self)
 
@@ -611,8 +650,30 @@ class GatewayUsageWindow:
         self.close()
 
     @property
+    def task_scoped(self) -> bool:
+        """Whether this window's counter is genuinely this task's alone.
+
+        True only when a correlation id was sent *and* the Gateway's answer,
+        both before and after, confirmed it understood the request as
+        task-scoped (``_usage_scope == "task"``).  A Gateway that predates
+        ``TASK_ID_HEADER`` silently ignores the header and answers with the
+        whole process's counter under the same key names -- checking the
+        confirmation, not just "did we send an id", is what keeps that case
+        from being misread as attributable.
+        """
+        if not self.task_id:
+            return False
+        before, after = self.before, self.after
+        return (
+            isinstance(before, dict)
+            and before.get("_usage_scope") == "task"
+            and isinstance(after, dict)
+            and after.get("_usage_scope") == "task"
+        )
+
+    @property
     def exclusive(self) -> bool:
-        return self.concurrent_tasks_max <= 1
+        return self.task_scoped or self.concurrent_tasks_max <= 1
 
     def timeout_evidence(self) -> dict[str, Any]:
         """What the Gateway saw across this task, for a timeout adjudication.
@@ -822,7 +883,10 @@ def annotate_usage(
         "usage_source": USAGE_SOURCE_GATEWAY,
         "cache_semantics": GATEWAY_CACHE_SEMANTICS,
         "concurrent_tasks_max": window.concurrent_tasks_max,
-        "attribution": "exclusive" if window.exclusive else "overlapped",
+        "attribution": (
+            "task_scoped" if window.task_scoped
+            else ("exclusive" if window.exclusive else "overlapped")
+        ),
         **delta,
         "total_tokens": total_tokens(delta, GATEWAY_CACHE_SEMANTICS),
         "cumulative_before": _counters_only(window.before),

@@ -278,7 +278,15 @@ def run_single_task(
     # here, closed at the top of `finally` -- deliberately BEFORE
     # grade_the_task(), because WildClaw's LLM judge talks to the same gateway
     # with the same token and would otherwise be billed to the agent.
-    usage_window = gateway_usage.GatewayUsageWindow.open()
+    # ``task_id`` doubles as the per-task correlation id: it is already a
+    # stable, task-scoped identity (it is the container name too), computed
+    # above before any gateway call -- exactly what
+    # ``src/utils/gateway_usage.py``'s ``TASK_ID_HEADER`` needs. Passing it
+    # here scopes this window's own provenance reads to just this task's
+    # bucket; each backend must *also* stamp it on its own outbound requests
+    # (see each ``src/agents/<backend>/runner.py``) for the gateway to have
+    # anything to bucket by.
+    usage_window = gateway_usage.GatewayUsageWindow.open(task_id=task_id)
 
     try:
         execution = backend.run_task(
