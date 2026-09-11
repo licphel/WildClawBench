@@ -6,17 +6,92 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path, PurePosixPath
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# -grader: carries the shared grading interpreter (src/utils/grading.py::
+# GRADER_PYTHON). The agent-visible environment is unchanged from v1.3-node.
+# openclaw's task image.  Renamed from wildclawbench-ubuntu:v1.3-node-grader
+# when the OpenClaw CLI stopped being whatever the base image was built with
+# and became a build argument (Dockerfile.openclaw ARG OPENCLAW_VERSION);
+# the tag now names the CLI release, as the codex and claudecode tags do.
 DOCKER_IMAGE  = os.environ.get("DOCKER_IMAGE", "").strip()
-TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE",  "/tmp_workspace")
+TMP_WORKSPACE = "/tmp_workspace"
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
-BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
+
+
+_DEFAULT_CONTAINER_NO_PROXY = "localhost,127.0.0.1,::1,host.docker.internal"
+
+
+def _rewrite_proxy_host(value: str) -> str:
+    """Make a host-local proxy reachable from a bridged task container."""
+    if not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return value
+    replacement = os.environ.get("BENCHMARK_CONTAINER_PROXY_HOST", "host.docker.internal")
+    netloc = replacement
+    if parsed.port is not None:
+        netloc = f"{replacement}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def container_proxy_env(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Resolve the proxy environment from the host to the container viewpoint.
+
+    ``HTTP_PROXY_INNER`` is already a container-reachable value and therefore
+    wins.  The old code only read that pair, while the normal benchmark proxy
+    launcher exports ``BENCHMARK_CONTAINER_*`` and many invocations only have
+    host-side ``HTTP_PROXY``.  The latter is rewritten only when proxy use was
+    explicitly enabled, so an ambient developer proxy is not silently adopted.
+    """
+    source = source if source is not None else os.environ
+    http = source.get("HTTP_PROXY_INNER") or source.get("BENCHMARK_CONTAINER_HTTP_PROXY")
+    https = source.get("HTTPS_PROXY_INNER") or source.get("BENCHMARK_CONTAINER_HTTPS_PROXY")
+    all_proxy = source.get("ALL_PROXY_INNER") or source.get("BENCHMARK_CONTAINER_ALL_PROXY")
+    no_proxy = (
+        source.get("NO_PROXY_INNER")
+        or source.get("BENCHMARK_CONTAINER_NO_PROXY")
+        or source.get("NO_PROXY")
+        or source.get("no_proxy")
+    )
+
+    if not http and source.get("BENCHMARK_USE_PROXY") == "1":
+        http = _rewrite_proxy_host(source.get("HTTP_PROXY", ""))
+    if not https and source.get("BENCHMARK_USE_PROXY") == "1":
+        https = _rewrite_proxy_host(source.get("HTTPS_PROXY") or http or "")
+    if not all_proxy and source.get("BENCHMARK_USE_PROXY") == "1":
+        all_proxy = _rewrite_proxy_host(source.get("ALL_PROXY", "") or http or "")
+
+    if http and not https:
+        https = http
+    if http or https or all_proxy:
+        no_proxy = no_proxy or _DEFAULT_CONTAINER_NO_PROXY
+
+    resolved: dict[str, str] = {}
+    for upper, lower, value in (
+        ("HTTP_PROXY", "http_proxy", http),
+        ("HTTPS_PROXY", "https_proxy", https),
+        ("ALL_PROXY", "all_proxy", all_proxy),
+    ):
+        if value:
+            resolved[upper] = value
+            resolved[lower] = value
+    if no_proxy:
+        resolved["NO_PROXY"] = no_proxy
+        resolved["no_proxy"] = no_proxy
+    return resolved
 
 def remove_container(name: str) -> None:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
@@ -29,16 +104,18 @@ def start_container(task_id: str, workspace_path: str, extra_env: str = "",
     if not workspace.is_dir():
         raise RuntimeError(f"Workspace path does not exist or is not a directory: {workspace}")
 
-    proxy_http = os.environ.get('HTTP_PROXY_INNER', '')
-    proxy_https = os.environ.get('HTTPS_PROXY_INNER', '')
-    env_args = [
-        "-e", f"http_proxy={proxy_http}",
-        "-e", f"https_proxy={proxy_https}",
-        "-e", f"HTTP_PROXY={proxy_http}",
-        "-e", f"HTTPS_PROXY={proxy_https}",
-        "-e", f"BRAVE_API_KEY={BRAVE_API_KEY}",
-        "-e", f"no_proxy={'' if not proxy_http else os.environ.get('NO_PROXY_INNER', '')}",
-    ]
+    proxy_env = container_proxy_env()
+    env_args = []
+    # Explicitly clear image-baked proxy values when no runtime proxy was
+    # selected. Some legacy WildClaw images carried a dead proxy in ENV.
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+        "NO_PROXY", "no_proxy",
+    ):
+        env_args += ["-e", f"{key}={proxy_env.get(key, '')}"]
+    if BRAVE_API_KEY:
+        env_args += ["-e", f"BRAVE_API_KEY={BRAVE_API_KEY}"]
     for line in extra_env.splitlines():
         key = line.strip()
         if not key or key.startswith("#"):
@@ -224,40 +301,91 @@ def run_warmup(
     if not commands:
         return
 
-    logger.info("[%s] Running warmup (%d commands)", task_id, len(commands))
+    retry_delay = 10.0
+    max_retries = 5
+    retry_desc = str(max_retries)
+
+    logger.info(
+        "[%s] Running warmup (%d commands, retries=%s, retry_delay=%.1fs)",
+        task_id,
+        len(commands),
+        retry_desc,
+        retry_delay,
+    )
     for idx, cmd in enumerate(commands, start=1):
         logger.info("[%s] warmup: %s", task_id, cmd)
         stripped_cmd = cmd.rstrip()
-        if detach_background and stripped_cmd.endswith("&"):
-            background_cmd = stripped_cmd[:-1].strip()
-            log_path = f"/tmp/wildclaw_warmup_{idx}.log"
-            wrapped = (
-                f"cd {TMP_WORKSPACE} && "
-                f"nohup /bin/bash -lc {shlex.quote(background_cmd)} "
-                f"> {shlex.quote(log_path)} 2>&1 < /dev/null &"
-            )
-            r = subprocess.run(
-                ["docker", "exec", task_id, "/bin/bash", "-lc", wrapped],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(
-                    f"Warmup background command failed: {cmd!r}\n{r.stderr}"
+
+        attempts = 0
+        while True:
+            attempts += 1
+            if detach_background and stripped_cmd.endswith("&"):
+                background_cmd = stripped_cmd[:-1].strip()
+                log_path = f"/tmp/wildclaw_warmup_{idx}.log"
+                # `-c`, not `-lc`, in both shells here and everywhere else in
+                # the harness.  These two lines were the only place a warmup
+                # command's PATH depended on whether it ended in `&`: the
+                # backgrounded branch used a login shell and the branch below
+                # does not, so the same warmup line saw two different PATHs
+                # depending on a trailing character.  In the hermes image that
+                # was a real difference -- a login shell there sourced uv's
+                # env script and inserted /root/.local/bin, which carries uv's
+                # own package-less python3.12.  Every image's ENV PATH is now
+                # authoritative and complete, so a login shell adds nothing.
+                wrapped = (
+                    f"cd {TMP_WORKSPACE} && "
+                    f"nohup /bin/bash -c {shlex.quote(background_cmd)} "
+                    f"> {shlex.quote(log_path)} 2>&1 < /dev/null &"
                 )
-            continue
+                r = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", wrapped],
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                r = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
+                    capture_output=True, text=True,
+                )
 
-        r = subprocess.run(
-            ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"Warmup command failed: {cmd!r}\n{r.stderr}")
+            if r.returncode != 0:
+                stderr = (r.stderr or "").strip()
+                stdout = (r.stdout or "").strip()
+                if max_retries > 0 and attempts > max_retries:
+                    raise RuntimeError(
+                        f"Warmup command failed after {attempts} attempts: {cmd!r}\n"
+                        f"stdout:\n{stdout}\n\nstderr:\n{stderr}"
+                    )
+                logger.warning(
+                    "[%s] Warmup command failed (command %d/%d, attempt %d, rc=%d); retrying in %.1fs: %s\nstdout: %s\nstderr: %s",
+                    task_id,
+                    idx,
+                    len(commands),
+                    attempts,
+                    r.returncode,
+                    retry_delay,
+                    cmd,
+                    stdout[-1000:],
+                    stderr[-1000:],
+                )
+                time.sleep(max(0.0, retry_delay))
+                continue
+
+            if attempts > 1:
+                logger.info(
+                    "[%s] Warmup command succeeded after %d attempts: %s",
+                    task_id,
+                    attempts,
+                    cmd,
+                )
+            break
 
 
-def run_background(task_id: str, bash_cmd: str, log_path: Path) -> subprocess.Popen:
+def run_background(
+    task_id: str, bash_cmd: str, log_path: Path, append: bool = False
+) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open("w", encoding="utf-8")
+    log_file = log_path.open("a" if append else "w", encoding="utf-8")
     proc = subprocess.Popen(
         ["docker", "exec", task_id, "/bin/bash", "-c",
          f"cd {TMP_WORKSPACE} && {bash_cmd}"],

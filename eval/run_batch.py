@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import json
@@ -38,7 +39,12 @@ from src.utils.grading import (
     print_global_summary,
     write_error_score as write_error_score_file,
 )
-from src.utils.transient_errors import is_transient_error
+from src.utils.transient_errors import (
+    MAX_TASK_ATTEMPTS,
+    attempt_evidence,
+    should_retry_attempt,
+)
+from src.utils import gateway_usage
 
 load_dotenv()
 logging.basicConfig(
@@ -48,14 +54,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GATEWAY_PORT     = int(os.environ.get("GATEWAY_PORT", "18789"))
+# OpenClaw's in-container gateway gets an ephemeral port. A fixed default
+# creates avoidable collisions when tasks run in parallel.
+GATEWAY_PORT     = 0
 
 ROOT_DIR         = Path(__file__).resolve().parent.parent
-TASKS_DIR        = ROOT_DIR / os.environ.get("TASKS_SUBDIR",  "tasks")
+TASKS_DIR        = ROOT_DIR / "tasks"
+# OUTPUT_SUBDIR is intentionally still overridable by config_lib.sh so the
+# run-layout wrapper can stage each experiment before publishing it.
 OUTPUT_DIR       = ROOT_DIR / os.environ.get("OUTPUT_SUBDIR", "output")
 
-DEFAULT_MODEL    = os.environ.get("DEFAULT_MODEL",    "gpt-5.6-terra")
-DEFAULT_PARALLEL = int(os.environ.get("DEFAULT_PARALLEL", "1"))
+DEFAULT_MODEL    = "gpt-5.6-terra"
+DEFAULT_PARALLEL = 1
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
@@ -64,7 +74,18 @@ OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
 OPENROUTER_BASE_URL_CLAUDECODE = normalize_openrouter_base_url_for_claudecode(
     os.environ.get("OPENROUTER_BASE_URL", "")
 )
-MODELS_API_KEY_PLACEHOLDER = "${MY_PROXY_API_KEY}"
+MODELS_API_KEY_PLACEHOLDER = "${GATEWAY_TOKEN}"
+
+#: Baselines graded even when the run reported an error, so a failed task keeps
+#: its real (usually near-zero) per-check breakdown instead of empty scores.
+#: All five are listed rather than making this unconditional so an unrecognised
+#: backend still falls back to the conservative behaviour.  Matched by *class
+#: name* via gateway_usage.backend_name, not isinstance: HermesAgentAgent is
+#: imported lazily inside main() to keep it off the module-level import path,
+#: which is exactly why gateway_usage.BACKEND_NAME_BY_CLASS maps by name too.
+GRADE_ON_ERROR_BACKENDS = frozenset(
+    {"claudecode", "codex", "hermesagent", "openclaw", "pylm"}
+)
 
 ALL_CATEGORIES = [
     "01_Productivity_Flow",
@@ -126,13 +147,20 @@ def grade_the_task(
 
 def save_usage(output_dir: Path, result: dict, usage: dict, task_id: str) -> dict:
     result["usage"] = usage
-    if usage["request_count"] > 0:
+    request_count = usage.get("request_count")
+    if isinstance(request_count, int) and request_count > 0:
+        # usage_source/cache_semantics are logged, not just written: the whole
+        # point of the record is that a number is meaningless without them, and
+        # the console is where an operator first sees it.
         logger.info(
-            "[%s] Token usage - input:%d output:%d cache_read:%d total:%d cost:$%.4f",
+            "[%s] Token usage (%s, cache=%s) - input:%s output:%s cache_read:%s "
+            "total:%s cost:$%s",
             task_id,
-            usage["input_tokens"], usage["output_tokens"],
-            usage["cache_read_tokens"], usage["total_tokens"],
-            usage["cost_usd"],
+            usage.get("usage_source", gateway_usage.USAGE_SOURCE_BACKEND),
+            usage.get("cache_semantics", gateway_usage.CACHE_UNKNOWN),
+            usage.get("input_tokens"), usage.get("output_tokens"),
+            usage.get("cache_read_tokens"), usage.get("total_tokens"),
+            usage.get("cost_usd"),
         )
     usage_path = output_dir / "usage.json"
     usage_path.write_text(
@@ -158,17 +186,37 @@ def collect_task_output(
         logger.warning("[%s] Failed to collect task output: %s", task_id, exc)
 
 
+def _publish_task_result(result: dict) -> None:
+    """Publish exactly one canonical result for the logical Task."""
+    output_dir = result.get("_output_dir")
+    if not output_dir:
+        return
+    payload = {
+        key: value for key, value in result.items()
+        if not key.startswith("_")
+        and key not in {"retry_adjudication", "attempt", "attempt_id", "history"}
+    }
+    payload.setdefault("status", "all_attempts_failed" if result.get("error") else "ok")
+    if result.get("error"):
+        payload["score"] = 0.0
+    path = Path(output_dir) / "task_result.json"
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
 def load_models_config(models_config_path: Path) -> dict:
     raw_config = models_config_path.read_text(encoding="utf-8")
-    proxy_api_key = os.environ.get("MY_PROXY_API_KEY")
-    if MODELS_API_KEY_PLACEHOLDER in raw_config and not proxy_api_key:
+    gateway_token = os.environ.get("GATEWAY_TOKEN")
+    if MODELS_API_KEY_PLACEHOLDER in raw_config and not gateway_token:
         raise ValueError(
-            "MY_PROXY_API_KEY must be set to a non-empty value when models config uses ${MY_PROXY_API_KEY}"
+            "GATEWAY_TOKEN must be set to a non-empty value when models config uses ${GATEWAY_TOKEN}"
         )
 
     expanded_config = raw_config.replace(
         MODELS_API_KEY_PLACEHOLDER,
-        proxy_api_key or "",
+        gateway_token or "",
     )
     parsed_models_config = json.loads(expanded_config)
     if not isinstance(parsed_models_config, dict):
@@ -210,11 +258,27 @@ def run_single_task(
     output_dir = output_root / task["category"] / f"{task_id_ori}" / f"{suffix}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    result = {"task_id": task_id, "scores": {}, "error": None}
+    result = {
+        "task_id": task_id,
+        "scores": {},
+        "error": None,
+        # Private runner state. Consumed by run_single_task_with_retry before
+        # the published Task result is returned.
+        "_output_dir": str(output_dir),
+    }
 
     gateway_proc = None
     agent_proc = None
     elapsed_time = float(timeout_seconds)
+
+    # The inference gateway sees every request on the wire, so it is the one
+    # counter that means the same thing for all five baselines.  It is a
+    # host-side singleton with no per-client partition, so this task's slice is
+    # the movement of its cumulative counter across the agent's run: opened
+    # here, closed at the top of `finally` -- deliberately BEFORE
+    # grade_the_task(), because WildClaw's LLM judge talks to the same gateway
+    # with the same token and would otherwise be billed to the agent.
+    usage_window = gateway_usage.GatewayUsageWindow.open()
 
     try:
         execution = backend.run_task(
@@ -241,17 +305,23 @@ def run_single_task(
         logger.error("[%s] Unexpected backend error: %s", task_id, exc)
 
     finally:
+        usage_window.close()
         grading_transcript_path = backend.transcript_container_path
+        # This started as an isinstance tuple that grew one baseline at a time:
         # OpenClawAgent previously never set result["error"] (openclaw/runner.py
         # returned error=None unconditionally), so "not result.get('error')" was
-        # always true for it and grading always ran. Now that runner.py surfaces
+        # always true for it and grading always ran. Once runner.py surfaced
         # embedded-run failures (e.g. an upstream provider hiccup) as a real
         # error — so run_single_task_with_retry can detect and retry them —
-        # OpenClawAgent needs grade_on_error=True too, or it would silently skip
-        # grading on that path and leave the task with empty scores instead of
-        # the real (near-)zero breakdown it always got before.
-        grade_on_error = isinstance(
-            backend, (CodexAgent, ClaudeCodeAgent, OpenClawAgent, PyLMAgent)
+        # OpenClawAgent needed grade_on_error=True too, or it would silently
+        # skip grading on that path and leave the task with empty scores instead
+        # of the real (near-)zero breakdown it always got before.  hermesagent
+        # was the one baseline never given the same treatment, and via
+        # isinstance it could not be: HermesAgentAgent is imported lazily and
+        # naming it here would force an eager module-level import.  Matching on
+        # the backend name instead fixes that, and all five are now aligned.
+        grade_on_error = (
+            gateway_usage.backend_name(backend) in GRADE_ON_ERROR_BACKENDS
         )
         should_grade = task.get("automated_checks") and (
             not result.get("error") or grade_on_error
@@ -282,6 +352,12 @@ def run_single_task(
             task_id=task_id,
             output_dir=output_dir,
             elapsed_time=elapsed_time,
+        )
+        # Label it and, where the gateway saw this task exclusively, let the
+        # gateway's count take the top-level fields.  The backend's own numbers
+        # are kept under "self_reported" either way.
+        usage = gateway_usage.annotate_usage(
+            usage, backend=backend, window=usage_window
         )
         result = save_usage(output_dir, result, usage, task_id)
 
@@ -329,24 +405,72 @@ def run_single_task(
 # raise once from run_single_task, or an embedded-run error that stayed
 # transient through all of OpenClawAgent's in-container attempts. Rebuilding
 # the whole container is expensive, so only one fallback attempt.
-MAX_TRANSIENT_RETRIES = 1
+#
+# The number is no longer WildClaw's to choose. MAX_TASK_ATTEMPTS is the
+# repo-wide budget in src/utils/transient_errors.py (authoritative copy:
+# eval_framework/retry_policy.py), so this harness and the shared
+# eval_framework/runner.py that drives Sentinel, ToolMaze, BEAM and
+# vendor_onboarding cannot answer "re-run this task?" differently.
+MAX_TRANSIENT_RETRIES = max(0, MAX_TASK_ATTEMPTS - 1)
 
 
 def run_single_task_with_retry(*args, **kwargs) -> dict:
-    """run_single_task, retried on known-transient infra errors.
+    """run_single_task, retried only on a demonstrated inference anomaly.
 
-    Each attempt gets its own output_dir (fresh run_id from run_single_task),
-    so a retry never clobbers a prior attempt's artifacts.
+    Each execution gets a temporary output_dir. When the policy replaces it,
+    that directory is deleted before the next execution starts, so the final
+    output tree contains exactly one execution for the logical Task.
+
+    The decision itself is not made here -- ``should_retry_attempt`` in
+    src/utils/transient_errors.py is the one place in the repo that decides it,
+    and it reads the same two things every caller can supply: the failure text,
+    and what the Gateway saw across the attempt (already written into this
+    attempt's usage.json under ``gateway_usage.timeout_adjudication``, so the
+    verdict can be re-derived from the artifacts afterwards).
+
+    What that gate is worth, measured: 01_Productivity_Flow/task_1 timed out at
+    1224s having made 31 gateway requests with the last landing 46s before the
+    deadline and nothing open at it -- an agent working right up to the wall.
+    Under the old string-only rule it was handed a second container and a
+    second clock, and scored 0.3705 where the first attempt scored 0.0. That is
+    not correcting a measurement error, it is manufacturing a better score.
     """
+
     result = run_single_task(*args, **kwargs)
     attempt = 1
-    while is_transient_error(result.get("error")) and attempt <= MAX_TRANSIENT_RETRIES:
+    while attempt <= MAX_TRANSIENT_RETRIES:
+        retry, why = should_retry_attempt(
+            result.get("error"), attempt_evidence(result)
+        )
+        if not retry:
+            if result.get("error"):
+                logger.info(
+                    "[%s] Kept as the measurement, not retried: %s",
+                    result.get("task_id"), why,
+                )
+            break
+        stale_output = result.pop("_output_dir", None)
+        if stale_output:
+            try:
+                shutil.rmtree(Path(stale_output))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "[%s] Failed to remove replaced Task output %s: %s",
+                    result.get("task_id"), stale_output, exc,
+                )
         logger.warning(
-            "[%s] Transient error survived in-container retries, rebuilding container (attempt %d/%d): %s",
-            result.get("task_id"), attempt, MAX_TRANSIENT_RETRIES, result.get("error"),
+            "[%s] Rebuilding container after an upstream inference anomaly: %s",
+            result.get("task_id"), why,
         )
         result = run_single_task(*args, **kwargs)
         attempt += 1
+    if result.get("error") and attempt > 1:
+        result["status"] = "all_attempts_failed"
+        result["score"] = 0.0
+    _publish_task_result(result)
+    result.pop("_output_dir", None)
     return result
 
 

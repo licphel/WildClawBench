@@ -12,10 +12,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from src.agents.approval_posture import CLAUDE as CLAUDE_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
+from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
 
 load_dotenv()
 
@@ -23,6 +25,10 @@ logger = logging.getLogger(__name__)
 CLAUDECODE_SKILLS_DIR = "/root/.claude/skills"
 CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
+# Same-session resumes are deliberately unlimited and use the shared gateway
+# backoff. They are an internal recovery mechanism, not a benchmark knob.
+CLAUDECODE_RESUME_ATTEMPTS = 3
+CLAUDECODE_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -52,7 +58,7 @@ class ClaudeCodeAgent(BaseAgent):
 
     @property
     def transcript_container_path(self) -> str:
-        return "/claude_code/log/chat.json"
+        return "/claude_code/log/chat.jsonl"
 
     def prepare_grading_transcript(self, task_id: str) -> str:
         with tempfile.TemporaryDirectory(prefix="claudecode_transcript_") as tmp_dir:
@@ -142,7 +148,7 @@ class ClaudeCodeAgent(BaseAgent):
         task_id = spec.task_id
 
         try:
-            self._start_container(task_id, spec.workspace_path)
+            self._start_container(task_id, spec.workspace_path, small_fast_model=spec.model)
             self._prepare_workspace(task_id)
             self._copy_tmp_files(task_id, spec.workspace_path)
             setup_skills(
@@ -153,14 +159,30 @@ class ClaudeCodeAgent(BaseAgent):
             )
             run_warmup(task_id, spec.task.get("warmup", ""))
             snapshot_workspace_state(task_id)
-            self._run_prompt(
+            wrapper_retry_seconds = self._run_prompt(
                 task_id,
                 spec.prompt,
                 spec.model,
                 spec.timeout_seconds,
                 spec.output_dir,
             )
+            # Retry time stays INSIDE elapsed_time, deliberately.  Every
+            # baseline retries, but only three of the five retry in a place
+            # their Python wrapper can see: openclaw reconnects inside the
+            # openclaw CLI and perdura retries inside its own runtime, so no
+            # wrapper there can deduct anything.  "Includes retries" is the
+            # only definition all five can actually satisfy, and a column
+            # where two bars silently mean something else is worse than a
+            # column that is uniformly inclusive.  _run_prompt still measures
+            # the wrapper's retry time and still keeps it off the *task
+            # budget* -- a resumed run gets its full timeout -- it is simply
+            # not subtracted from the reported wall clock.
             elapsed_time = time.perf_counter() - start_time
+            if wrapper_retry_seconds:
+                logger.info(
+                    "[%s] ClaudeCode elapsed %.2fs, including %.2fs of wrapper retry time",
+                    task_id, elapsed_time, wrapper_retry_seconds,
+                )
             return AgentExecution(elapsed_time=elapsed_time, error=None, gateway_proc=None, agent_proc=None)
         except subprocess.TimeoutExpired:
             logger.info("[%s] ClaudeCode timed out...", task_id)
@@ -195,7 +217,7 @@ class ClaudeCodeAgent(BaseAgent):
         log_dest = output_dir / "claude_code_log"
         log_dest.mkdir(parents=True, exist_ok=True)
         self._copy_file_from_container(task_id, "/claude_code/log/usage.json", log_dest / "usage.json")
-        self._copy_file_from_container(task_id, "/claude_code/log/chat.json", log_dest / "chat.json")
+        self._copy_file_from_container(task_id, "/claude_code/log/chat.jsonl", log_dest / "chat.json")
         self._copy_dir_from_container(task_id, "/claude_code/log/.", log_dest)
         self._sync_agent_log_from_claude_logs(task_id, output_dir, log_dest)
 
@@ -259,6 +281,10 @@ class ClaudeCodeAgent(BaseAgent):
         for payload in payloads:
             self._accumulate_costed_usage(payload, totals)
 
+        official = self._extract_usage_from_official_rows(payloads)
+        if official["request_count"] > 0:
+            return official
+
         totals["total_tokens"] = (
             totals["input_tokens"]
             + totals["output_tokens"]
@@ -269,6 +295,80 @@ class ClaudeCodeAgent(BaseAgent):
             totals["cost_usd"] = self._estimate_cost(totals)
         totals["cost_usd"] = round(totals["cost_usd"], 6)
         return totals
+
+    def _extract_usage_from_official_rows(self, payloads: list[Any]) -> dict[str, Any]:
+        """Read the aggregate usage emitted by Claude Code's stream-json result."""
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "request_count": 0,
+        }
+
+        result_rows = [
+            row for row in payloads
+            if isinstance(row, dict) and row.get("type") == "result"
+        ]
+        for row in result_rows:
+            model_usage = row.get("modelUsage")
+            if isinstance(model_usage, dict):
+                for model_data in model_usage.values():
+                    if not isinstance(model_data, dict):
+                        continue
+                    self._add_usage_values(totals, model_data)
+                if totals["request_count"] > 0:
+                    continue
+
+            usage = row.get("usage")
+            if isinstance(usage, dict):
+                self._add_usage_values(totals, usage)
+                cost = self._num(row.get("total_cost_usd"), default=0.0)
+                if cost > 0:
+                    totals["cost_usd"] = cost
+
+        if totals["request_count"] == 0:
+            for row in payloads:
+                if not isinstance(row, dict) or row.get("type") != "assistant":
+                    continue
+                message = row.get("message")
+                if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                    self._add_usage_values(totals, message["usage"])
+
+        totals["total_tokens"] = (
+            totals["input_tokens"]
+            + totals["output_tokens"]
+            + totals["cache_read_tokens"]
+            + totals["cache_write_tokens"]
+        )
+        totals["cost_usd"] = round(totals["cost_usd"], 6)
+        return totals
+
+    def _add_usage_values(self, totals: dict[str, Any], usage: dict[str, Any]) -> None:
+        input_tokens = int(self._num(usage.get("input_tokens", usage.get("inputTokens"))))
+        output_tokens = int(self._num(usage.get("output_tokens", usage.get("outputTokens"))))
+        cache_read_tokens = int(
+            self._num(usage.get("cache_read_input_tokens", usage.get("cacheReadInputTokens")))
+        )
+        cache_write_tokens = int(
+            self._num(
+                usage.get(
+                    "cache_creation_input_tokens",
+                    usage.get("cacheCreationInputTokens"),
+                )
+            )
+        )
+        cost = self._num(usage.get("cost_usd", usage.get("costUSD")), default=0.0)
+
+        if input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or cost:
+            totals["request_count"] += int(self._num(usage.get("requestCount"), default=1))
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        totals["cache_read_tokens"] += cache_read_tokens
+        totals["cache_write_tokens"] += cache_write_tokens
+        totals["cost_usd"] += cost
 
     def _accumulate_costed_usage(self, payload: Any, totals: dict[str, Any]) -> None:
         if isinstance(payload, list):
@@ -355,23 +455,32 @@ class ClaudeCodeAgent(BaseAgent):
         if r.returncode != 0:
             logger.warning("[%s] ClaudeCode log dir copy failed: %s", task_id, r.stderr.strip())
 
-    def _start_container(self, task_id: str, workspace_path: str) -> None:
+    def _start_container(
+        self, task_id: str, workspace_path: str, small_fast_model: str = ""
+    ) -> None:
         proxy_http = os.environ.get("HTTP_PROXY_INNER", "")
         proxy_https = os.environ.get("HTTPS_PROXY_INNER", "")
+        no_proxy = os.environ.get("NO_PROXY_INNER", "")
         env_map = {
             "ANTHROPIC_API_KEY": self.api_key,
             "ANTHROPIC_BASE_URL": self.api_base_url,
+            # ClaudeCode's built-in WebSearchTool and other side queries use
+            # getSmallFastModel(); route them through the benchmark model.
+            "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model,
             "OPENROUTER_API_KEY": self.api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
-            "DISABLE_PROMPT_CACHING": os.environ.get("DISABLE_PROMPT_CACHING", "1"),
-            "DISABLE_INTERLEAVED_THINKING": os.environ.get("DISABLE_INTERLEAVED_THINKING", "1"),
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": os.environ.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1"),
-            "IS_SANDBOX": os.environ.get("IS_SANDBOX", "1"),
-            "CLAUDE_CODE_FULL_LOG_PATH": os.environ.get("CLAUDE_CODE_FULL_LOG_PATH", "./log"),
+            # Keep the official CLI's fixed sandbox/compatibility flags; do
+            # not expose prompt-cache or reasoning overrides as environment
+            # variables that can silently change a benchmark run.
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            "IS_SANDBOX": "1",
+            "CLAUDE_CODE_FULL_LOG_PATH": "./log",
             "http_proxy": proxy_http,
             "https_proxy": proxy_https,
             "HTTP_PROXY": proxy_http,
             "HTTPS_PROXY": proxy_https,
+            "no_proxy": no_proxy,
+            "NO_PROXY": no_proxy,
         }
         env_args: list[str] = []
         for key, value in env_map.items():
@@ -460,27 +569,98 @@ PY"""
         if r_cp.returncode != 0:
             raise RuntimeError(f"ClaudeCode tmp copy failed:\n{r_cp.stderr}")
 
-    def _run_prompt(self, task_id: str, prompt: str, model: str, timeout_seconds: int, output_dir: Path) -> None:
+    def _run_prompt(self, task_id: str, prompt: str, model: str, timeout_seconds: int, output_dir: Path) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
-        cmd = (
-            f"cd /claude_code && "
-            f"IS_SANDBOX=1 ./start.sh "
-            f"--add-dir /tmp_workspace "
-            f"-p {shlex.quote(prompt)} "
-            f"--model {shlex.quote(model)}"
-        )
-        r = subprocess.run(
-            ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        (output_dir / "agent.log").write_text(
-            (r.stdout or "") + ("\n" if r.stdout else "") + (r.stderr or ""),
-            encoding="utf-8",
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}):\n{r.stderr}")
+        started = time.perf_counter()
+        excluded_retry_time = 0.0
+        attempt = 0
+        while True:
+            counted_elapsed = time.perf_counter() - started - excluded_retry_time
+            remaining = max(1, int(timeout_seconds - counted_elapsed))
+            is_resume = attempt > 0
+            current_prompt = prompt if not is_resume else (
+                "A previous attempt of this same task was interrupted by a transient "
+                "provider error. Continue from the current workspace, preserve and "
+                "verify completed work, and finish every required output. Do not "
+                "restart the task or discuss the interruption. The original task is:\n\n"
+                f"{prompt}"
+            )
+            resume_flag = "--continue " if is_resume else ""
+            # The approval posture is stated here, by the harness, rather than
+            # left to /claude_code/start.sh -- which is a Docker layer, so a
+            # reader of this repository could not find out what policy a claude
+            # run had. start.sh puts its own copy of the flag before "$@", so
+            # during the overlap the CLI simply receives it twice; the baked
+            # copy can be dropped from the image once whoever owns the build
+            # gets to it. See src/agents/approval_posture.py.
+            approval_flags = " ".join(CLAUDE_POSTURE.argv)
+            cmd = (
+                f"cd /claude_code && IS_SANDBOX=1 ./start.sh {resume_flag}"
+                f"{approval_flags} "
+                f"--add-dir /tmp_workspace -p {shlex.quote(current_prompt)} "
+                f"--model {shlex.quote(model)}"
+            )
+            record_posture(
+                output_dir,
+                CLAUDE_POSTURE,
+                applied={
+                    "delivered_as": "docker exec argv",
+                    "flags": list(CLAUDE_POSTURE.argv),
+                    "command": cmd,
+                    "image_side_duplicate": "/claude_code/start.sh",
+                },
+            )
+            attempt_started = time.perf_counter()
+            try:
+                r = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                )
+            except subprocess.TimeoutExpired:
+                raise
+            attempt_elapsed = time.perf_counter() - attempt_started
+            output = (r.stdout or "") + ("\n" if r.stdout and r.stderr else "") + (r.stderr or "")
+            log_path = output_dir / "agent.log"
+            with log_path.open("a" if is_resume else "w", encoding="utf-8") as log:
+                if is_resume:
+                    log.write(json.dumps({
+                        "type": "runner.resume_start",
+                        "resume_attempt": attempt,
+                        "message": "Retrying ClaudeCode with --continue in the same session.",
+                    }) + "\n")
+                log.write(output)
+                if output and not output.endswith("\n"):
+                    log.write("\n")
+            # Keyed on the run having actually failed. This used to retry a
+            # returncode-0 run whose output merely contained a marker, so a
+            # task whose transcript quotes an HTTP 400 from its own in-task
+            # mock API earned a free extra turn on the task budget.
+            if r.returncode == 0:
+                return excluded_retry_time
+            provider_error = resumable_provider_error(output)
+            if provider_error is None:
+                raise RuntimeError(
+                    f"ClaudeCode run failed without a resumable provider error "
+                    f"(rc={r.returncode}):\n{output}"
+                )
+            excluded_retry_time += attempt_elapsed
+            if attempt >= CLAUDECODE_RESUME_ATTEMPTS:
+                raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")
+            if remaining <= 30:
+                raise RuntimeError(
+                    f"ClaudeCode run failed and no useful time remains for resume (rc={r.returncode}):\n{output}"
+                )
+            if CLAUDECODE_RETRY_DELAY_SECONDS > 0:
+                delay_started = time.perf_counter()
+                time.sleep(CLAUDECODE_RETRY_DELAY_SECONDS)
+                excluded_retry_time += time.perf_counter() - delay_started
+            attempt += 1
+            logger.warning(
+                "[%s] ClaudeCode exited non-zero; retrying --continue (%s/%s)",
+                    task_id, attempt, CLAUDECODE_RESUME_ATTEMPTS,
+            )
 
     def _extract_usage_from_logs(self, log_dir: Path) -> dict[str, Any]:
         totals = {

@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from src.agents.approval_posture import OPENCLAW as OPENCLAW_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.grading import extract_usage_from_jsonl
+from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
 from src.utils.docker_utils import (
     close_proc_log,
     inject_lobster_workspace,
@@ -22,36 +24,29 @@ from src.utils.docker_utils import (
     setup_workspace,
     start_container,
 )
-from src.utils.transient_errors import is_transient_error
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# `openclaw agent` exits 0 even when the embedded run itself failed (e.g. the
-# upstream model provider returning a transient error) — it only logs
-# `isError=true ... error=<message>` to gateway.log and ends the session with
-# no output. Left unchecked, run_batch.py records this as a clean, low/zero
-# score with no error, which also makes it invisible to the transient-error
-# retries below. Scan gateway.log for that marker so the failure surfaces as
-# a real execution error instead.
-_EMBEDDED_RUN_ERROR_RE = re.compile(r"embedded run agent end:.*isError=true.*?error=(.+)$", re.MULTILINE)
+OPENCLAW_HOME = "/root/.openclaw"
+#: The one path every WildClaw baseline's graded transcript lives at. OpenClaw
+#: no longer writes it itself (see ``prepare_grading_transcript``), so this is
+#: the name of the file the runner puts there, not the name of a file OpenClaw
+#: promises.
+OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_HOME}/agents/main/sessions/chat.jsonl"
 
-MAX_INNER_RETRIES = 2
-
-
-def _embedded_run_error_in(text: str) -> str | None:
-    match = _EMBEDDED_RUN_ERROR_RE.search(text)
-    return match.group(1).strip() if match else None
-
-
-def _read_new_content(path: Path, from_offset: int) -> str:
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(from_offset)
-            return f.read()
-    except OSError:
-        return ""
+# Same-session resumes are deliberately unlimited and use the shared gateway
+# backoff. They are an internal recovery mechanism, not a benchmark knob.
+OPENCLAW_RESUME_ATTEMPTS = 3
+OPENCLAW_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
+OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = 120.0
+OPENCLAW_RESUME_PREFIX = (
+    "A previous attempt of this same task was interrupted by a transient "
+    "provider error. Continue from the current workspace, preserve and "
+    "verify completed work, and finish every required output. Do not "
+    "restart the task or discuss the interruption. The original task is:\n\n"
+)
 
 
 class OpenClawAgent(BaseAgent):
@@ -65,7 +60,7 @@ class OpenClawAgent(BaseAgent):
         self.gateway_port = gateway_port
         self.openrouter_api_key = openrouter_api_key
         self.openrouter_base_url = openrouter_base_url
-        self.image_model = image_model if image_model is not None else os.environ.get("OPENCLAW_IMAGE_MODEL", "").strip()
+        self.image_model = image_model or ""
 
     @property
     def expects_gateway(self) -> bool:
@@ -73,7 +68,92 @@ class OpenClawAgent(BaseAgent):
 
     @property
     def transcript_container_path(self) -> str:
-        return "/root/.openclaw/agents/main/sessions/chat.jsonl"
+        return OPENCLAW_TRANSCRIPT_PATH
+
+    def prepare_grading_transcript(self, task_id: str) -> str:
+        """Guarantee ``chat.jsonl`` exists, whichever way OpenClaw stored it.
+
+        OpenClaw wrote one JSONL file per session under
+        ``agents/<id>/sessions/`` up to 2026.3.x. From 2026.9.1 there is no such
+        file: the transcript is rows in the ``transcript_events`` table of
+        ``<state>/agents/<id>/agent/openclaw-agent.sqlite``, and ``sessionFile``
+        survives only as a deprecated "compatibility token; returns the session
+        key, not a file path" (``src/agents/sessions/agent-session-base.ts``).
+        Every consumer here reads the file: the grader loads it through
+        ``transcript_loader.load_transcript`` inside the container, and
+        ``collect_usage`` copies it out and runs ``extract_usage_from_jsonl``
+        over it. A missing file is not an error anywhere -- grading sees an
+        empty transcript and usage reports all zeros -- so the break would have
+        been silent.
+
+        The stored events are byte-identical to the lines the JSONL carried, so
+        this is a container change and not a format change: the rows are
+        emitted in ``(session_id, seq)`` order and nothing is reshaped. The
+        existing file wins when there is one, which keeps this a no-op on an
+        image still carrying an OpenClaw that writes JSONL -- as the WildClaw
+        images do today -- and makes it the source once they are rebuilt.
+        """
+
+        self._materialize_transcript(task_id)
+        return self.transcript_container_path
+
+    def _materialize_transcript(self, task_id: str) -> None:
+        script = f"""python3 - <<'PY'
+import glob
+import json
+import os
+import sqlite3
+
+out = {json.dumps(OPENCLAW_TRANSCRIPT_PATH)}
+if os.path.exists(out) and os.path.getsize(out) > 0:
+    raise SystemExit(0)
+
+rows = []
+for db in sorted(glob.glob({json.dumps(OPENCLAW_HOME)} + "/**/openclaw-agent.sqlite", recursive=True)):
+    try:
+        conn = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        continue
+    try:
+        rows.extend(
+            conn.execute(
+                "select session_id, seq, event_json from transcript_events "
+                "order by session_id, seq"
+            ).fetchall()
+        )
+    except sqlite3.Error:
+        # A run that never reached the agent leaves the table absent.
+        pass
+    finally:
+        conn.close()
+
+os.makedirs(os.path.dirname(out), exist_ok=True)
+written = 0
+with open(out, "w", encoding="utf-8") as handle:
+    for _session_id, _seq, event_json in rows:
+        try:
+            event = json.loads(event_json)
+        except (TypeError, ValueError):
+            continue
+        handle.write(json.dumps(event, ensure_ascii=False) + "\\n")
+        written += 1
+print("materialized %d transcript event(s) from SQLite" % written)
+PY"""
+        r = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            # Loud, never fatal: a transcript this could not build leaves the
+            # run exactly where it already was, and grading still runs.
+            logger.warning(
+                "[%s] Could not materialize the openclaw transcript: %s",
+                task_id,
+                (r.stderr or "").strip()[:400],
+            )
+        elif (r.stdout or "").strip():
+            logger.info("[%s] %s", task_id, (r.stdout or "").strip())
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         gateway_proc = None
@@ -102,6 +182,7 @@ class OpenClawAgent(BaseAgent):
             if spec.models_config:
                 inject_openclaw_models(spec.task_id, spec.models_config)
 
+            self._apply_approval_posture(spec.task_id, spec.output_dir)
             self._set_model(spec.task_id, spec.model)
             self._inject_openrouter_key(spec.task_id)
             image_model = self.image_model or spec.model
@@ -112,83 +193,149 @@ class OpenClawAgent(BaseAgent):
                 bash_cmd=(
                     f"export OPENROUTER_API_KEY='{self.openrouter_api_key}' && "
                     f"export OPENROUTER_BASE_URL='{self.openrouter_base_url}' && "
-                    f"openclaw gateway --port {self.gateway_port}"
+                    "for attempt in 1 2; do "
+                    f"openclaw gateway run --port {self.gateway_port} "
+                    "--bind loopback --allow-unconfigured; "
+                    "status=$?; "
+                    "if [ $status -eq 0 ] || [ $attempt -eq 2 ]; then "
+                    "exit $status; fi; "
+                    "sleep 1; "
+                    "done"
                 ),
                 log_path=spec.output_dir / "gateway.log",
             )
-            logger.info("[%s] Waiting for gateway to be ready (2s)...", spec.task_id)
-            time.sleep(2)
-
-            gateway_log_path = spec.output_dir / "gateway.log"
-            safe_prompt = spec.prompt.replace("'", "'\\''")
-            start_time = time.perf_counter()
-            deadline = start_time + spec.timeout_seconds
-            total_attempts = MAX_INNER_RETRIES + 1
-            attempt = 1
-            embedded_error = None
-            timed_out = False
+            logger.info(
+                "[%s] Waiting for OpenClaw gateway health (timeout=%ss)...",
+                spec.task_id,
+                OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS,
+            )
+            gateway_deadline = (
+                time.monotonic() + OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS
+            )
             while True:
-                remaining = max(1, int(deadline - time.perf_counter()))
-                agent_log_path = spec.output_dir / (
-                    "agent.log" if attempt == 1 else f"agent.retry{attempt}.log"
+                if gateway_proc.poll() is not None:
+                    gateway_log = spec.output_dir / "gateway.log"
+                    detail = ""
+                    if gateway_log.exists():
+                        detail = gateway_log.read_text(
+                            encoding="utf-8", errors="replace"
+                        )[-2000:]
+                    raise RuntimeError(
+                        "OpenClaw gateway exited before becoming ready "
+                        f"(rc={gateway_proc.returncode}):\n{detail}"
+                    )
+                health = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        spec.task_id,
+                        "/bin/bash",
+                        "-c",
+                        "openclaw health",
+                    ],
+                    capture_output=True,
+                    text=True,
                 )
-                offset_before = gateway_log_path.stat().st_size if gateway_log_path.exists() else 0
+                if health.returncode == 0:
+                    logger.info(
+                        "[%s] OpenClaw gateway is ready: %s",
+                        spec.task_id,
+                        (health.stdout or "").strip()[:300],
+                    )
+                    break
+                if time.monotonic() >= gateway_deadline:
+                    detail = (health.stderr or health.stdout or "").strip()
+                    raise RuntimeError(
+                        "OpenClaw gateway did not become ready within "
+                        f"{OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS}s: {detail}"
+                    )
+                time.sleep(0.5)
+
+            safe_prompt = spec.prompt.replace("'", "'\\''")
+            safe_resume_prompt = (OPENCLAW_RESUME_PREFIX + spec.prompt).replace(
+                "'", "'\\''"
+            )
+            agent_log = spec.output_dir / "agent.log"
+            start_time = time.perf_counter()
+            excluded_retry_time = 0.0
+            resume_attempt = 0
+            while True:
+                log_offset = agent_log.stat().st_size if agent_log.exists() else 0
+                counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
+                remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
+                message = safe_prompt if resume_attempt == 0 else safe_resume_prompt
                 agent_proc = run_background(
                     spec.task_id,
-                    bash_cmd=f"openclaw agent --session-id chat --timeout {remaining} --message '{safe_prompt}'",
-                    log_path=agent_log_path,
+                    bash_cmd=f"openclaw agent --session-id chat --timeout {remaining} --message '{message}'",
+                    log_path=agent_log,
+                    append=resume_attempt > 0,
                 )
 
-                logger.info("[%s] Waiting for agent to finish (attempt %d/%d)...", spec.task_id, attempt, total_attempts)
+                logger.info("[%s] Waiting for agent to finish...", spec.task_id)
+                attempt_started = time.perf_counter()
                 try:
                     agent_proc.wait(timeout=remaining)
-                    elapsed_time = time.perf_counter() - start_time
-                    logger.info(
-                        "[%s] Agent finished, elapsed: %.2f seconds (attempt %d)",
-                        spec.task_id, elapsed_time, attempt,
-                    )
                 except subprocess.TimeoutExpired:
                     logger.info("[%s] Agent timed out...", spec.task_id)
                     elapsed_time = float(spec.timeout_seconds)
                     agent_proc.kill()
                     agent_proc.wait()
-                    timed_out = True
-
+                    break
+                attempt_elapsed = time.perf_counter() - attempt_started
+                # Retry time stays INSIDE elapsed_time, deliberately; see the
+                # note in the claudecode runner.  This runner could never
+                # deduct the openclaw CLI's own reconnects (MAX_RETRIES = 5
+                # with 1s/2s/4s/8s/16s backoff, in
+                # baselines/openclaw/src/agents/openai-ws-connection.ts)
+                # anyway, so deducting only the wrapper's half made the number
+                # neither inclusive nor exclusive.  excluded_retry_time is
+                # still accumulated: the task budget still refunds a resumed
+                # attempt.
+                elapsed_time = time.perf_counter() - start_time
+                if agent_proc.returncode == 0:
+                    logger.info(
+                        "[%s] Agent finished successfully, elapsed: %.2f seconds",
+                        spec.task_id,
+                        elapsed_time,
+                    )
+                    break
+                provider_error_reason = self._find_error_marker(agent_log, log_offset)
+                if provider_error_reason is None:
+                    # Unchanged from before this loop existed: a non-zero exit
+                    # carrying no provider signature is the agent's own failure,
+                    # and the workspace it left behind is still the measurement.
+                    break
+                excluded_retry_time += attempt_elapsed
+                if resume_attempt >= OPENCLAW_RESUME_ATTEMPTS:
+                    raise RuntimeError(
+                        f"OpenClaw agent failed after a provider error "
+                        f"({provider_error_reason}) with no resume attempts left "
+                        f"(rc={agent_proc.returncode})"
+                    )
+                if remaining <= 30:
+                    raise RuntimeError(
+                        f"OpenClaw agent failed after a provider error "
+                        f"({provider_error_reason}) and no useful time remains for resume"
+                    )
+                if OPENCLAW_RETRY_DELAY_SECONDS > 0:
+                    delay_started = time.perf_counter()
+                    time.sleep(OPENCLAW_RETRY_DELAY_SECONDS)
+                    excluded_retry_time += time.perf_counter() - delay_started
                 close_proc_log(agent_proc)
-                logger.info("[%s] Agent exit code: %s (attempt %d)", spec.task_id, agent_proc.returncode, attempt)
-
-                if timed_out:
-                    break
-
-                embedded_error = _embedded_run_error_in(_read_new_content(gateway_log_path, offset_before))
-                if not embedded_error:
-                    break
-                if not is_transient_error(embedded_error):
-                    logger.warning(
-                        "[%s] Embedded run failed with a non-transient error, not retrying in-container: %s",
-                        spec.task_id, embedded_error,
-                    )
-                    break
-                if attempt >= total_attempts or time.perf_counter() >= deadline:
-                    logger.warning(
-                        "[%s] Transient embedded-run error, out of in-container retries/time budget: %s",
-                        spec.task_id, embedded_error,
-                    )
-                    break
+                resume_attempt += 1
                 logger.warning(
-                    "[%s] Transient embedded-run error (attempt %d/%d), retrying in the same container: %s",
-                    spec.task_id, attempt, total_attempts, embedded_error,
+                    "[%s] OpenClaw agent exited non-zero after a provider error (%s); "
+                    "retrying the same session (%s/%s)",
+                    spec.task_id,
+                    provider_error_reason,
+                    resume_attempt,
+                    OPENCLAW_RESUME_ATTEMPTS,
                 )
-                attempt += 1
 
-            if embedded_error and not timed_out:
-                logger.warning(
-                    "[%s] Embedded run failed despite exit code 0: %s",
-                    spec.task_id, embedded_error,
-                )
+            logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)
             return AgentExecution(
                 elapsed_time=elapsed_time,
-                error=embedded_error if not timed_out else None,
+                error=None,
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
             )
@@ -200,6 +347,16 @@ class OpenClawAgent(BaseAgent):
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
             )
+
+    @staticmethod
+    def _find_error_marker(log_path: Path, offset: int) -> str | None:
+        """Return the provider-failure signature this attempt logged, if any."""
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                return resumable_provider_error(log.read())
+        except OSError:
+            return None
 
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict:
         transcript_host = output_dir / "chat.jsonl"
@@ -236,10 +393,53 @@ class OpenClawAgent(BaseAgent):
         logger.info("[%s] Model set: %s", task_id, model)
 
     def _inject_openrouter_key(self, task_id: str) -> None:
+        """Save the OpenRouter key where the running OpenClaw will look for it.
+
+        Two stores, one per era. Up to 2026.3.x the credential was a JSON file
+        at ``agents/<id>/agent/auth-profiles.json`` and writing it was the whole
+        job. From 2026.9.1 auth is SQLite, and that file is not merely ignored:
+        it is *detected* by name and makes OpenClaw refuse to start at all --
+        ``AuthProfileMigrationRequiredError``, "requires legacy credential
+        migration; run openclaw doctor --fix"
+        (``src/agents/auth-profiles/legacy-source-diagnostic.ts``). So writing
+        it unconditionally would take the whole baseline down once the image is
+        rebuilt.
+
+        ``models auth paste-api-key`` is the CLI that owns the current store; it
+        reads the key from stdin, so the key never appears in an argv a
+        ``docker exec`` would log, and it writes both the secret and the
+        non-secret ``auth.profiles`` descriptor in config. It does not exist on
+        2026.3.11 (that CLI has ``paste-token`` only), which is exactly what
+        selects the legacy write for an image that still needs it.
+        """
+
         if not self.openrouter_api_key:
             return
 
-        auth_profile_path = "/root/.openclaw/agents/main/agent/auth-profiles.json"
+        modern = subprocess.run(
+            [
+                "docker", "exec", "-i", task_id, "/bin/bash", "-c",
+                "openclaw models auth paste-api-key "
+                "--provider openrouter --profile-id openrouter:default",
+            ],
+            input=self.openrouter_api_key + "\n",
+            capture_output=True,
+            text=True,
+        )
+        if modern.returncode == 0:
+            logger.info(
+                "[%s] Saved OPENROUTER_API_KEY via openclaw models auth paste-api-key",
+                task_id,
+            )
+            return
+        logger.info(
+            "[%s] openclaw models auth paste-api-key unavailable (%s); "
+            "writing the legacy auth-profiles.json instead",
+            task_id,
+            (modern.stderr or modern.stdout or "").strip().splitlines()[-1:] or "",
+        )
+
+        auth_profile_path = f"{OPENCLAW_HOME}/agents/main/agent/auth-profiles.json"
         inject_cmd = f"""python3 - <<'PY'
 import json
 import pathlib
@@ -259,6 +459,79 @@ PY"""
             text=True,
         )
         logger.info("[%s] Injected OPENROUTER_API_KEY into auth-profiles.json", task_id)
+
+    def _apply_approval_posture(self, task_id: str, output_dir: Path) -> None:
+        """Write openclaw's approval posture from the harness, not the image.
+
+        OpenClaw has no bypass flag, so the declaration has to be config -- and
+        it used to be config baked into a Docker layer
+        (``/root/.openclaw/openclaw.json``), which meant the only way to learn
+        what policy an openclaw run had was to open the image. These are the
+        same three keys ``eval_framework/backends/openclaw_backend.py`` writes
+        on the outer path. What is written, and whether each write
+        succeeded, is recorded next to the task's other artifacts.
+        """
+
+        applied: dict[str, object] = {"config": {}, "files": {}}
+        # 2026.9.1 treats this JSON as a legacy-migration marker and refuses
+        # agent requests while it exists. Remove it defensively so an older
+        # image cannot invalidate the declared config posture.
+        legacy_path = "/root/.openclaw/exec-approvals.json"
+        remove_legacy = subprocess.run(
+            ["docker", "exec", task_id, "rm", "-f", legacy_path],
+            capture_output=True,
+            text=True,
+        )
+        applied["legacy_exec_approvals_absent"] = {
+            "path": legacy_path,
+            "returncode": remove_legacy.returncode,
+            "stderr": (remove_legacy.stderr or "").strip()[:400],
+        }
+        for key, value in OPENCLAW_POSTURE.config.items():
+            r = subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-c",
+                 f"openclaw config set {shlex.quote(key)} {shlex.quote(str(value))}"],
+                capture_output=True, text=True,
+            )
+            applied["config"][key] = {
+                "value": value,
+                "returncode": r.returncode,
+                "stderr": (r.stderr or "").strip()[:400],
+            }
+            if r.returncode != 0:
+                # Loud, but not fatal: the image still carries the same values,
+                # so a failed write leaves the run in the state it was already
+                # in rather than in an undeclared one. The artifact says which.
+                logger.warning(
+                    "[%s] openclaw config set %s failed: %s",
+                    task_id, key, (r.stderr or "").strip(),
+                )
+        for path, payload in OPENCLAW_POSTURE.files.items():
+            body = json.dumps(payload, ensure_ascii=False)
+            r = subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-c",
+                 f"mkdir -p {shlex.quote(str(Path(path).parent))} && "
+                 f"printf %s {shlex.quote(body)} > {shlex.quote(path)}"],
+                capture_output=True, text=True,
+            )
+            applied["files"][path] = {
+                "returncode": r.returncode,
+                "stderr": (r.stderr or "").strip()[:400],
+            }
+            if r.returncode != 0:
+                logger.warning(
+                    "[%s] writing %s failed: %s", task_id, path, (r.stderr or "").strip()
+                )
+        readback = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c",
+             "test ! -e /root/.openclaw/exec-approvals.json; "
+             "echo legacy_exec_approvals_absent=$?; "
+             "openclaw config get tools.exec.security 2>&1; "
+             "openclaw config get tools.exec.ask 2>&1"],
+            capture_output=True, text=True,
+        )
+        applied["readback"] = (readback.stdout or "").strip()[:2000]
+        record_posture(output_dir, OPENCLAW_POSTURE, applied=applied)
 
     def _set_image_model(self, task_id: str, model: str) -> None:
         subprocess.run(

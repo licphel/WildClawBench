@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from src.agents.approval_posture import PERDURA as PERDURA_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 
 
@@ -114,9 +115,7 @@ class PyLMAgent(BaseAgent):
                 extra_env=str(spec.task.get("env") or ""),
                 tmp_path=tmp_path,
                 image=self.image,
-                enable_nested_isolation=os.environ.get(
-                    "WILDCLAW_PYLM_NESTED_ISOLATION", ""
-                ).lower() in {"1", "true", "yes"},
+                enable_nested_isolation=False,
                 pylm_store_host_dir=spec.output_dir / "pylm_store",
             )
             setup_workspace(spec.task_id)
@@ -132,10 +131,31 @@ class PyLMAgent(BaseAgent):
                 detach_background=True,
             )
 
-            sandbox_mode = os.environ.get(
-                "WILDCLAW_PYLM_SANDBOX_MODE", "dangerous_skip"
-            )
+            # Default from src/agents/approval_posture.py rather than a
+            # literal here, so the declared posture and the launched one cannot
+            # drift apart. The env var stays as the override.
+            sandbox_mode = PERDURA_POSTURE.argv[1]
             confirm_dangerous_skip = sandbox_mode == "dangerous_skip"
+            non_interactive = "--non-interactive" in PERDURA_POSTURE.argv
+            # Written twice on purpose. Once here, so a task that dies
+            # mid-run still leaves its intended posture on disk; then again
+            # below with what the CLI actually accepted, which is the value
+            # worth having and the one that can differ -- the container entry
+            # resolves --sandbox-mode against a live `perdura run --help`, and
+            # the two CLI generations answer differently.
+            posture_intent = {
+                "delivered_as": "perdura CLI argv",
+                "sandbox_mode": sandbox_mode,
+                "overridden_by_env": sandbox_mode != PERDURA_POSTURE.argv[1],
+                # wildclaw_cli_container_entry.py probes `perdura run --help`
+                # and only appends this when the build still accepts it;
+                # current perdura does not (sandbox_confirmation.py: "no
+                # separate confirmation flag exists").
+                "confirm_dangerous_skip_requested": confirm_dangerous_skip,
+                "non_interactive_requested": non_interactive,
+                "resolved": "pending: container has not reported yet",
+            }
+            record_posture(spec.output_dir, PERDURA_POSTURE, applied=posture_intent)
             summary, elapsed, error = cli_runner._run_container_cli(
                 task_id=spec.task_id,
                 prompt=spec.prompt,
@@ -144,10 +164,19 @@ class PyLMAgent(BaseAgent):
                 reasoning_effort=spec.thinking,
                 sandbox_mode=sandbox_mode,
                 confirm_dangerous_skip=confirm_dangerous_skip,
+                non_interactive=non_interactive,
                 timeout_seconds=spec.timeout_seconds,
                 output_dir=spec.output_dir,
                 plugin_paths=self._skill_paths(spec.task),
             )
+            # `sandbox` is the container entry's own account of what
+            # `perdura run` was actually given (wildclaw_cli_container_entry.py
+            # -> cli_result.json). Absent only when the run died before the
+            # entry returned, and that absence is itself worth recording.
+            posture_intent["resolved"] = summary.get("sandbox") or {
+                "note": "container reported no sandbox block; see cli_result.json",
+            }
+            record_posture(spec.output_dir, PERDURA_POSTURE, applied=posture_intent)
             self._summaries[spec.task_id] = summary
             return AgentExecution(
                 elapsed_time=elapsed,
@@ -167,6 +196,7 @@ class PyLMAgent(BaseAgent):
     def collect_usage(
         self, task_id: str, output_dir: Path, elapsed_time: float
     ) -> dict:
+        cli_runner = self._import_cli_runner()
         summary = self._summaries.get(task_id, {})
         result_path = output_dir / "cli_result.json"
         if not summary and result_path.is_file():
@@ -177,18 +207,9 @@ class PyLMAgent(BaseAgent):
             except (OSError, json.JSONDecodeError):
                 pass
 
-        input_tokens = int(summary.get("prompt_tokens") or 0)
-        output_tokens = int(summary.get("completion_tokens") or 0)
-        return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_tokens": int(summary.get("cache_read_tokens") or 0),
-            "cache_write_tokens": int(summary.get("cache_write_tokens") or 0),
-            "total_tokens": input_tokens + output_tokens,
-            "cost_usd": float(summary.get("total_cost") or 0.0),
-            "request_count": int(bool(input_tokens or output_tokens)),
-            "elapsed_time": round(elapsed_time, 2),
-        }
+        # ``retry_count`` is part of the shared CLI summary contract; the
+        # normalizer preserves it when known and leaves it unknown on timeout.
+        return cli_runner.usage_from_cli_summary(summary, elapsed_time)
 
     def cleanup_staging(self, task_id: str) -> None:
         staging = self._staging_dirs.pop(task_id, None)

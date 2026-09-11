@@ -77,6 +77,15 @@ def _normalize_role_content_message(item: Any) -> dict[str, Any] | None:
             if block_type == "text":
                 blocks.append({"type": "text", "text": str(block.get("text", ""))})
                 continue
+            if block_type == "tool_result":
+                blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": str(block.get("tool_use_id", "")),
+                        "content": block.get("content", ""),
+                    }
+                )
+                continue
             if block_type in ("tool_use", "toolCall"):
                 tool_input = block.get("input", block.get("arguments", {}))
                 if isinstance(tool_input, str):
@@ -90,6 +99,25 @@ def _normalize_role_content_message(item: Any) -> dict[str, Any] | None:
                         "input": tool_input,
                     }
                 )
+    return normalized
+
+
+def _normalize_official_cli_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    """Normalize Claude Code's --output-format=stream-json message rows."""
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("type") not in {"assistant", "user"}:
+            continue
+        message = row.get("message")
+        if not isinstance(message, dict):
+            continue
+        normalized_message = _normalize_role_content_message(message)
+        if normalized_message is None:
+            continue
+        usage = message.get("usage")
+        if isinstance(usage, dict) and normalized_message["message"]["role"] == "assistant":
+            normalized_message["message"]["usage"] = _to_openclaw_usage(usage)
+        normalized.append(normalized_message)
     return normalized
 
 
@@ -283,7 +311,9 @@ def convert_claudecode_chat_to_openclaw_jsonl(chat_path: Path, output_path: Path
     if openclaw_rows:
         normalized = openclaw_rows
     else:
-        normalized = _normalize_claude_event_rows(rows)
+        normalized = _normalize_official_cli_rows(rows)
+        if not normalized:
+            normalized = _normalize_claude_event_rows(rows)
         if not normalized:
             role_messages: list[dict[str, Any]] = []
             for row in rows:

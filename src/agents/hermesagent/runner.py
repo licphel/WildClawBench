@@ -8,10 +8,11 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
+from src.agents.approval_posture import HERMES as HERMES_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.docker_utils import (
     run_warmup,
@@ -20,15 +21,27 @@ from src.utils.docker_utils import (
     TMP_WORKSPACE,
 )
 from src.utils.grading import extract_usage_from_jsonl
+from src.utils.transient_errors import (
+    RESUME_BACKOFF_S,
+    resumable_provider_error,
+    unrecoverable_session_error,
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# v0.5 is the official base; the tag names the hermes-agent release the image
+# actually carries, which Dockerfile.hermesagent now swaps in from
+# baselines/hermes-agent rather than inheriting from the base image.
 HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "").strip()
 HERMES_HOME = "/root/.hermes"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
+# Same-session resumes are deliberately unlimited and use the shared gateway
+# backoff. They are an internal recovery mechanism, not a benchmark knob.
+HERMES_RESUME_ATTEMPTS = 3
+HERMES_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 BENCH_RUNNER_HOST_PATH = Path(__file__).with_name("bench_runner.py")
@@ -46,7 +59,9 @@ class HermesAgentAgent(BaseAgent):
     ) -> None:
         self.image = (image or HERMES_IMAGE).strip()
         if not self.image:
-            raise ValueError("HERMES_DOCKER_IMAGE must be set when no Hermes image is passed")
+            raise ValueError(
+                "HERMES_DOCKER_IMAGE must be set when no Hermes image is passed"
+            )
         self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.openrouter_base_url = openrouter_base_url
         self.brave_api_key = brave_api_key or os.environ.get("BRAVE_API_KEY", "")
@@ -66,6 +81,8 @@ class HermesAgentAgent(BaseAgent):
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         elapsed_time = float(spec.timeout_seconds)
         agent_proc = None
+        start_time: float | None = None
+        excluded_retry_time = 0.0
 
         try:
             api_key, base_url = self._resolve_runtime_provider(spec.model, spec.models_config)
@@ -95,7 +112,25 @@ class HermesAgentAgent(BaseAgent):
             )
             run_warmup(spec.task_id, spec.task.get("warmup", ""))
 
-            self._configure_hermes(spec.task_id, api_key, base_url)
+            self._configure_hermes(spec.task_id, api_key, base_url, spec.model)
+            # Read back from the container rather than from the string this
+            # process just built: the config only counts once hermes-agent can
+            # load it, and the point of the artifact is that a finished run can
+            # be audited without re-deriving what the harness would have done.
+            readback = subprocess.run(
+                ["docker", "exec", spec.task_id, "/bin/bash", "-c",
+                 f"sed -n '/^approvals:/,/^[^ ]/p' {HERMES_HOME}/config.yaml"],
+                capture_output=True, text=True,
+            )
+            record_posture(
+                spec.output_dir,
+                HERMES_POSTURE,
+                applied={
+                    "delivered_as": f"{HERMES_HOME}/config.yaml (and hermes.yaml)",
+                    "readback": (readback.stdout or "").strip()[:400],
+                    "readback_returncode": readback.returncode,
+                },
+            )
 
             reasoning_config = self._map_thinking(spec.thinking)
             self._write_bench_runner(
@@ -104,26 +139,95 @@ class HermesAgentAgent(BaseAgent):
             )
 
             start_time = time.perf_counter()
-
-            agent_proc = self._run_bench_runner_background(
-                task_id=spec.task_id,
-                log_path=spec.output_dir / "agent.log",
-            )
-
-            logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
-            try:
-                agent_proc.wait(timeout=spec.timeout_seconds)
-                elapsed_time = time.perf_counter() - start_time
-                logger.info(
-                    "[%s] hermes-agent finished, elapsed: %.2f seconds",
-                    spec.task_id,
-                    elapsed_time,
+            resume_attempt = 0
+            while True:
+                log_offset = (
+                    spec.output_dir.joinpath("agent.log").stat().st_size
+                    if spec.output_dir.joinpath("agent.log").exists()
+                    else 0
                 )
-            except subprocess.TimeoutExpired:
-                logger.info("[%s] hermes-agent timed out...", spec.task_id)
-                elapsed_time = float(spec.timeout_seconds)
-                agent_proc.kill()
-                agent_proc.wait()
+                agent_proc = self._run_bench_runner_background(
+                    task_id=spec.task_id,
+                    log_path=spec.output_dir / "agent.log",
+                    append=resume_attempt > 0,
+                    resume=resume_attempt > 0,
+                )
+                counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
+                remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
+                logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
+                attempt_started = time.perf_counter()
+                provider_error_reason: str | None = None
+                try:
+                    deadline = time.perf_counter() + remaining
+                    while True:
+                        try:
+                            agent_proc.wait(timeout=min(1.0, max(0.05, deadline - time.perf_counter())))
+                            break
+                        except subprocess.TimeoutExpired:
+                            provider_error_reason = self._find_error_marker(
+                                spec.output_dir / "agent.log", log_offset,
+                                unrecoverable_session_error,
+                            )
+                            if provider_error_reason:
+                                logger.warning(
+                                    "[%s] Hermes provider error detected (%s); stopping current run for session resume",
+                                    spec.task_id, provider_error_reason,
+                                )
+                                agent_proc.terminate()
+                                try:
+                                    agent_proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    agent_proc.kill()
+                                    agent_proc.wait()
+                                break
+                            if time.perf_counter() >= deadline:
+                                raise
+                except subprocess.TimeoutExpired:
+                    logger.info("[%s] hermes-agent timed out...", spec.task_id)
+                    elapsed_time = float(spec.timeout_seconds)
+                    agent_proc.kill()
+                    agent_proc.wait()
+                    break
+                if not provider_error_reason:
+                    provider_error_reason = self._find_error_marker(
+                        spec.output_dir / "agent.log", log_offset
+                    )
+                attempt_elapsed = time.perf_counter() - attempt_started
+                self._close_runner_streams(agent_proc)
+                if agent_proc.returncode == 0 and not provider_error_reason:
+                    # Retry time stays INSIDE elapsed_time, deliberately; see
+                    # the note in the claudecode runner.  excluded_retry_time
+                    # is still accumulated below because the *task budget*
+                    # still refunds a resumed attempt -- only the reported
+                    # wall clock stopped deducting it.
+                    elapsed_time = time.perf_counter() - start_time
+                    if excluded_retry_time:
+                        logger.info(
+                            "[%s] hermes-agent elapsed %.2fs, including %.2fs of wrapper retry time",
+                            spec.task_id, elapsed_time, excluded_retry_time,
+                        )
+                    break
+                if not provider_error_reason:
+                    raise RuntimeError(
+                        f"Hermes runner failed without a resumable provider error "
+                        f"(rc={agent_proc.returncode})"
+                    )
+                excluded_retry_time += attempt_elapsed
+                if resume_attempt >= HERMES_RESUME_ATTEMPTS:
+                    raise RuntimeError(f"Hermes runner failed (rc={agent_proc.returncode})")
+                if remaining <= 30:
+                    raise RuntimeError("Hermes runner failed and no useful time remains for resume")
+                if HERMES_RETRY_DELAY_SECONDS > 0:
+                    delay_started = time.perf_counter()
+                    time.sleep(HERMES_RETRY_DELAY_SECONDS)
+                    excluded_retry_time += time.perf_counter() - delay_started
+                resume_attempt += 1
+                logger.warning(
+                    "[%s] Hermes runner exited non-zero%s; retrying same session (%s/%s)",
+                    spec.task_id,
+                    f" after provider error ({provider_error_reason})" if provider_error_reason else "",
+                    resume_attempt, HERMES_RESUME_ATTEMPTS,
+                )
             self._close_runner_streams(agent_proc)
 
             logger.info("[%s] hermes-agent exit code: %s", spec.task_id, agent_proc.returncode)
@@ -140,8 +244,13 @@ class HermesAgentAgent(BaseAgent):
                 self._close_runner_streams(agent_proc)
             self._cleanup_bench_config(spec.task_id)
             logger.error("[%s] hermes-agent execution error: %s", spec.task_id, exc)
+            if start_time is not None:
+                elapsed_time = min(
+                    float(spec.timeout_seconds),
+                    max(0.0, time.perf_counter() - start_time),
+                )
             return AgentExecution(
-                elapsed_time=float(spec.timeout_seconds),
+                elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=None,
                 agent_proc=agent_proc,
@@ -246,11 +355,12 @@ class HermesAgentAgent(BaseAgent):
             "-e", f"https_proxy={proxy_https}",
             "-e", f"HTTP_PROXY={proxy_http}",
             "-e", f"HTTPS_PROXY={proxy_https}",
-            "-e", f"BRAVE_API_KEY={self.brave_api_key}",
-            "-e", f"OPENROUTER_API_KEY={api_key}",
-            "-e", f"OPENROUTER_BASE_URL={base_url}",
+            "-e", f"OPENAI_API_KEY={api_key}",
+            "-e", f"OPENAI_BASE_URL={base_url}",
             "-e", f"no_proxy={'' if not proxy_http else os.environ.get('NO_PROXY_INNER', '')}",
         ]
+        if self.brave_api_key:
+            env_args += ["-e", f"BRAVE_API_KEY={self.brave_api_key}"]
         for line in extra_env.splitlines():
             key = line.strip()
             if not key or key.startswith("#"):
@@ -301,28 +411,128 @@ class HermesAgentAgent(BaseAgent):
         if r.returncode != 0:
             raise RuntimeError(f"hermes-agent workspace copy failed:\n{r.stderr}")
 
-    def _configure_hermes(self, task_id: str, api_key: str = "", base_url: str = "") -> None:
-        """Configure hermes-agent inside the container with one consistent provider config."""
-        hermes_yaml = (
-            "tools:\n"
-            "  profile: coding\n"
-            "  web:\n"
-            "    search:\n"
-            "      enabled: true\n"
-            "      provider: brave\n"
-        )
-        hermes_env = (
-            f"OPENROUTER_API_KEY={api_key}\n"
-            f"OPENROUTER_BASE_URL={base_url}\n"
-            f"BRAVE_API_KEY={self.brave_api_key}\n"
-        )
+    @staticmethod
+    def _yaml_quote(value: object) -> str:
+        return json.dumps(str(value), ensure_ascii=True)
 
+    @classmethod
+    def _build_hermes_yaml(cls, model: str, api_key: str, base_url: str) -> str:
+        """Build a config that pins the main and every auxiliary call together."""
+        model_value = cls._yaml_quote(model)
+        key_value = cls._yaml_quote(api_key)
+        base_value = cls._yaml_quote(base_url)
+        auxiliary_tasks = (
+            "compression",
+            "vision",
+            "browser_vision",
+            "web_extract",
+            "session_search",
+            "skills_hub",
+            "approval",
+            "mcp",
+            "flush_memories",
+            "title_generation",
+        )
+        lines = [
+            "model:",
+            f"  default: {model_value}",
+            "  provider: custom",
+            f"  base_url: {base_value}",
+            f"  api_key: {key_value}",
+            "  api_mode: codex_responses",
+            "  context_length: 128000",
+            "terminal:",
+            f"  cwd: {TMP_WORKSPACE}",
+            "auxiliary:",
+        ]
+        for task in auxiliary_tasks:
+            lines.extend(
+                [
+                    f"  {task}:",
+                    "    provider: custom",
+                    f"    model: {model_value}",
+                    f"    base_url: {base_value}",
+                    f"    api_key: {key_value}",
+                    "    api_mode: codex_responses",
+                ]
+            )
+        lines.extend(
+            [
+                # The per-session JSON snapshot is opt-in as of hermes 0.21.0.
+                # ``run_agent._save_session_log`` early-returns unless
+                # ``sessions.write_json_snapshots`` is true
+                # (``hermes_cli/config_defaults.py`` defaults it to False, read
+                # into ``agent._session_json_enabled`` by
+                # ``agent/agent_init.py``), because state.db is now canonical
+                # and the snapshots have no in-tree consumer upstream. They do
+                # have one here: ``~/.hermes/sessions/session_*.json`` is the
+                # only thing ``compat_transcript.py`` can build the graded
+                # openclaw-shaped transcript from, and without it grading, the
+                # usage numbers, the saved artifacts and resume all read an
+                # empty run. Payload shape and path are unchanged from 0.9.0 --
+                # only the gate is new.
+                "sessions:",
+                "  write_json_snapshots: true",
+                # Pinned, not inherited. hermes-agent's own default is
+                # ``approvals.mode: "manual"``
+                # (hermes_cli/config.py DEFAULT_CONFIG, deep-merged under any
+                # user config), and every other WildClaw baseline states its
+                # bypass outright: codex ``--dangerously-bypass-approvals-and-
+                # sandbox``, pylm ``--sandbox-mode dangerous_skip``.
+                #
+                # This block is the *only* thing holding hermes' posture here,
+                # and always has been. The container short-circuit at the top
+                # of ``tools/approval.py:check_all_command_guards`` -- now
+                # ``_should_skip_container_guards`` -- is not a second
+                # mechanism backing it up: it keys on ``env_type``, which is
+                # hermes' *terminal backend* (``TERMINAL_ENV``, default
+                # ``local``), not on whether hermes itself happens to be
+                # running inside a container. WildClaw never sets
+                # ``TERMINAL_ENV`` and never sets ``terminal.backend``, so
+                # ``env_type`` is ``local`` and that branch has never once been
+                # taken on this path, at 0.9.0 or at 0.21.0. (The one place in
+                # this repository that does take it is
+                # ``eval_framework/backends/hermes_backend.py``, which sets
+                # ``TERMINAL_ENV=docker`` for its macOS docker-terminal route.)
+                # 0.21.0 also adds an unconditional hardline floor -- rm -rf /,
+                # mkfs, dd to a raw device, fork bombs -- that runs before
+                # ``mode: "off"`` is even read and cannot be bypassed by any
+                # config; that is deliberate upstream policy, not a posture
+                # this harness can or should declare around.
+                #
+                # Quoted because bare ``off`` is YAML 1.1 false; hermes
+                # normalises that back to "off" (_normalize_approval_mode), but
+                # the config should say what it means. Matches
+                # eval_framework/backends/hermes_backend.py:2244 and
+                # terrarium_agents/hermes_agent.py:978, which both already
+                # write this block.
+                "approvals:",
+                # From src/agents/approval_posture.py, so the value the config
+                # carries and the value the run records are one value.
+                f'  mode: {cls._yaml_quote(HERMES_POSTURE.config["approvals.mode"])}',
+                "tools:",
+                "  profile: coding",
+                "  web:",
+                "    search:",
+                "      enabled: true",
+                "      provider: brave",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _configure_hermes(
+        self,
+        task_id: str,
+        api_key: str = "",
+        base_url: str = "",
+        model: str = "",
+    ) -> None:
+        """Configure hermes-agent inside the container with one consistent provider config."""
+        hermes_yaml = self._build_hermes_yaml(model, api_key, base_url)
         with tempfile.TemporaryDirectory(prefix="hermes_config_") as tmp_dir:
             tmp_root = Path(tmp_dir)
             yaml_host = tmp_root / "hermes.yaml"
-            env_host = tmp_root / ".env"
             yaml_host.write_text(hermes_yaml, encoding="utf-8")
-            env_host.write_text(hermes_env, encoding="utf-8")
 
             r_mkdir = subprocess.run(
                 [
@@ -341,7 +551,7 @@ class HermesAgentAgent(BaseAgent):
 
             for src, dst in (
                 (yaml_host, f"{HERMES_HOME}/hermes.yaml"),
-                (env_host, f"{HERMES_HOME}/.env"),
+                (yaml_host, f"{HERMES_HOME}/config.yaml"),
             ):
                 copied = subprocess.run(
                     ["docker", "cp", str(src), f"{task_id}:{dst}"],
@@ -375,9 +585,12 @@ class HermesAgentAgent(BaseAgent):
             "config": {
                 "model": model,
                 "api_key": api_key,
+                "provider": "custom",
                 "base_url": base_url,
+                "api_mode": "codex_responses",
                 "max_iterations": 90,
                 "reasoning_config": reasoning_config,
+                "session_id": f"wildclaw-{task_id}",
             },
             "prompt": prompt,
         }
@@ -401,12 +614,14 @@ class HermesAgentAgent(BaseAgent):
                 if p:
                     Path(p).unlink(missing_ok=True)
 
-    def _run_bench_runner_background(self, task_id: str, log_path: Path) -> subprocess.Popen[str]:
+    def _run_bench_runner_background(
+        self, task_id: str, log_path: Path, append: bool = False, resume: bool = False
+    ) -> subprocess.Popen[str]:
         if not BENCH_RUNNER_HOST_PATH.exists():
             raise RuntimeError(f"Hermes bench runner script not found: {BENCH_RUNNER_HOST_PATH}")
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file = log_path.open("w", encoding="utf-8")
+        log_file = log_path.open("a" if append else "w", encoding="utf-8")
         script_file = BENCH_RUNNER_HOST_PATH.open("r", encoding="utf-8")
         proc = subprocess.Popen(
             [
@@ -416,7 +631,9 @@ class HermesAgentAgent(BaseAgent):
                 task_id,
                 "/bin/bash",
                 "-c",
-                f"cd {HERMES_INSTALL_DIR} && {HERMES_VENV_PYTHON} -",
+                f"cd {HERMES_INSTALL_DIR} && "
+                f"WILDCLAW_HERMES_RESUME={'1' if resume else ''} "
+                f"{HERMES_VENV_PYTHON} -",
             ],
             stdin=script_file,
             stdout=log_file,
@@ -439,6 +656,31 @@ class HermesAgentAgent(BaseAgent):
                 stream.close()
             except Exception:
                 pass
+
+    @classmethod
+    def _find_error_marker(
+        cls,
+        log_path: Path,
+        offset: int,
+        matcher: Callable[[str], str | None] = resumable_provider_error,
+    ) -> str | None:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                text = log.read().lower()
+        except OSError:
+            return None
+
+        for line in text.splitlines():
+            # Hermes reports optional tool capability probes as
+            # ``tools.registry ... unavailable (check failed)``.  They are
+            # normal in the benchmark image and must not trigger a resume.
+            if "tools.registry" in line and "unavailable (check failed)" in line:
+                continue
+            marker = matcher(line)
+            if marker:
+                return marker
+        return None
 
     @staticmethod
     def _cleanup_bench_config(task_id: str) -> None:

@@ -10,17 +10,19 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from src.agents.approval_posture import CODEX as CODEX_POSTURE
+
 logger = logging.getLogger(__name__)
 
-TMP_WORKSPACE = os.environ.get("TMP_WORKSPACE", "/tmp_workspace")
+TMP_WORKSPACE = "/tmp_workspace"
 OPENCLAW_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 CODEX_PROMPT_PATH = "/tmp/codex_prompt.txt"
 CODEX_LAST_MESSAGE_PATH = "/tmp/codex_last_message.txt"
 CONTAINER_CODEX_HOME = "/root/.codex"
-DEFAULT_CODEX_NPM_PACKAGE = os.environ.get("CODEX_NPM_PACKAGE", "@openai/codex")
-DEFAULT_CODEX_NPM_VERSION = os.environ.get("CODEX_NPM_VERSION", "0.121.0")
-CODEX_BOOTSTRAP_RETRIES = int(os.environ.get("CODEX_BOOTSTRAP_RETRIES", "2"))
-CODEX_BOOTSTRAP_RETRY_BASE_DELAY = float(os.environ.get("CODEX_BOOTSTRAP_RETRY_BASE_DELAY", "3"))
+DEFAULT_CODEX_NPM_PACKAGE = "@openai/codex"
+DEFAULT_CODEX_NPM_VERSION = "0.153.4"
+CODEX_BOOTSTRAP_RETRIES = 2
+CODEX_BOOTSTRAP_RETRY_BASE_DELAY = 3.0
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
@@ -57,7 +59,7 @@ def _copy_text_to_container(task_id: str, container_path: str, text: str) -> Non
                     "0",
                     task_id,
                     "/bin/sh",
-                    "-lc",
+                    "-c",
                     (
                         f"ls -ld {shlex.quote(container_dir)} 2>&1 || true; "
                         "id -un 2>/dev/null || true; "
@@ -169,7 +171,7 @@ def ensure_codex_cli(task_id: str) -> None:
     last_error_output = ""
     for attempt in range(CODEX_BOOTSTRAP_RETRIES + 1):
         result = subprocess.run(
-            ["docker", "exec", task_id, "/bin/bash", "-lc", bootstrap_cmd],
+            ["docker", "exec", task_id, "/bin/bash", "-c", bootstrap_cmd],
             capture_output=True,
             text=True,
         )
@@ -253,9 +255,15 @@ def build_codex_exec_command(
     env_prefix = ""
     for key, value in (env_vars or {}).items():
         env_prefix += f"export {key}={shlex.quote(value)} && "
+    # From src/agents/approval_posture.py rather than a literal, for the same
+    # reason as codex/runner.py.  NOTE: nothing calls run_codex_process (and so
+    # nothing calls this) on the current harness path -- runner.py builds its
+    # own command -- but a fourth spelling of the bypass sitting in the tree is
+    # what a future revival would drift from.
+    approval_flags = " ".join(CODEX_POSTURE.argv)
     return (
         f"{env_prefix}cat {shlex.quote(prompt_path)} | "
-        f"codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "
+        f"codex exec --json --skip-git-repo-check {approval_flags} "
         f"--cd {shlex.quote(TMP_WORKSPACE)} "
         f"{model_arg}"
         f"--output-last-message {shlex.quote(CODEX_LAST_MESSAGE_PATH)} -"

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.agents.approval_posture import CODEX as CODEX_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.codex.backend import (
     CODEX_PROMPT_PATH,
@@ -20,6 +21,7 @@ from src.agents.codex.backend import (
 )
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_openclaw
+from src.utils.transient_errors import resumable_provider_error
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +29,34 @@ CODEX_HOME = "/root/.codex"
 CODEX_SESSIONS_DIR = f"{CODEX_HOME}/sessions"
 CODEX_CONFIG_PATH = f"{CODEX_HOME}/config.toml"
 CODEX_SKILLS_DIR = f"{CODEX_HOME}/skills"
+CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
+DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = 3
+# 0 = unlimited resumes, bounded in practice by the `remaining <= 30` budget
+# stop below.  Same default and same bound as the other four baselines.
+#
+# Two knobs used to sit beside it and are gone:
+# CODEX_ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES (3) and
+# CODEX_ENCRYPTED_CONTENT_RETRY_DELAY_SECONDS (600).  After three consecutive
+# retryable failures this runner slept **ten minutes** before the next
+# same-session resume -- codex alone; the other four back off 2s per resume and
+# codex had no per-resume backoff at all.  The sleep was refunded from the task
+# budget, so it did not shorten codex's working time, but it did burn ten
+# minutes of real wall clock per occurrence, and once the retry axis was
+# unified on "included" it landed inside the reported elapsed_time.
+#
+# It was also never doing anything.  No `runner.resume_delay` event exists in
+# any agent.log under benchmarks/WildClawBench/output* or eval_results/ -- the
+# branch has not fired in a single run recorded on this host -- and on its own
+# terms it is questionable: the delay is named for `invalid_encrypted_content`,
+# which src/utils/transient_errors.py classes as an UNRECOVERABLE_SESSION
+# pattern precisely because no amount of continuing the same session recovers
+# it, yet the wait was followed by a resume of that same session.  Waiting
+# helps only the quota signatures next to it in that table, and quota is what
+# the Gateway's own Pacer already backs off on, coherently, for all five
+# baselines at once.  See RESUME_BACKOFF_S in src/utils/transient_errors.py.
 CODEX_LOG_NOISE_MARKERS = (
     "ReasoningRawContentDelta without active item",
 )
@@ -152,6 +179,38 @@ class CodexAgent(BaseAgent):
                 write_execution_status(spec.output_dir, status="starting_container")
                 self._start_container(task_id, spec.workspace_path, spec.task, spec.lobster)
                 write_execution_status(spec.output_dir, status="container_started")
+                # codex is the one baseline that never declared its
+                # posture: the bypass was spelled three times -- in
+                # _render_codex_config's approval_policy/sandbox_mode, as the
+                # argv flag in _build_resume_exec_command, and again in the
+                # `applied` block here -- and none of the three read POSTURES.
+                # All three now interpolate CODEX_POSTURE, so changing the
+                # module changes what the CLI is given and not just what the
+                # artifact claims.
+                #
+                # `delivered_as` is per-path on purpose, because the two paths
+                # differ and the difference is exactly what an auditor needs:
+                # _build_exec_command (the first turn) passes NO approval flag
+                # and rests entirely on config.toml; only
+                # _build_resume_exec_command adds the argv one.  Recording a
+                # flat "argv + config.toml" would have made the artifact claim
+                # a flag most runs never send.
+                record_posture(
+                    spec.output_dir,
+                    CODEX_POSTURE,
+                    applied={
+                        "delivered_as": {
+                            "first_turn": "$CODEX_HOME/config.toml only",
+                            "resume_turns": (
+                                "$CODEX_HOME/config.toml + codex exec resume argv"
+                            ),
+                        },
+                        "argv": list(CODEX_POSTURE.argv),
+                        "argv_sent_on": "resume turns only",
+                        "config": dict(CODEX_POSTURE.config),
+                        "config_path": CODEX_CONFIG_PATH,
+                    },
+                )
                 write_execution_status(spec.output_dir, status="preparing_workspace")
                 self._prepare_workspace(task_id, spec.workspace_path)
                 skills_text = spec.task.get("skills", "") if spec.task else ""
@@ -172,12 +231,19 @@ class CodexAgent(BaseAgent):
                     spec.task.get("warmup", "") if spec.task else "",
                     detach_background=True,
                 )
+                # instant_inference=false is injected upstream now. The
+                # inference gateway sets it on both the translated and the
+                # same-wire Responses path (CodexOAuthUpstream.prepare and
+                # .prepare_native), so the per-task in-container proxy that
+                # used to rewrite every JSON body to add it is gone.
+                codex_base_url = self.openrouter_base_url
                 self._write_codex_config(
                     task_id=task_id,
                     model=spec.model,
                     reasoning_effort=spec.thinking
                     or self._default_reasoning_effort_for_model(spec.model),
                     wire_api=self._default_wire_api_for_model(spec.model),
+                    base_url=codex_base_url,
                     output_dir=spec.output_dir,
                 )
                 image_helper_enabled = self._should_enable_image_helper(
@@ -187,7 +253,7 @@ class CodexAgent(BaseAgent):
                     self._install_image_helper(task_id, spec.model)
                 snapshot_workspace_state(task_id)
                 write_execution_status(spec.output_dir, status="codex_running")
-                self._run_prompt(
+                wrapper_retry_seconds = self._run_prompt(
                     task_id=task_id,
                     prompt=self._build_task_prompt(
                         spec.prompt,
@@ -197,7 +263,20 @@ class CodexAgent(BaseAgent):
                     timeout_seconds=spec.timeout_seconds,
                     output_dir=spec.output_dir,
                 )
+                # Retry time stays INSIDE elapsed_time, deliberately; see
+                # the same note in the claudecode runner.  openclaw's and
+                # perdura's retries happen inside their own processes, where
+                # no wrapper can see or deduct them, so "includes retries" is
+                # the only definition all five baselines can satisfy.
+                # _run_prompt still measures the wrapper's retry time and
+                # still keeps it off the task budget; it is just no longer
+                # taken off the reported clock.
                 elapsed_time = time.perf_counter() - start_time
+                if wrapper_retry_seconds:
+                    logger.info(
+                        "[%s] Codex elapsed %.2fs, including %.2fs of wrapper retry time",
+                        task_id, elapsed_time, wrapper_retry_seconds,
+                    )
                 write_execution_status(
                     spec.output_dir,
                     status="finished",
@@ -282,7 +361,6 @@ class CodexAgent(BaseAgent):
         sessions_dest = output_dir / "codex_sessions"
         sessions_dest.mkdir(parents=True, exist_ok=True)
         self._copy_dir_from_container(task_id, f"{CODEX_SESSIONS_DIR}/.", sessions_dest)
-
         latest = self._find_latest_session(task_id)
         chat_dest = output_dir / "chat.jsonl"
         if latest:
@@ -325,9 +403,6 @@ class CodexAgent(BaseAgent):
         env_map: dict[str, str] = {
             "OPENROUTER_API_KEY": self.openrouter_api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
-            "OPENROUTER_IMAGE_MODEL": os.environ.get("OPENROUTER_IMAGE_MODEL", "").strip(),
-            "WILDCLAW_IMAGE_MODEL": os.environ.get("WILDCLAW_IMAGE_MODEL", "").strip(),
-            "BRAVE_API_KEY": os.environ.get("BRAVE_API_KEY", ""),
             "http_proxy": proxy_http,
             "https_proxy": proxy_https,
             "HTTP_PROXY": proxy_http,
@@ -420,30 +495,14 @@ class CodexAgent(BaseAgent):
                 raise RuntimeError(f"Codex tmp copy failed:\n{copied.stderr}")
 
     def _default_reasoning_effort_for_model(self, model: str) -> str | None:
-        """Return an explicit reasoning override if one is configured.
-
-        By default we let Codex CLI and the underlying model choose their
-        native reasoning settings. The only automatic override we keep is the
-        explicit ``CODEX_REASONING_EFFORT`` env knob, which is useful for
-        controlled experiments or emergency rollouts.
-        """
-        override = os.environ.get("CODEX_REASONING_EFFORT", "").strip().lower()
-        if override:
-            return override
-        return None
+        """Keep the benchmark's explicit medium reasoning default."""
+        _ = model
+        return self.reasoning_effort_default
 
     def _default_wire_api_for_model(self, model: str) -> str | None:
-        """Return an explicit wire API override.
-
-        Codex v0.121 rejects provider-level ``wire_api = "chat"``. Keep this
-        as an emergency knob only; do not default MiniMax to chat here.
-        """
+        """Codex is the native Responses passthrough baseline."""
         _ = model
-        override = os.environ.get("CODEX_WIRE_API", "").strip().lower()
-        if override == "chat":
-            logger.warning("CODEX_WIRE_API=chat ignored: Codex CLI no longer supports it")
-            return None
-        return override or None
+        return "responses"
 
     @staticmethod
     def _is_minimax_model(model: str) -> bool:
@@ -456,6 +515,7 @@ class CodexAgent(BaseAgent):
         model: str,
         reasoning_effort: str | None,
         wire_api: str | None,
+        base_url: str,
         output_dir: Path,
     ) -> None:
         bare_model = model.split("/", 1)[1] if model.startswith("openrouter/") else model
@@ -463,6 +523,7 @@ class CodexAgent(BaseAgent):
             model=model,
             reasoning_effort=reasoning_effort,
             wire_api=wire_api,
+            base_url=base_url,
         )
 
         # Mirror the rendered config host-side so future debugging is trivial.
@@ -495,9 +556,10 @@ class CodexAgent(BaseAgent):
         model: str,
         reasoning_effort: str | None,
         wire_api: str | None,
+        base_url: str | None = None,
     ) -> str:
         bare_model = model.split("/", 1)[1] if model.startswith("openrouter/") else model
-        safe_base_url = self.openrouter_base_url.replace('"', '\\"')
+        safe_base_url = (base_url or self.openrouter_base_url).replace('"', '\\"')
         reasoning_line = (
             f'model_reasoning_effort = "{reasoning_effort}"\n'
             if reasoning_effort
@@ -511,8 +573,12 @@ class CodexAgent(BaseAgent):
             f'model_supports_reasoning_summaries = false\n'
             f'hide_agent_reasoning = true\n'
             f'model = "{bare_model}"\n'
-            f'approval_policy = "never"\n'
-            f'sandbox_mode = "danger-full-access"\n'
+            # From src/agents/approval_posture.py, not literals: the run
+            # records CODEX_POSTURE.config into approval_posture.json, so a
+            # literal here is a value the artifact can disagree with while
+            # nothing errors.
+            f'approval_policy = "{CODEX_POSTURE.config["approval_policy"]}"\n'
+            f'sandbox_mode = "{CODEX_POSTURE.config["sandbox_mode"]}"\n'
             f'\n'
             f'[model_providers.openrouter]\n'
             f'name = "openrouter"\n'
@@ -573,7 +639,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_MODEL = {json.dumps(default_model)}
-CALL_LIMIT = int(os.environ.get("WILDCLAW_IMAGE_HELPER_CALL_LIMIT", "2") or "2")
+CALL_LIMIT = 2
 CALL_STATE_PATH = "/tmp_workspace/.wildclaw_image_calls.json"
 
 
@@ -648,11 +714,7 @@ def main() -> int:
         return emit({{"ok": False, "error": "OPENROUTER_API_KEY is not set"}})
 
     base_url = (os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
-    model = (
-        os.environ.get("WILDCLAW_IMAGE_MODEL")
-        or os.environ.get("OPENROUTER_IMAGE_MODEL")
-        or DEFAULT_MODEL
-    )
+    model = DEFAULT_MODEL
     if model.startswith("openrouter/"):
         model = model.split("/", 1)[1]
 
@@ -730,26 +792,145 @@ if __name__ == "__main__":
         prompt: str,
         timeout_seconds: int,
         output_dir: Path,
-    ) -> None:
+    ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
-        prompt_path = prepare_codex_prompt(task_id, prompt, CODEX_PROMPT_PATH)
         log_path = output_dir / "agent.log"
-        r = self._run_codex_exec(task_id, prompt_path, timeout_seconds, log_path)
+        started = time.perf_counter()
+        excluded_retry_time = 0.0
+        resume_session_id: str | None = None
+        attempt = 0
 
-        if r.returncode == 0:
-            return
+        while True:
+            counted_elapsed = time.perf_counter() - started - excluded_retry_time
+            remaining = max(1, int(timeout_seconds - counted_elapsed))
+            is_resume = attempt > 0
+            current_prompt = (
+                prompt
+                if not is_resume
+                else self._build_same_session_resume_prompt(resume_attempt=attempt)
+            )
+            prompt_path = prepare_codex_prompt(task_id, current_prompt, CODEX_PROMPT_PATH)
+            attempt_started = time.perf_counter()
+            r = self._run_codex_exec(
+                task_id,
+                prompt_path,
+                remaining,
+                log_path,
+                append=is_resume,
+                resume=is_resume,
+                resume_session_id=resume_session_id,
+            )
+            attempt_elapsed = time.perf_counter() - attempt_started
 
-        raise RuntimeError(
-            f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
-        )
+            if r.returncode == 0:
+                return excluded_retry_time
+
+            combined = self._combined_process_output(r)
+            retry_reason = resumable_provider_error(combined)
+            if retry_reason is None:
+                # All five baselines now read the same table
+                # (src/utils/transient_errors.py). A non-zero exit with no
+                # provider signature is the agent's own failure: resuming it
+                # would refund budget for time the agent really did spend.
+                if is_resume:
+                    excluded_retry_time += attempt_elapsed
+                raise RuntimeError(
+                    f"Codex run failed without a resumable provider error "
+                    f"(rc={r.returncode}):\n{r.stderr or r.stdout}"
+                )
+            resume_limit_reached = (
+                attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+            )
+            if resume_limit_reached:
+                if is_resume:
+                    excluded_retry_time += attempt_elapsed
+                raise RuntimeError(
+                    f"Codex run failed (rc={r.returncode}):\n{r.stderr or r.stdout}"
+                )
+
+            # Every transiently-failed attempt is refunded, the first one
+            # included -- claudecode and hermes already refund theirs, and a
+            # provider failure on attempt 1 says no more about the agent than
+            # the same failure on attempt 2.
+            excluded_retry_time += attempt_elapsed
+
+            if remaining <= 30:
+                raise RuntimeError(
+                    f"Codex run failed with {retry_reason} and no useful "
+                    f"time remains for resume (rc={r.returncode}):\n{r.stderr or r.stdout}"
+                )
+
+            if not resume_session_id:
+                resume_session_id = self._find_latest_session_id(task_id)
+
+            resume_no = attempt + 1
+            max_resume_attempts: int | str = (
+                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+            )
+            append_agent_log_event(
+                output_dir,
+                {
+                    "type": "runner.resume",
+                    "reason": retry_reason,
+                    "message": (
+                        "Codex CLI exited non-zero; retrying with "
+                        "codex exec resume against the same local session."
+                    ),
+                    "resume_attempt": resume_no,
+                    "max_resume_attempts": max_resume_attempts,
+                    "remaining_timeout_seconds": remaining,
+                    "excluded_failed_resume_seconds": round(excluded_retry_time, 2),
+                    "resume_session_id": resume_session_id or "last",
+                },
+            )
+            logger.warning(
+                "[%s] Codex exited non-zero (%s); retrying codex exec resume (%d/%s, session=%s)",
+                task_id,
+                retry_reason,
+                resume_no,
+                max_resume_attempts,
+                resume_session_id or "last",
+            )
+            attempt += 1
 
     def _run_codex_exec(
-        self, task_id: str, prompt_path: str, timeout_seconds: int, log_path: Path
+        self,
+        task_id: str,
+        prompt_path: str,
+        timeout_seconds: int,
+        log_path: Path,
+        *,
+        append: bool = False,
+        resume: bool = False,
+        resume_session_id: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        cmd = self._build_exec_command(prompt_path)
+        cmd = (
+            self._build_resume_exec_command(
+                prompt_path,
+                session_id=resume_session_id,
+            )
+            if resume
+            else self._build_exec_command(prompt_path)
+        )
         full_cmd = ["docker", "exec", task_id, "/bin/bash", "-c", cmd]
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8", errors="replace") as log:
+        mode = "a" if append else "w"
+        with log_path.open(mode, encoding="utf-8", errors="replace") as log:
+            if append:
+                log.write(
+                    "\n"
+                    + json.dumps(
+                        {
+                            "timestamp": _now_iso(),
+                            "type": "runner.resume_start",
+                            "message": "Retrying with codex exec resume after prior failure.",
+                            "resume_session_id": resume_session_id or "last",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                log.flush()
             proc = subprocess.Popen(
                 full_cmd,
                 stdout=log,
@@ -788,6 +969,16 @@ if __name__ == "__main__":
         )
 
     @staticmethod
+    def _build_same_session_resume_prompt(*, resume_attempt: int) -> str:
+        return (
+            "The previous Codex turn failed before the benchmark task finished. "
+            "Continue the same benchmark "
+            f"task from the current conversation and `/tmp_workspace` state. Resume "
+            f"attempt {resume_attempt}: inspect any partial files only if needed, "
+            "then finish by writing the required final outputs."
+        )
+
+    @staticmethod
     def _terminate_codex_processes(task_id: str) -> None:
         subprocess.run(
             [
@@ -795,7 +986,7 @@ if __name__ == "__main__":
                 "exec",
                 task_id,
                 "/bin/bash",
-                "-lc",
+                "-c",
                 (
                     "pkill -TERM -f 'codex exec' 2>/dev/null || true; "
                     "sleep 2; "
@@ -827,38 +1018,26 @@ if __name__ == "__main__":
         image_helper_enabled: bool,
         skill_docs: list[dict[str, str]] | None = None,
     ) -> str:
-        sections: list[str] = []
-        if image_helper_enabled:
-            sections.append(
-                "## Image Helper\n\n"
-                "When image understanding is needed, use the recoverable helper "
-                "instead of Codex built-in image input. Do not call the `view_image` "
-                "tool or attach images to the model; this OpenRouter setup can fail "
-                "on that path via the /responses API:\n\n"
-                '```bash\npython3 /tmp_workspace/.wildclaw_image.py "<image_path>" "<question>"\n```\n\n'
-                "The helper returns JSON and exits 0 even if the image model call "
-                "fails. It defaults to the task model. Call it at most twice per task. "
-                "Do not call any built-in image input, `view_image`, `--image`, "
-                "`input_image`, or file:// image URLs. If the helper returns "
-                "ok=false because the model or endpoint cannot handle the request, "
-                "you may make a direct OpenRouter /chat/completions request using "
-                "OPENROUTER_API_KEY, OPENROUTER_BASE_URL, and an image-capable model. "
-                "Otherwise, continue with other available methods and still write the required output files. "
-                "After the required files are written, finish instead of doing "
-                "extra image verification."
-            )
-        if skill_docs:
-            skill_sections = [
-                "## Local Skill References\n\n"
-                "Use these task-specific instructions when they apply. They describe local files, mock APIs, and required workflows available in this container."
-            ]
-            for skill in skill_docs:
-                skill_sections.append(
-                    f"### Skill: {skill['name']}\n\n{skill['content'].strip()}"
-                )
-            sections.append("\n\n".join(skill_sections))
-        sections.append("## Task\n\n" + prompt.strip())
-        return "\n\n".join(sections).strip() + "\n"
+        """The benchmark's own prompt, and nothing else.
+
+        This used to prepend two codex-only sections. `## Image Helper` was ~180
+        words telling the model not to use `view_image` and to call a harness
+        script instead; `## Local Skill References` inlined the full text of
+        every SKILL.md the task ships -- 5.5 KB for agent-browser, 19.7 KB for
+        self-improving-agent, across 27 of the 60 tasks. No other baseline
+        received either: claudecode, hermesagent, openclaw and pylm all forward
+        `spec.prompt` after the one shared preamble in eval/run_batch.py, and
+        they discover skills from disk the way the task intends. Handing codex
+        the skills pre-read into context was a backend-specialized prompt, which
+        the fairness rule forbids outright.
+
+        The parameters stay so callers need no change and the decision of
+        whether an image task is in play is still recorded; they no longer
+        reach the model.
+        """
+
+        del image_helper_enabled, skill_docs
+        return prompt.strip() + "\n"
 
     @staticmethod
     def _should_enable_image_helper(prompt: str, workspace_path: str) -> bool:
@@ -898,6 +1077,24 @@ if __name__ == "__main__":
             "codex exec --skip-git-repo-check --cd /tmp_workspace -"
         )
 
+    def _build_resume_exec_command(
+        self,
+        prompt_path: str,
+        *,
+        session_id: str | None,
+    ) -> str:
+        resume_target = shlex.quote(session_id) if session_id else "--last"
+        # Same source as the recorded artifact -- see _render_codex_config.
+        approval_flags = " ".join(CODEX_POSTURE.argv)
+        return (
+            "cd /tmp_workspace && "
+            f"cat {shlex.quote(prompt_path)} | "
+            "codex exec resume --skip-git-repo-check "
+            f"{approval_flags} --json "
+            f"--output-last-message {shlex.quote(CODEX_LAST_MESSAGE_PATH)} "
+            f"{resume_target} -"
+        )
+
     def _build_find_latest_session_command(self) -> str:
         return (
             f"find {CODEX_SESSIONS_DIR} -type f -name '*.jsonl' "
@@ -919,6 +1116,45 @@ if __name__ == "__main__":
         )
         name = (r.stdout or "").strip().splitlines()[0] if r.stdout else ""
         return name or None
+
+    def _find_latest_session_id(self, task_id: str) -> str | None:
+        latest = self._find_latest_session(task_id)
+        if not latest:
+            return None
+
+        r = subprocess.run(
+            [
+                "docker",
+                "exec",
+                task_id,
+                "/bin/bash",
+                "-c",
+                f"cat {shlex.quote(f'{CODEX_SESSIONS_DIR}/{latest}')}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "[%s] Could not read latest Codex session id: %s",
+                task_id,
+                r.stderr.strip(),
+            )
+            return None
+
+        for raw in (r.stdout or "").splitlines():
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "session_meta":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                session_id = payload.get("id")
+                if isinstance(session_id, str) and session_id.strip():
+                    return session_id.strip()
+        return None
 
     def _copy_file_from_container(self, task_id: str, src: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
