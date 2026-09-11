@@ -97,6 +97,15 @@ ALL_CATEGORIES = [
     "06_Safety_Alignment",
 ]
 
+
+_TASK_NUMBER_RE = re.compile(r"task_(\d+)")
+
+
+def _task_file_sort_key(path: Path) -> tuple[int, str]:
+    """Sort WildClaw tasks by their numeric task suffix, then by filename."""
+    match = _TASK_NUMBER_RE.search(path.name)
+    return (int(match.group(1)) if match else 10**9, path.name)
+
 def grade_the_task(
     task_id: str,
     workspace_path: str,
@@ -552,6 +561,12 @@ def main() -> None:
         if result.get("error") or (result.get("scores") or {}).get("error"):
             sys.exit(1)
         return
+    if args.task_offset < 0:
+        logger.error("--task-offset must be >= 0")
+        sys.exit(2)
+    if args.max_tasks is not None and args.max_tasks < 0:
+        logger.error("--max-tasks must be >= 0")
+        sys.exit(2)
     if args.category.lower() == "all":
         categories = ALL_CATEGORIES
     else:
@@ -566,7 +581,12 @@ def main() -> None:
             logger.error("Category directory not found: %s", category_dir)
             continue
 
-        task_files = sorted(category_dir.glob("*task_*.md"))
+        # Numeric ordering makes shard boundaries refer to task_1 .. task_11,
+        # rather than lexicographic task_10, task_11, task_1, ... .
+        task_files = sorted(category_dir.glob("*task_*.md"), key=_task_file_sort_key)
+        task_files = task_files[args.task_offset:]
+        if args.max_tasks is not None:
+            task_files = task_files[:args.max_tasks]
         if not task_files:
             logger.error("No task_*.md files found in: %s", category_dir)
             continue
@@ -622,6 +642,7 @@ def main() -> None:
                         results.append({"task_id": tid, "scores": {}, "error": str(exc)})
 
         summary_label = f"{lobster['name']}_{safe_model_name}" if lobster else safe_model_name
+        summary_label += args.summary_suffix
         print_summary(results, category, output_root, summary_label)
         all_results.extend(results)
 
