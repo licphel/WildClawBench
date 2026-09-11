@@ -158,43 +158,6 @@ UPSTREAM_FAILURE_PATTERNS = (
 
 PROVIDER_ERROR_PATTERNS = UNRECOVERABLE_SESSION_PATTERNS + UPSTREAM_FAILURE_PATTERNS
 
-# Narrower than UNRECOVERABLE_SESSION_PATTERNS above on purpose: quota
-# exhaustion refills on its own ("the next attempt is worth making", per that
-# tuple's own comment), so it stays eligible for a fresh Task retry. Only the
-# encrypted-session repudiation is truly session-scoped -- resuming the same
-# session cannot recover it, and neither can a fresh container reaching the
-# same upstream state, so it is excluded from Task-level retry eligibility
-# entirely and left to the bounded in-session Resume loop alone. Ported from
-# benchmarks/WildClawBench/src/utils/transient_errors.py, where this
-# distinction was built and proven before eval_framework had it; keep the two
-# in sync (see script/sync_inference_gateway.py's docstring on why they must
-# not drift apart again).
-SESSION_ONLY_MARKERS = (
-    "invalid_encrypted_content",
-    "encrypted content could not be verified",
-    "could not be decrypted or parsed",
-)
-
-# Deterministic request-shape failures: retrying the same prompt/session
-# cannot change the request shape, so they must not enter either in-session
-# Resume or Task-level retry. A context-length overflow or an invalid
-# parameter reaching this file is proof that a fresh attempt will fail
-# identically -- retrying spends a container/session for a result that is
-# already known.
-DETERMINISTIC_REQUEST_MARKERS = (
-    "context_length_exceeded",
-    "context length exceeded",
-    "maximum context length",
-    "maximum context window",
-    "too many tokens",
-    "prompt is too long",
-    "input is too long",
-    "invalid_request_error",
-    "unsupported parameter",
-    "invalid parameter",
-    "extra inputs are not permitted",
-)
-
 # A task that ran out of wall-clock. Deliberately matched on the generic
 # phrasing rather than any one harness's wording ("pylm run timed out
 # after 900 seconds", "Command '[...]' timed out after 1319 seconds", ...)
@@ -245,6 +208,51 @@ NON_RETRYABLE_MARKERS = (
     "export trajectory",
 )
 
+# These are deterministic request failures. Retrying the same prompt/session
+# cannot change the request shape, so they must not enter either in-session
+# resume or task-level retry. ``invalid_encrypted_content`` is deliberately
+# handled by the separate session-only policy below; it is never a fresh
+# Task/container retry candidate.
+DETERMINISTIC_REQUEST_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "maximum context window",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "invalid_request_error",
+    "unsupported parameter",
+    "invalid parameter",
+    "extra inputs are not permitted",
+)
+
+SESSION_ONLY_MARKERS = (
+    "invalid_encrypted_content",
+    "encrypted content could not be verified",
+    "could not be decrypted or parsed",
+)
+
+
+def deterministic_request_error(error: str | None) -> str | None:
+    """Return a request-shape failure that must never be retried."""
+
+    if not error:
+        return None
+    lowered = error.lower()
+    # The encrypted-session signature has its own bounded same-session policy.
+    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
+        return None
+    for marker in DETERMINISTIC_REQUEST_MARKERS:
+        if marker in lowered:
+            return marker
+    if any(
+        marker in lowered
+        for marker in ("http 400", "status 400", "status=400", "code 400", "returned 400")
+    ):
+        return "HTTP 400 request error"
+    return None
+
 
 def non_retryable_phase(error: str | None) -> str | None:
     """The NON_RETRYABLE_MARKERS signature in ``error``, or None.
@@ -264,27 +272,6 @@ def non_retryable_phase(error: str | None) -> str | None:
     for marker in NON_RETRYABLE_MARKERS:
         if marker.lower() in lowered:
             return marker
-    return None
-
-
-def deterministic_request_error(error: str | None) -> str | None:
-    """Return a request-shape failure that must never be retried, or None."""
-
-    if not error:
-        return None
-    lowered = error.lower()
-    # The encrypted-session signature has its own bounded same-session policy
-    # (SESSION_ONLY_MARKERS / task_retryable_provider_error), not this one.
-    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
-        return None
-    for marker in DETERMINISTIC_REQUEST_MARKERS:
-        if marker in lowered:
-            return marker
-    if any(
-        marker in lowered
-        for marker in ("http 400", "status 400", "status=400", "code 400", "returned 400")
-    ):
-        return "HTTP 400 request error"
     return None
 
 
@@ -507,22 +494,21 @@ def resumable_provider_error(output: str | None) -> str | None:
     appearing in the output of a *successful* run is the task's own transcript
     quoting it (a task whose mock API returns HTTP 400, say), not a failure.
     """
-    return _matched_pattern(output, PROVIDER_ERROR_PATTERNS)
+    session_only = _matched_pattern(output, SESSION_ONLY_MARKERS)
+    if session_only is not None:
+        return session_only
+    return _matched_pattern(output, UPSTREAM_FAILURE_PATTERNS)
 
 
 def task_retryable_provider_error(output: str | None) -> str | None:
-    """Return an upstream signature eligible for a fresh Task retry, or None.
+    """Return an upstream signature eligible for a fresh Task retry.
 
-    Deliberately a different predicate from ``resumable_provider_error``: a
-    session-only failure (SESSION_ONLY_MARKERS) may be resumed same-session a
-    bounded number of times, but exhausting that loop is not on its own a
-    reason to throw away the container and start a new Task -- resuming
-    already established that the *upstream* session state was the problem,
-    not the inference path in general, and a fresh Task pays the same cost
-    (fresh container, fresh clock) for a signature the bounded Resume loop is
-    the correct place to keep trying. Keeping the veto here, next to the
-    other predicate, makes the separation structural instead of depending on
-    every caller to remember it.
+    This is intentionally a different predicate from
+    ``resumable_provider_error``.  A session-only failure may be resumed by a
+    baseline a bounded number of times, but exhausting that loop is not a
+    reason to create a new Task/container.  Keeping the session-only veto here
+    makes that separation structural instead of depending on a caller to
+    remember it.
     """
 
     if not output:
@@ -663,10 +649,10 @@ def should_retry_attempt(
             f"({phase!r}), so it says nothing about the measurement; kept"
         )
 
-    # Retrying the same input cannot change its shape -- a context-length
-    # overflow or an invalid parameter is proof a fresh attempt fails
-    # identically, so it is vetoed before either kind of provider evidence
-    # below gets a say.
+    # A string can carry both signatures -- perdura's retry-exhausted summary
+    # ends a run that also ran out of clock.  Only the independent Task-level
+    # provider predicate below can authorize a fresh Task; the in-session
+    # Resume result is deliberately not used as that authorization.
     deterministic = deterministic_request_error(error)
     if deterministic is not None:
         return False, (
@@ -674,12 +660,6 @@ def should_retry_attempt(
             "the same input cannot succeed by retrying"
         )
 
-    # A session-only signature (the upstream repudiating the encrypted
-    # conversation state a session is built on) is handled only by the
-    # bounded in-session Resume loop; exhausting that loop is not on its own
-    # authorization for a fresh Task/container, so it is excluded here even
-    # though resumable_provider_error() (the Resume loop's own gate) matches
-    # it. See task_retryable_provider_error().
     session_only = _matched_pattern(error, SESSION_ONLY_MARKERS)
     if session_only is not None:
         return False, (
@@ -688,11 +668,6 @@ def should_retry_attempt(
             "loop and is not a Task/container retry candidate"
         )
 
-    # A string can carry both signatures -- perdura's retry-exhausted summary
-    # ends a run that also ran out of clock -- and the provider half is
-    # decisive: an upstream that repudiated the session, ran out of quota or
-    # dropped the connection is an inference anomaly by construction, and
-    # needs no second opinion from the Gateway.
     provider = task_retryable_provider_error(error)
     if provider:
         return True, (
