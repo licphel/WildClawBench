@@ -21,7 +21,11 @@ from src.agents.codex.backend import (
 )
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_openclaw
-from src.utils.transient_errors import resumable_provider_error
+from src.utils.transient_errors import (
+    RESUME_ATTEMPTS,
+    resumable_provider_error,
+    unbounded_provider_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +37,16 @@ CODEX_LAST_MESSAGE_PATH = "/tmp_workspace/.codex_last_message.txt"
 OPENCLAW_TRANSCRIPT_DIR = "/root/.openclaw/agents/main/sessions"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_TRANSCRIPT_DIR}/chat.jsonl"
 DEFAULT_REASONING_EFFORT = "medium" #"high"
-DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = 3
-# 0 = unlimited resumes, bounded in practice by the `remaining <= 30` budget
-# stop below.  Same default and same bound as the other four baselines.
+# Ordinary same-session resumes retain the shared three-resume limit. The
+# encrypted-session and instant-inference quota signatures bypass it.
+DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS: int | None = RESUME_ATTEMPTS
+# A host-side docker exec timeout is not a graceful stop for the Codex
+# process inside the container.  Give it time to receive SIGINT and append its
+# final native token_count/session record before falling back to SIGKILL.
+CODEX_TIMEOUT_FLUSH_SECONDS = 15.0
+# The two targeted provider signatures bypass the ordinary three-resume limit;
+# the `remaining <= 30` guard below still prevents starting a retry when the
+# task clock has no useful time.
 #
 # Two knobs used to sit beside it and are gone:
 # CODEX_ENCRYPTED_CONTENT_SLOW_AFTER_FAILURES (3) and
@@ -51,10 +62,10 @@ DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS = 3
 # any agent.log under benchmarks/WildClawBench/output* or eval_results/ -- the
 # branch has not fired in a single run recorded on this host -- and on its own
 # terms it is questionable: the delay is named for `invalid_encrypted_content`,
-# which src/utils/transient_errors.py classes as an UNRECOVERABLE_SESSION
-# pattern precisely because no amount of continuing the same session recovers
-# it, yet the wait was followed by a resume of that same session.  Waiting
-# helps only the quota signatures next to it in that table, and quota is what
+# which src/utils/transient_errors.py classifies as an external session-state
+# failure; the same session cannot repair it, so the retry is now deliberately
+# unbounded rather than gated by the old three-resume limit.  Waiting helps
+# only the quota signatures next to it in that table, and quota is what
 # the Gateway's own Pacer already backs off on, coherently, for all five
 # baselines at once.  See RESUME_BACKOFF_S in src/utils/transient_errors.py.
 CODEX_LOG_NOISE_MARKERS = (
@@ -262,6 +273,7 @@ class CodexAgent(BaseAgent):
                     ),
                     timeout_seconds=spec.timeout_seconds,
                     output_dir=spec.output_dir,
+                    started_at=start_time,
                 )
                 # Retry time stays INSIDE elapsed_time, deliberately; see
                 # the same note in the claudecode runner.  openclaw's and
@@ -792,17 +804,28 @@ if __name__ == "__main__":
         prompt: str,
         timeout_seconds: int,
         output_dir: Path,
+        *,
+        started_at: float | None = None,
     ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = output_dir / "agent.log"
-        started = time.perf_counter()
+        # The task clock opens at run_task entry, before container/workspace
+        # setup.  A fresh clock here let setup escape the deadline while still
+        # being included in the reported elapsed_time.
+        started = time.perf_counter() if started_at is None else started_at
         excluded_retry_time = 0.0
         resume_session_id: str | None = None
         attempt = 0
 
         while True:
             counted_elapsed = time.perf_counter() - started - excluded_retry_time
-            remaining = max(1, int(timeout_seconds - counted_elapsed))
+            remaining = int(timeout_seconds - counted_elapsed)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(
+                    cmd="Codex task",
+                    timeout=timeout_seconds,
+                )
+            remaining = max(1, remaining)
             is_resume = attempt > 0
             current_prompt = (
                 prompt
@@ -839,7 +862,9 @@ if __name__ == "__main__":
                     f"(rc={r.returncode}):\n{r.stderr or r.stdout}"
                 )
             resume_limit_reached = (
-                attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS is not None
+                and attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                and unbounded_provider_error(retry_reason) is None
             )
             if resume_limit_reached:
                 if is_resume:
@@ -865,7 +890,11 @@ if __name__ == "__main__":
 
             resume_no = attempt + 1
             max_resume_attempts: int | str = (
-                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                "unlimited"
+                if unbounded_provider_error(retry_reason)
+                else DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                if DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS is not None
+                else "unlimited"
             )
             append_agent_log_event(
                 output_dir,
@@ -952,13 +981,28 @@ if __name__ == "__main__":
                     os.fsync(log.fileno())
                 except OSError:
                     pass
-                self._terminate_codex_processes(task_id)
-                proc.kill()
+                # SIGINT is the equivalent of Ctrl-C for `codex exec`: it lets
+                # the CLI close its session and flush the last native usage
+                # event.  The old path sent TERM/KILL immediately, which is
+                # exactly when self-reported usage was lost on timeouts.
+                self._interrupt_codex_processes(task_id)
                 try:
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=CODEX_TIMEOUT_FLUSH_SECONDS)
                 except subprocess.TimeoutExpired:
-                    log.write("[Codex runner] docker exec did not exit after kill\n")
-                    log.flush()
+                    try:
+                        self._terminate_codex_processes(task_id)
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        logger.warning(
+                            "[%s] Codex timeout force-stop errored: %s",
+                            task_id,
+                            exc,
+                        )
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        log.write("[Codex runner] docker exec did not exit after kill\n")
+                        log.flush()
                 raise
 
         return subprocess.CompletedProcess(
@@ -977,6 +1021,26 @@ if __name__ == "__main__":
             f"attempt {resume_attempt}: inspect any partial files only if needed, "
             "then finish by writing the required final outputs."
         )
+
+    @staticmethod
+    def _interrupt_codex_processes(task_id: str) -> None:
+        """Ask the in-container Codex CLI to flush its native session first."""
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    task_id,
+                    "/bin/bash",
+                    "-c",
+                    "pkill -INT -f '[c]odex exec' 2>/dev/null || true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("[%s] Codex timeout interrupt errored: %s", task_id, exc)
 
     @staticmethod
     def _terminate_codex_processes(task_id: str) -> None:

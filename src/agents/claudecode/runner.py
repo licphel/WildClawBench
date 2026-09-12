@@ -17,7 +17,12 @@ from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
-from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
+from src.utils.transient_errors import (
+    RESUME_ATTEMPTS,
+    RESUME_BACKOFF_S,
+    resumable_provider_error,
+    unbounded_provider_error,
+)
 
 load_dotenv()
 
@@ -25,10 +30,15 @@ logger = logging.getLogger(__name__)
 CLAUDECODE_SKILLS_DIR = "/root/.claude/skills"
 CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
-# Same-session resumes are deliberately unlimited and use the shared gateway
-# backoff. They are an internal recovery mechanism, not a benchmark knob.
-CLAUDECODE_RESUME_ATTEMPTS = 3
+# Ordinary same-session resumes retain the shared three-resume limit. The
+# encrypted-session and instant-inference quota signatures bypass it.
+CLAUDECODE_RESUME_ATTEMPTS: int | None = RESUME_ATTEMPTS
 CLAUDECODE_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
+# A host-side docker exec timeout kills the client, not necessarily the
+# Claude process inside the container.  Give Claude a chance to handle the
+# interrupt and emit its terminal result/modelUsage row before collection.
+CLAUDECODE_TIMEOUT_FLUSH_SECONDS = 15.0
+CLAUDECODE_AGENT_PID_PATH = "/tmp/wildclaw-claudecode-agent.pid"
 
 
 class ClaudeCodeAgent(BaseAgent):
@@ -143,7 +153,7 @@ class ClaudeCodeAgent(BaseAgent):
             return CLAUDECODE_COMPAT_TRANSCRIPT_PATH
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
-        elapsed_time = float(spec.timeout_seconds)
+        elapsed_time = 0.0
         start_time = time.perf_counter()
         task_id = spec.task_id
 
@@ -165,6 +175,7 @@ class ClaudeCodeAgent(BaseAgent):
                 spec.model,
                 spec.timeout_seconds,
                 spec.output_dir,
+                started_at=start_time,
             )
             # Retry time stays INSIDE elapsed_time, deliberately.  Every
             # baseline retries, but only three of the five retry in a place
@@ -186,6 +197,7 @@ class ClaudeCodeAgent(BaseAgent):
             return AgentExecution(elapsed_time=elapsed_time, error=None, gateway_proc=None, agent_proc=None)
         except subprocess.TimeoutExpired:
             logger.info("[%s] ClaudeCode timed out...", task_id)
+            self._flush_timed_out_run(task_id)
             return AgentExecution(
                 elapsed_time=float(spec.timeout_seconds),
                 error="ClaudeCode run timed out",
@@ -194,6 +206,11 @@ class ClaudeCodeAgent(BaseAgent):
             )
         except Exception as exc:
             logger.error("[%s] ClaudeCode execution error: %s", task_id, exc)
+            # The PID file makes this a no-op when setup failed before Claude
+            # launched, but protects the native log if an unexpected wrapper
+            # exception occurs while the in-container process is still live.
+            self._flush_timed_out_run(task_id)
+            elapsed_time = max(0.0, time.perf_counter() - start_time)
             return AgentExecution(
                 elapsed_time=elapsed_time,
                 error=str(exc),
@@ -569,14 +586,32 @@ PY"""
         if r_cp.returncode != 0:
             raise RuntimeError(f"ClaudeCode tmp copy failed:\n{r_cp.stderr}")
 
-    def _run_prompt(self, task_id: str, prompt: str, model: str, timeout_seconds: int, output_dir: Path) -> float:
+    def _run_prompt(
+        self,
+        task_id: str,
+        prompt: str,
+        model: str,
+        timeout_seconds: int,
+        output_dir: Path,
+        *,
+        started_at: float | None = None,
+    ) -> float:
         output_dir.mkdir(parents=True, exist_ok=True)
-        started = time.perf_counter()
+        # The task budget starts at run_task entry, before container/workspace
+        # setup. Starting a second clock here let setup time escape the
+        # deadline while still appearing in the reported elapsed_time.
+        started = time.perf_counter() if started_at is None else started_at
         excluded_retry_time = 0.0
         attempt = 0
         while True:
             counted_elapsed = time.perf_counter() - started - excluded_retry_time
-            remaining = max(1, int(timeout_seconds - counted_elapsed))
+            remaining = int(timeout_seconds - counted_elapsed)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(
+                    cmd="ClaudeCode task",
+                    timeout=timeout_seconds,
+                )
+            remaining = max(1, remaining)
             is_resume = attempt > 0
             current_prompt = prompt if not is_resume else (
                 "A previous attempt of this same task was interrupted by a transient "
@@ -595,7 +630,8 @@ PY"""
             # gets to it. See src/agents/approval_posture.py.
             approval_flags = " ".join(CLAUDE_POSTURE.argv)
             cmd = (
-                f"cd /claude_code && IS_SANDBOX=1 ./start.sh {resume_flag}"
+                f"cd /claude_code && echo $$ > {shlex.quote(CLAUDECODE_AGENT_PID_PATH)} && "
+                f"IS_SANDBOX=1 exec ./start.sh {resume_flag}"
                 f"{approval_flags} "
                 f"--add-dir /tmp_workspace -p {shlex.quote(current_prompt)} "
                 f"--model {shlex.quote(model)}"
@@ -646,7 +682,11 @@ PY"""
                     f"(rc={r.returncode}):\n{output}"
                 )
             excluded_retry_time += attempt_elapsed
-            if attempt >= CLAUDECODE_RESUME_ATTEMPTS:
+            if (
+                CLAUDECODE_RESUME_ATTEMPTS is not None
+                and attempt >= CLAUDECODE_RESUME_ATTEMPTS
+                and unbounded_provider_error(provider_error) is None
+            ):
                 raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")
             if remaining <= 30:
                 raise RuntimeError(
@@ -659,8 +699,148 @@ PY"""
             attempt += 1
             logger.warning(
                 "[%s] ClaudeCode exited non-zero; retrying --continue (%s/%s)",
-                    task_id, attempt, CLAUDECODE_RESUME_ATTEMPTS,
+                    task_id,
+                    attempt,
+                    (
+                        "unlimited"
+                        if unbounded_provider_error(provider_error)
+                        else CLAUDECODE_RESUME_ATTEMPTS or "unlimited"
+                    ),
             )
+
+    def _flush_timed_out_run(self, task_id: str) -> None:
+        """Ask the in-container CLI to finalize its native usage before copy.
+
+        ``subprocess.run(..., timeout=...)`` only terminates the host-side
+        ``docker exec`` client.  Previously the container was collected
+        immediately afterwards, so a timed-out Claude process never got a
+        chance to emit its terminal ``result``/``modelUsage`` record.  That
+        made the backend collector manufacture an all-zero native report even
+        though the process had made progress.
+
+        This is deliberately a signal to ClaudeCode itself, never a Gateway
+        read or a reconstruction from Gateway counters.  If Claude does not
+        emit native accounting during the grace period, the zero/missing
+        self-report remains explicit and is not replaced with another source.
+        """
+        try:
+            active = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    task_id,
+                    "/bin/bash",
+                    "-lc",
+                    (
+                        "("
+                        f"(test -s {shlex.quote(CLAUDECODE_AGENT_PID_PATH)} && "
+                        f"kill -0 \"$(cat {shlex.quote(CLAUDECODE_AGENT_PID_PATH)})\" "
+                        "2>/dev/null) || pgrep -x claude >/dev/null"
+                        ")"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if active.returncode != 0:
+                logger.info("[%s] No live ClaudeCode process needs timeout flushing", task_id)
+                return
+            signal_script = f"""
+pid_file={shlex.quote(CLAUDECODE_AGENT_PID_PATH)}
+if test -s "$pid_file" && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    kill -INT "$(cat "$pid_file")" 2>/dev/null || true
+fi
+pkill -INT -x claude 2>/dev/null || true
+"""
+            interrupted = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    task_id,
+                    "/bin/bash",
+                    "-lc",
+                    signal_script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if interrupted.returncode != 0:
+                logger.warning(
+                    "[%s] ClaudeCode timeout interrupt failed: %s",
+                    task_id,
+                    interrupted.stderr.strip(),
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("[%s] ClaudeCode timeout interrupt errored: %s", task_id, exc)
+            return
+
+        deadline = time.monotonic() + CLAUDECODE_TIMEOUT_FLUSH_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                probe = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        task_id,
+                        "/bin/bash",
+                        "-lc",
+                        (
+                            "(test -s /claude_code/log/usage.json || "
+                            "grep -Eq '\"type\"[[:space:]]*:[[:space:]]*\"result\"' "
+                            "/claude_code/log/chat.jsonl) && "
+                            "(! test -s "
+                            f"{shlex.quote(CLAUDECODE_AGENT_PID_PATH)} || "
+                            "! kill -0 \"$(cat "
+                            f"{shlex.quote(CLAUDECODE_AGENT_PID_PATH)}"
+                            ")\" 2>/dev/null)"
+                        ),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                probe = None
+            if probe is not None and probe.returncode == 0:
+                logger.info("[%s] ClaudeCode emitted native terminal usage after timeout", task_id)
+                return
+            time.sleep(0.5)
+
+        # Do not leave a timed-out CLI running while grading and artifact
+        # collection proceed.  This is only the last resort after the grace
+        # period, so any native record Claude could emit has already had time
+        # to reach disk.
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    task_id,
+                    "/bin/bash",
+                    "-lc",
+                    (
+                        f"pid_file={shlex.quote(CLAUDECODE_AGENT_PID_PATH)}; "
+                        "if test -s \"$pid_file\"; then "
+                        "kill -TERM \"$(cat \"$pid_file\")\" 2>/dev/null || true; "
+                        "fi; "
+                        "pkill -TERM -x claude 2>/dev/null || true; "
+                        "sleep 2; "
+                        "pkill -KILL -x claude 2>/dev/null || true"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("[%s] ClaudeCode timeout force-stop errored: %s", task_id, exc)
+        logger.warning(
+            "[%s] ClaudeCode timeout flush produced no native usage; "
+            "self_reported will remain unavailable",
+            task_id,
+        )
 
     def _extract_usage_from_logs(self, log_dir: Path) -> dict[str, Any]:
         totals = {

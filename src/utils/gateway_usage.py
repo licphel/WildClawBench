@@ -331,6 +331,17 @@ _COUNTERS = (
     "request_count",
 )
 
+# ``request_count`` alone is not usable billing data.  In particular,
+# ClaudeCode can finish on a timeout with a request count but without exporting
+# any token buckets; when that happens the Gateway delta is the authoritative
+# measurement and must not be demoted merely because the backend saw requests.
+_TOKEN_COUNTERS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
 #: Gateway provenance key -> our key.  The Gateway speaks Anthropic's names.
 _GATEWAY_KEY_MAP = {
     "input_tokens": "input_tokens",
@@ -854,9 +865,11 @@ def annotate_usage(
 
     record["gateway_usage"] = gateway_block
 
-    # The baseline's own collector is the task-level source of truth. The
-    # Gateway delta is retained for audit and only fills in when the baseline
-    # exported no usage at all.
+    # The baseline's own collector is the task-level source of truth when it
+    # exported usable token buckets. The Gateway delta is retained for audit
+    # otherwise, and fills in the authoritative counters when the backend only
+    # reported a request count (a common timeout artifact) or reported no
+    # usage at all.
     if gateway_block["authoritative"] and not _reported_nothing(self_reported):
         gateway_block["native_usage_authoritative"] = True
         gateway_block["authoritative"] = False
@@ -896,7 +909,14 @@ def _stalled_request_age_s() -> float | None:
 
 
 def _reported_nothing(usage: dict[str, Any]) -> bool:
-    return not any(_int(usage.get(key)) for key in _COUNTERS)
+    """Whether the backend supplied any usable token accounting.
+
+    A positive ``request_count`` without token buckets is common on a
+    timed-out ClaudeCode attempt.  It proves that the backend started work,
+    not that its self-reported billing is usable, so it must not suppress an
+    exclusive Gateway measurement.
+    """
+    return not any(_int(usage.get(key)) for key in _TOKEN_COUNTERS)
 
 
 def _counters_only(snapshot: dict[str, Any] | None) -> dict[str, int]:

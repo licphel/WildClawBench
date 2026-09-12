@@ -43,6 +43,7 @@ from src.utils.transient_errors import (
     MAX_TASK_ATTEMPTS,
     attempt_evidence,
     should_retry_attempt,
+    unbounded_provider_error,
 )
 from src.utils import gateway_usage
 
@@ -178,6 +179,28 @@ def save_usage(output_dir: Path, result: dict, usage: dict, task_id: str) -> dic
     )
     logger.info("[%s] Usage written to %s", task_id, usage_path)
     return result
+
+
+def empty_usage_record(elapsed_time: float, *, error: str | None = None) -> dict:
+    """Return a serializable native-usage placeholder for failed collection.
+
+    The runner is allowed to have no native tokens after a failure, but the
+    batch driver must still leave an explicit ``usage.json`` instead of
+    aborting its ``finally`` block halfway through cleanup.
+    """
+    record = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "request_count": 0,
+        "elapsed_time": round(elapsed_time, 2),
+    }
+    if error:
+        record["collection_error"] = error
+    return record
 
 def collect_task_output(
     task_id: str,
@@ -315,7 +338,12 @@ def run_single_task(
         logger.error("[%s] Unexpected backend error: %s", task_id, exc)
 
     finally:
-        usage_window.close()
+        try:
+            usage_window.close()
+        except Exception as exc:
+            # A broken usage probe must not prevent native artifact collection
+            # or the final usage.json from being written.
+            logger.warning("[%s] Failed to close gateway usage window: %s", task_id, exc)
         grading_transcript_path = backend.transcript_container_path
         # This started as an isinstance tuple that grew one baseline at a time:
         # OpenClawAgent previously never set result["error"] (openclaw/runner.py
@@ -347,29 +375,64 @@ def run_single_task(
                     exc,
                 )
 
-        result = grade_the_task(
-            task_id,
-            workspace_path,
-            output_dir,
-            task,
-            result,
-            lobster.get("env") if lobster else None,
-            transcript_container_path=grading_transcript_path,
-            grade_on_error=grade_on_error,
-            write_error_score_on_failure=grade_on_error,
-        )
-        usage = backend.collect_usage(
-            task_id=task_id,
-            output_dir=output_dir,
-            elapsed_time=elapsed_time,
-        )
-        # Label it and, where the gateway saw this task exclusively, let the
-        # gateway's count take the top-level fields.  The backend's own numbers
-        # are kept under "self_reported" either way.
-        usage = gateway_usage.annotate_usage(
-            usage, backend=backend, window=usage_window
-        )
-        result = save_usage(output_dir, result, usage, task_id)
+        try:
+            result = grade_the_task(
+                task_id,
+                workspace_path,
+                output_dir,
+                task,
+                result,
+                lobster.get("env") if lobster else None,
+                transcript_container_path=grading_transcript_path,
+                grade_on_error=grade_on_error,
+                write_error_score_on_failure=grade_on_error,
+            )
+        except Exception as exc:
+            # Scoring is best effort.  It must not suppress usage collection
+            # when a timed-out container leaves an incomplete transcript.
+            logger.exception("[%s] Grading raised unexpectedly: %s", task_id, exc)
+            result["error"] = result.get("error") or str(exc)
+
+        try:
+            usage = backend.collect_usage(
+                task_id=task_id,
+                output_dir=output_dir,
+                elapsed_time=elapsed_time,
+            )
+            if not isinstance(usage, dict):
+                raise TypeError(f"backend returned {type(usage).__name__}, expected dict")
+        except Exception as exc:
+            logger.exception("[%s] Native usage collection failed: %s", task_id, exc)
+            usage = empty_usage_record(elapsed_time, error=str(exc))
+
+        # Keep the baseline's native report under self_reported.  Whatever the
+        # existing top-level provenance policy decides for the Gateway fields,
+        # never copy that delta into self_reported to repair a native timeout
+        # report whose own counters are zero.
+        try:
+            usage = gateway_usage.annotate_usage(
+                usage, backend=backend, window=usage_window
+            )
+        except Exception as exc:
+            logger.exception("[%s] Usage annotation failed: %s", task_id, exc)
+            raw_usage = dict(usage)
+            usage = dict(raw_usage)
+            usage["self_reported"] = dict(raw_usage)
+            usage["usage_source"] = gateway_usage.USAGE_SOURCE_BACKEND
+            usage["cache_semantics"] = gateway_usage.self_reported_cache_semantics(backend)
+            usage["annotation_error"] = str(exc)
+
+        try:
+            result = save_usage(output_dir, result, usage, task_id)
+        except Exception as exc:
+            # Preserve the run result and make one last serializable attempt so
+            # a malformed collector payload cannot remove usage.json entirely.
+            logger.exception("[%s] Writing collected usage failed: %s", task_id, exc)
+            fallback = empty_usage_record(elapsed_time, error=f"usage write: {exc}")
+            try:
+                result = save_usage(output_dir, result, fallback, task_id)
+            except Exception:
+                logger.exception("[%s] Writing fallback usage.json also failed", task_id)
 
         try:
             collect_task_output(
@@ -414,7 +477,9 @@ def run_single_task(
 # survives that: non-agent-level failures (docker start, warmup) that can only
 # raise once from run_single_task, or an embedded-run error that stayed
 # transient through all of OpenClawAgent's in-container attempts. Rebuilding
-# the whole container is expensive, so only one fallback attempt.
+# the whole container is expensive, so ordinary anomalies get one fallback
+# attempt. Encrypted-session and instant-inference quota errors are explicitly
+# unbounded and bypass this finite fallback cap.
 #
 # The number is no longer WildClaw's to choose. MAX_TASK_ATTEMPTS is the
 # repo-wide budget in src/utils/transient_errors.py (authoritative copy:
@@ -448,11 +513,18 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
 
     result = run_single_task(*args, **kwargs)
     attempt = 1
-    while attempt <= MAX_TRANSIENT_RETRIES:
+    unbounded = False
+    while True:
         retry, why = should_retry_attempt(
             result.get("error"), attempt_evidence(result)
         )
-        if not retry:
+        # Once this task has demonstrated one of the explicitly unbounded
+        # provider failures, keep the no-cap mode even if a later retry is
+        # reported with a different transient spelling.  The task is still
+        # waiting on the same external provider condition; changing the log
+        # wording must not silently reinstate the finite cap.
+        unbounded = unbounded or bool(unbounded_provider_error(result.get("error")))
+        if not retry or (not unbounded and attempt > MAX_TRANSIENT_RETRIES):
             if result.get("error"):
                 logger.info(
                     "[%s] Kept as the measurement, not retried: %s",

@@ -81,9 +81,9 @@ because five files inside that repository import it as
 # running* agent may stop it on these, because continuing cannot recover.
 UNRECOVERABLE_SESSION_PATTERNS = (
     # The upstream repudiating the encrypted conversation state a session is
-    # built on -- surfaced as a 4xx carrying this marker. No amount of
-    # continuing the same session recovers it, and the gateway now records it
-    # as an anomaly for Sentinel's side of the same fix
+    # built on -- surfaced as a 4xx carrying this marker. Continuing the same
+    # session cannot recover it, and the gateway now records it as an anomaly
+    # for Sentinel's side of the same fix
     # (inference_gateway.py::note_anomaly).
     "invalid_encrypted_content",
     # The same repudiation in the prose phrasings hermes-agent's runner
@@ -112,6 +112,13 @@ UPSTREAM_FAILURE_PATTERNS = (
     "network aborted",
     "ETIMEDOUT",
     "EAI_AGAIN",
+    # OpenClaw reports a provider-side stream failure in the agent log using
+    # this short marker. The gateway's longer wording is included below too;
+    # both are recoverable upstream failures, not task-level errors.
+    "provider internal error",
+    "incomplete chunked read",
+    "peer closed connection without sending complete message body",
+    "stream ended early",
     "502 Bad Gateway",
     "503 Service Unavailable",
     # The relay refusing to route because every upstream channel in the group
@@ -147,6 +154,11 @@ UPSTREAM_FAILURE_PATTERNS = (
 )
 
 PROVIDER_ERROR_PATTERNS = UNRECOVERABLE_SESSION_PATTERNS + UPSTREAM_FAILURE_PATTERNS
+
+# These failures are not agent measurements: the current upstream session or
+# instant-inference allocation is unusable.  The caller must keep retrying the
+# provider path rather than spending a finite task-attempt budget on it.
+UNBOUNDED_RETRY_PATTERNS = UNRECOVERABLE_SESSION_PATTERNS
 
 # A task that ran out of wall-clock. Deliberately matched on the generic
 # phrasing rather than any one harness's wording ("pylm run timed out
@@ -200,9 +212,9 @@ NON_RETRYABLE_MARKERS = (
 
 # These are deterministic request failures. Retrying the same prompt/session
 # cannot change the request shape, so they must not enter either in-session
-# resume or task-level retry. ``invalid_encrypted_content`` is deliberately
-# handled by the separate session-only policy below; it is never a fresh
-# Task/container retry candidate.
+# resume or task-level retry. The encrypted-session markers are intentionally
+# excluded here: they describe external conversation state and are handled by
+# the separate unbounded provider-retry policy below.
 DETERMINISTIC_REQUEST_MARKERS = (
     "context_length_exceeded",
     "context length exceeded",
@@ -251,7 +263,7 @@ def deterministic_request_error(error: str | None) -> str | None:
     if not error:
         return None
     lowered = error.lower()
-    # The encrypted-session signature has its own bounded same-session policy.
+    # The encrypted-session signature has its own non-deterministic retry policy.
     if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
         return None
     for marker in DETERMINISTIC_REQUEST_MARKERS:
@@ -477,34 +489,25 @@ def resumable_provider_error(output: str | None) -> str | None:
     TRANSIENT_ERROR_PATTERNS because they refund the failed attempt's elapsed
     time from the task budget. Refunding a wall-clock exhaustion would hand
     the next attempt the full budget again and loop forever, so only the
-    task-level retry -- one fresh container, bounded by MAX_TRANSIENT_RETRIES
-    -- may act on WALL_CLOCK_PATTERNS.
+    task-level retry may act on WALL_CLOCK_PATTERNS.
 
     Callers must first establish that the attempt actually failed. A marker
     appearing in the output of a *successful* run is the task's own transcript
     quoting it (a task whose mock API returns HTTP 400, say), not a failure.
     """
-    session_only = _matched_pattern(output, SESSION_ONLY_MARKERS)
-    if session_only is not None:
-        return session_only
-    return _matched_pattern(output, UPSTREAM_FAILURE_PATTERNS)
+    return _matched_pattern(output, PROVIDER_ERROR_PATTERNS)
 
 
 def task_retryable_provider_error(output: str | None) -> str | None:
     """Return an upstream signature eligible for a fresh Task retry.
 
     This is intentionally a different predicate from
-    ``resumable_provider_error``.  A session-only failure may be resumed by a
-    baseline a bounded number of times, but exhausting that loop is not a
-    reason to create a new Task/container.  Keeping the session-only veto here
-    makes that separation structural instead of depending on a caller to
-    remember it.
+    ``resumable_provider_error``.  Encrypted-session and instant-inference
+    quota failures are deliberately unbounded; ordinary provider failures keep
+    the finite task-level retry budget.
     """
 
     if not output:
-        return None
-    lowered = output.lower()
-    if any(marker in lowered for marker in SESSION_ONLY_MARKERS):
         return None
     return _matched_pattern(output, PROVIDER_ERROR_PATTERNS)
 
@@ -520,6 +523,18 @@ def unrecoverable_session_error(output: str | None) -> str | None:
     absorbed by anyone.
     """
     return _matched_pattern(output, UNRECOVERABLE_SESSION_PATTERNS)
+
+
+def unbounded_provider_error(output: str | None) -> str | None:
+    """Return a provider signature that must be retried without a cap.
+
+    This is intentionally narrower than ``resumable_provider_error``:
+    ordinary transport failures retain the normal finite task retry budget,
+    while encrypted-session repudiation and instant-inference quota exhaustion
+    are external state and are allowed to keep retrying until they clear.
+    """
+
+    return _matched_pattern(output, UNBOUNDED_RETRY_PATTERNS)
 
 
 # --------------------------------------------------------------------------- #
@@ -562,6 +577,12 @@ MAX_TASK_ATTEMPTS = 2
 #: measurement supporting any positive value, and the largest one was
 #: measuring nothing at all.  Zero is the value the data supports.
 RESUME_BACKOFF_S = 0.0
+
+# Ordinary same-session provider recovery remains bounded at three resumes.
+# The encrypted-session and instant-inference quota signatures bypass this
+# limit in the runner; they stop only after the provider accepts a request or
+# the operator stops the run.
+RESUME_ATTEMPTS: int | None = 3
 
 
 def should_retry_attempt(
@@ -611,14 +632,6 @@ def should_retry_attempt(
         return False, (
             f"the attempt failed with a deterministic request error ({deterministic!r}); "
             "the same input cannot succeed by retrying"
-        )
-
-    session_only = _matched_pattern(error, SESSION_ONLY_MARKERS)
-    if session_only is not None:
-        return False, (
-            f"the attempt failed with the session-only signature ({session_only!r}); "
-            "this signature is handled only by the bounded in-session Resume "
-            "loop and is not a Task/container retry candidate"
         )
 
     provider = task_retryable_provider_error(error)
