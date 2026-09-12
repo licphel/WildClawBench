@@ -588,6 +588,31 @@ def fetch_gateway_usage(*, task_id: str = "") -> dict[str, Any] | None:
 # One task's slice of the shared counter
 # --------------------------------------------------------------------------- #
 
+#: Same env var, same meaning, as ``eval_framework/gateway_usage.py``'s
+#: ``CONCURRENT_TASKS_ENV``: ``eval_framework/runner.py`` already sets this to
+#: ``--num-workers`` before it forks the per-task subprocesses that reach this
+#: module (one OS process per task, via ``script/run.sh`` -> ``run_batch.py``),
+#: so no caller here needs to change for this to take effect.
+CONCURRENT_TASKS_ENV = "EVAL_GATEWAY_CONCURRENT_TASKS"
+
+
+def _declared_concurrency() -> int:
+    """How many tasks the runner said it may have in flight at once.
+
+    ``GatewayUsageWindow``'s own ``_live`` set is in-process only: under
+    ``eval_framework``'s actual deployment (one subprocess per task, per
+    ``wildclawbench_adapter.py``), every process's ``_live`` set holds exactly
+    its own single window, so ``concurrent_tasks_max`` always came out 1 and
+    ``exclusive`` was always True, no matter how many sibling tasks were
+    hitting the same host-side Gateway singleton at once. This is the
+    process-blind floor that catches what ``_live`` structurally cannot.
+    """
+
+    try:
+        return max(1, int(os.environ.get(CONCURRENT_TASKS_ENV) or 1))
+    except (TypeError, ValueError):
+        return 1
+
 
 class GatewayUsageWindow:
     """The Gateway counter's movement across one task's agent run.
@@ -642,6 +667,14 @@ class GatewayUsageWindow:
             self.after = fetch_gateway_usage(task_id=self.task_id)
         with self._registry_lock:
             self._live.discard(self)
+        # ``self.concurrent_tasks_max`` above only ever reflects windows opened
+        # in *this* process. Floor it with the declared worker count so a task
+        # run as its own OS subprocess (the actual deployment; see
+        # ``_declared_concurrency``) still reports overlap it could never have
+        # observed directly, instead of a false ``exclusive``.
+        self.concurrent_tasks_max = max(
+            self.concurrent_tasks_max, _declared_concurrency()
+        )
 
     def __enter__(self) -> "GatewayUsageWindow":
         return self
