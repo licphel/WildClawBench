@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -23,8 +24,10 @@ from src.utils.docker_utils import (
 from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.transient_errors import (
+    RESUME_ATTEMPTS,
     RESUME_BACKOFF_S,
     resumable_provider_error,
+    unbounded_provider_error,
     unrecoverable_session_error,
 )
 
@@ -39,10 +42,16 @@ HERMES_IMAGE = os.environ.get("HERMES_DOCKER_IMAGE", "").strip()
 HERMES_HOME = "/root/.hermes"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_VENV_PYTHON = "/opt/hermes/.venv/bin/python3"
-# Same-session resumes are deliberately unlimited and use the shared gateway
-# backoff. They are an internal recovery mechanism, not a benchmark knob.
-HERMES_RESUME_ATTEMPTS = 3
+# Ordinary same-session resumes retain the shared three-resume limit (see
+# transient_errors.RESUME_ATTEMPTS). The encrypted-session and
+# instant-inference quota signatures bypass it.
+HERMES_RESUME_ATTEMPTS: int | None = RESUME_ATTEMPTS
 HERMES_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
+# The host-side docker exec timeout is not a graceful stop for the Python
+# runner inside the container.  Allow Hermes to persist its session and log
+# the last native response before escalating to TERM/KILL.
+HERMES_TIMEOUT_FLUSH_SECONDS = 15.0
+HERMES_AGENT_PID_PATH = "/tmp/wildclaw-hermes-agent.pid"
 
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
 BENCH_RUNNER_HOST_PATH = Path(__file__).with_name("bench_runner.py")
@@ -80,7 +89,7 @@ class HermesAgentAgent(BaseAgent):
         return self.transcript_container_path
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
-        elapsed_time = float(spec.timeout_seconds)
+        elapsed_time = 0.0
         agent_proc = None
         start_time: float | None = None
         excluded_retry_time = 0.0
@@ -154,7 +163,13 @@ class HermesAgentAgent(BaseAgent):
                     resume=resume_attempt > 0,
                 )
                 counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
-                remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
+                remaining = int(spec.timeout_seconds - counted_elapsed)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        cmd="Hermes task",
+                        timeout=spec.timeout_seconds,
+                    )
+                remaining = max(1, remaining)
                 logger.info("[%s] Waiting for hermes-agent to finish...", spec.task_id)
                 attempt_started = time.perf_counter()
                 provider_error_reason: str | None = None
@@ -186,9 +201,15 @@ class HermesAgentAgent(BaseAgent):
                 except subprocess.TimeoutExpired:
                     logger.info("[%s] hermes-agent timed out...", spec.task_id)
                     elapsed_time = float(spec.timeout_seconds)
-                    agent_proc.kill()
-                    agent_proc.wait()
-                    break
+                    self._flush_timed_out_run(spec.task_id, agent_proc)
+                    self._cleanup_bench_config(spec.task_id)
+                    return AgentExecution(
+                        elapsed_time=elapsed_time,
+                        error="Hermes run timed out",
+                        gateway_proc=None,
+                        agent_proc=agent_proc,
+                        excluded_retry_time=excluded_retry_time,
+                    )
                 if not provider_error_reason:
                     provider_error_reason = self._find_error_marker(
                         spec.output_dir / "agent.log", log_offset
@@ -214,7 +235,11 @@ class HermesAgentAgent(BaseAgent):
                         f"(rc={agent_proc.returncode})"
                     )
                 excluded_retry_time += attempt_elapsed
-                if resume_attempt >= HERMES_RESUME_ATTEMPTS:
+                if (
+                    HERMES_RESUME_ATTEMPTS is not None
+                    and resume_attempt >= HERMES_RESUME_ATTEMPTS
+                    and unbounded_provider_error(provider_error_reason) is None
+                ):
                     raise RuntimeError(f"Hermes runner failed (rc={agent_proc.returncode})")
                 if remaining <= 30:
                     raise RuntimeError("Hermes runner failed and no useful time remains for resume")
@@ -227,7 +252,12 @@ class HermesAgentAgent(BaseAgent):
                     "[%s] Hermes runner exited non-zero%s; retrying same session (%s/%s)",
                     spec.task_id,
                     f" after provider error ({provider_error_reason})" if provider_error_reason else "",
-                    resume_attempt, HERMES_RESUME_ATTEMPTS,
+                    resume_attempt,
+                    (
+                        "unlimited"
+                        if unbounded_provider_error(provider_error_reason)
+                        else HERMES_RESUME_ATTEMPTS or "unlimited"
+                    ),
                 )
             self._close_runner_streams(agent_proc)
 
@@ -242,15 +272,16 @@ class HermesAgentAgent(BaseAgent):
                 excluded_retry_time=excluded_retry_time,
             )
         except Exception as exc:
-            if agent_proc is not None:
+            if agent_proc is not None and agent_proc.poll() is None:
+                # Settle a live child on every failure path, not only the
+                # explicit wall-clock timeout path, before usage collection.
+                self._flush_timed_out_run(spec.task_id, agent_proc)
+            elif agent_proc is not None:
                 self._close_runner_streams(agent_proc)
             self._cleanup_bench_config(spec.task_id)
             logger.error("[%s] hermes-agent execution error: %s", spec.task_id, exc)
             if start_time is not None:
-                elapsed_time = min(
-                    float(spec.timeout_seconds),
-                    max(0.0, time.perf_counter() - start_time),
-                )
+                elapsed_time = max(0.0, time.perf_counter() - start_time)
             return AgentExecution(
                 elapsed_time=elapsed_time,
                 error=str(exc),
@@ -262,6 +293,13 @@ class HermesAgentAgent(BaseAgent):
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict[str, Any]:
         transcript_host = output_dir / "chat.jsonl"
         output_dir.mkdir(parents=True, exist_ok=True)
+        # Keep usage collection independent from grading.  In particular, a
+        # timed-out run may have no score path but can still have a native
+        # session snapshot that the compat converter can expose.
+        try:
+            self._write_compat_transcript(task_id)
+        except Exception as exc:
+            logger.warning("[%s] Compat transcript before usage failed: %s", task_id, exc)
         r_cp = subprocess.run(
             ["docker", "cp", f"{task_id}:{self.transcript_container_path}", str(transcript_host)],
             capture_output=True,
@@ -662,8 +700,9 @@ class HermesAgentAgent(BaseAgent):
                 "/bin/bash",
                 "-c",
                 f"cd {HERMES_INSTALL_DIR} && "
+                f"echo $$ > {shlex.quote(HERMES_AGENT_PID_PATH)} && "
                 f"WILDCLAW_HERMES_RESUME={'1' if resume else ''} "
-                f"{HERMES_VENV_PYTHON} -",
+                f"exec {HERMES_VENV_PYTHON} -",
             ],
             stdin=script_file,
             stdout=log_file,
@@ -686,6 +725,79 @@ class HermesAgentAgent(BaseAgent):
                 stream.close()
             except Exception:
                 pass
+        log_file = getattr(proc, "_log_file", None)
+        if log_file is not None and not log_file.closed:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _signal_hermes_process(task_id: str, signal_name: str) -> None:
+        """Signal the exact in-container Hermes bench runner when possible."""
+        if signal_name not in {"INT", "TERM", "KILL"}:
+            raise ValueError(f"unsupported signal: {signal_name}")
+        pid_file = shlex.quote(HERMES_AGENT_PID_PATH)
+        script = f"""
+pid_file={pid_file}
+if test -s "$pid_file" && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    kill -{signal_name} "$(cat "$pid_file")" 2>/dev/null || true
+else
+    pkill -{signal_name} -f '[p]ython3 -' 2>/dev/null || true
+fi
+"""
+        try:
+            subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-lc", script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "[%s] Hermes timeout signal %s errored: %s",
+                task_id,
+                signal_name,
+                exc,
+            )
+
+    def _flush_timed_out_run(
+        self, task_id: str, agent_proc: subprocess.Popen | None
+    ) -> None:
+        """Give Hermes time to persist native session usage before stopping it."""
+        if agent_proc is None or agent_proc.poll() is not None:
+            if agent_proc is not None:
+                self._close_runner_streams(agent_proc)
+            return
+
+        self._signal_hermes_process(task_id, "INT")
+        try:
+            agent_proc.wait(timeout=HERMES_TIMEOUT_FLUSH_SECONDS)
+            self._close_runner_streams(agent_proc)
+            return
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "[%s] Hermes did not exit during the %.1fs usage flush grace period",
+                task_id,
+                HERMES_TIMEOUT_FLUSH_SECONDS,
+            )
+
+        self._signal_hermes_process(task_id, "TERM")
+        try:
+            agent_proc.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            self._signal_hermes_process(task_id, "KILL")
+            try:
+                agent_proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                agent_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("[%s] Hermes docker exec did not exit after KILL", task_id)
+        finally:
+            self._close_runner_streams(agent_proc)
 
     @classmethod
     def _find_error_marker(

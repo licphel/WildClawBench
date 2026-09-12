@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -329,6 +330,237 @@ def print_summary(results: list[dict], category: str, output_dir: Path, model_na
     print(f"\n  Summary written to → {summary_path}")
     print("#" * 60)
 
+def _finite_number(value: object) -> int | float | None:
+    """Return numeric JSON values only; match OpenClaw's finite-number rule."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _token_count(value: object) -> int | None:
+    number = _finite_number(value)
+    if number is None:
+        return None
+    return max(0, int(number))
+
+
+def _pick_token(mapping: dict, *keys: str) -> tuple[int | None, str | None]:
+    for key in keys:
+        if key in mapping:
+            value = _token_count(mapping[key])
+            if value is not None:
+                return value, key
+    return None, None
+
+
+def _pick_cost(mapping: dict, *keys: str) -> float | None:
+    for key in keys:
+        if key in mapping:
+            value = _finite_number(mapping[key])
+            if value is not None:
+                return max(0.0, float(value))
+    return None
+
+
+_USAGE_KEYS = frozenset(
+    {
+        "input",
+        "output",
+        "cacheRead",
+        "cacheWrite",
+        "inputTokens",
+        "outputTokens",
+        "promptTokens",
+        "completionTokens",
+        "input_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "cache_read",
+        "cache_write",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+        "cached_input_tokens",
+        "cached_tokens",
+        "cached",
+        "cache_creation_input_tokens",
+        "total",
+        "totalTokens",
+        "total_tokens",
+        "cost",
+        "cost_usd",
+        "total_cost_usd",
+    }
+)
+
+
+def _looks_like_usage(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if _USAGE_KEYS.intersection(value):
+        return True
+    return any(
+        isinstance(value.get(key), dict)
+        and bool(
+            {"cached_tokens", "cache_write_tokens", "cache_creation_input_tokens"}
+            .intersection(value[key])
+        )
+        for key in ("input_tokens_details", "prompt_tokens_details")
+    )
+
+
+def _find_usage_block(entry: dict, message: dict) -> dict:
+    """Find one native usage snapshot without counting the same event twice.
+
+    OpenClaw normally persists ``message.usage``.  CLI/provider adapters can
+    instead put the snapshot in ``stats`` or on the event itself, and some
+    versions use snake_case OpenAI names.  Prefer a populated message block,
+    while retaining an empty block as a faithful zero-usage snapshot.
+    """
+    fallback: dict | None = None
+    containers = (message, entry)
+    for container in containers:
+        for key in (
+            "usage",
+            "token_usage",
+            "tokenUsage",
+            "stats",
+            "last_token_usage",
+            "lastTokenUsage",
+        ):
+            candidate = container.get(key)
+            if not isinstance(candidate, dict):
+                continue
+            if fallback is None:
+                fallback = candidate
+            if _looks_like_usage(candidate):
+                return candidate
+    return fallback or {}
+
+
+def _normalize_transcript_usage(usage: dict, entry: dict | None = None) -> dict:
+    """Normalize the usage variants accepted by OpenClaw's ``normalizeUsage``.
+
+    OpenClaw's persisted assistant messages are usually disjoint
+    ``input/output/cacheRead/cacheWrite`` buckets, but provider-shaped records
+    can use OpenAI Responses/Chat or CLI names.  In those formats the prompt
+    total includes cache buckets, so subtract them from input just as
+    OpenClaw does before writing its normalized assistant message.
+    """
+    cache_read, _ = _pick_token(
+        usage,
+        "cacheRead",
+        "cache_read",
+        "cacheReadTokens",
+        "cache_read_tokens",
+        "cache_read_input_tokens",
+        "cached_input_tokens",
+        "cached",
+        "cached_tokens",
+    )
+    cache_write, _ = _pick_token(
+        usage,
+        "cacheWrite",
+        "cache_write",
+        "cacheWriteTokens",
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+        "cache_write_input_tokens",
+    )
+    for detail_key in ("input_tokens_details", "prompt_tokens_details"):
+        details = usage.get(detail_key)
+        if not isinstance(details, dict):
+            continue
+        if cache_read is None:
+            cache_read, _ = _pick_token(details, "cached_tokens")
+        if cache_write is None:
+            cache_write, _ = _pick_token(
+                details, "cache_write_tokens", "cache_creation_input_tokens"
+            )
+
+    raw_input, input_key = _pick_token(
+        usage,
+        "input",
+        "inputTokens",
+        "input_tokens",
+        "promptTokens",
+        "prompt_tokens",
+        "prompt_n",
+    )
+    raw_output, _ = _pick_token(
+        usage,
+        "output",
+        "outputTokens",
+        "output_tokens",
+        "completionTokens",
+        "completion_tokens",
+        "predicted_n",
+    )
+
+    # ``input`` is OpenClaw's already-disjoint bucket.  The other provider
+    # aliases are prompt totals when a cache detail is present, so normalize
+    # them to the same disjoint convention.
+    has_cached_alias = any(
+        key in usage
+        for key in (
+            "cached_input_tokens",
+            "cached",
+            "cached_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+    has_cache_detail = any(
+        isinstance(usage.get(key), dict)
+        and any(
+            detail in usage[key]
+            for detail in (
+                "cached_tokens",
+                "cache_write_tokens",
+                "cache_creation_input_tokens",
+            )
+        )
+        for key in ("input_tokens_details", "prompt_tokens_details")
+    )
+    if raw_input is not None and input_key != "input":
+        if has_cached_alias or has_cache_detail:
+            raw_input -= cache_read or 0
+        if has_cache_detail or "cache_write_input_tokens" in usage:
+            raw_input -= cache_write or 0
+    input_tokens = _token_count(raw_input)
+
+    total_tokens, _ = _pick_token(usage, "total", "totalTokens", "total_tokens")
+    if total_tokens is None:
+        total_tokens = sum(
+            value or 0 for value in (input_tokens, raw_output, cache_read, cache_write)
+        )
+
+    cost: float | None = None
+    cost_value = usage.get("cost")
+    if isinstance(cost_value, dict):
+        cost = _pick_cost(cost_value, "total", "total_usd", "totalUSD")
+    else:
+        cost = _pick_cost(usage, "cost", "cost_usd", "costUSD", "total_cost_usd")
+    if cost is None and isinstance(entry, dict):
+        entry_cost = entry.get("cost")
+        if isinstance(entry_cost, dict):
+            cost = _pick_cost(entry_cost, "total", "total_usd", "totalUSD")
+        else:
+            cost = _pick_cost(entry, "cost_usd", "costUSD", "total_cost_usd")
+
+    return {
+        "input_tokens": input_tokens or 0,
+        "output_tokens": raw_output or 0,
+        "cache_read_tokens": cache_read or 0,
+        "cache_write_tokens": cache_write or 0,
+        "total_tokens": total_tokens or 0,
+        "cost_usd": cost or 0.0,
+    }
+
+
 def extract_usage_from_jsonl(jsonl_path: Path) -> dict:
     totals = {
         "input_tokens": 0,
@@ -349,20 +581,30 @@ def extract_usage_from_jsonl(jsonl_path: Path) -> dict:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if entry.get("type") != "message":
+        if not isinstance(entry, dict):
             continue
-        msg = entry.get("message", {})
-        if msg.get("role") != "assistant":
+        msg = entry.get("message")
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            assistant_message = msg
+        elif entry.get("role") == "assistant":
+            assistant_message = entry
+        elif entry.get("type") in {"assistant", "assistant_message"}:
+            assistant_message = msg if isinstance(msg, dict) else entry
+        else:
             continue
         totals["request_count"] += 1
-        usage = msg.get("usage", {})
-        totals["input_tokens"]       += usage.get("input",       0)
-        totals["output_tokens"]      += usage.get("output",      0)
-        totals["cache_read_tokens"]  += usage.get("cacheRead",   0)
-        totals["cache_write_tokens"] += usage.get("cacheWrite",  0)
-        totals["total_tokens"]       += usage.get("totalTokens", 0)
-        cost = usage.get("cost", {})
-        totals["cost_usd"] += cost.get("total", 0.0)
+        usage = _normalize_transcript_usage(
+            _find_usage_block(entry, assistant_message), entry
+        )
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "total_tokens",
+            "cost_usd",
+        ):
+            totals[key] += usage[key]
     totals["cost_usd"] = round(totals["cost_usd"], 6)
     return totals
 

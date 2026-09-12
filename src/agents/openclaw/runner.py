@@ -14,7 +14,12 @@ from src.agents.approval_posture import OPENCLAW as OPENCLAW_POSTURE, record as 
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.grading import extract_usage_from_jsonl
-from src.utils.transient_errors import RESUME_BACKOFF_S, resumable_provider_error
+from src.utils.transient_errors import (
+    RESUME_ATTEMPTS,
+    RESUME_BACKOFF_S,
+    resumable_provider_error,
+    unbounded_provider_error,
+)
 from src.utils.docker_utils import (
     close_proc_log,
     inject_lobster_workspace,
@@ -37,11 +42,17 @@ OPENCLAW_HOME = "/root/.openclaw"
 #: promises.
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_HOME}/agents/main/sessions/chat.jsonl"
 
-# Same-session resumes are deliberately unlimited and use the shared gateway
-# backoff. They are an internal recovery mechanism, not a benchmark knob.
-OPENCLAW_RESUME_ATTEMPTS = 3
+# Ordinary same-session resumes retain the shared three-resume limit (see
+# transient_errors.RESUME_ATTEMPTS). The encrypted-session and
+# instant-inference quota signatures bypass it.
+OPENCLAW_RESUME_ATTEMPTS: int | None = RESUME_ATTEMPTS
 OPENCLAW_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = 120.0
+# ``docker exec`` timing out only kills the host-side client.  Let the
+# in-container OpenClaw process handle SIGINT and flush its native transcript
+# before the runner escalates to TERM/KILL.
+OPENCLAW_TIMEOUT_FLUSH_SECONDS = 15.0
+OPENCLAW_AGENT_PID_PATH = "/tmp/wildclaw-openclaw-agent.pid"
 OPENCLAW_RESUME_PREFIX = (
     "A previous attempt of this same task was interrupted by a transient "
     "provider error. Continue from the current workspace, preserve and "
@@ -62,6 +73,56 @@ class OpenClawAgent(BaseAgent):
         self.openrouter_api_key = openrouter_api_key
         self.openrouter_base_url = openrouter_base_url
         self.image_model = image_model or ""
+
+    def _resolve_gateway_port(self, task_id: str) -> int:
+        """Return a valid free gateway port inside the task container.
+
+        ``run_batch.py`` passes ``0`` as the dynamic-port sentinel.  OpenClaw's
+        CLI does not accept ``--port 0`` (unlike Python's socket API), so the
+        allocation has to happen before the CLI starts and in the container's
+        own network namespace.  Each task has its own container; a short
+        bind-and-release probe is therefore sufficient and avoids sharing a
+        host-side port with another task.
+        """
+        if self.gateway_port > 0:
+            return self.gateway_port
+        probe = subprocess.run(
+            [
+                "docker",
+                "exec",
+                task_id,
+                "python3",
+                "-c",
+                (
+                    "import socket; "
+                    "sock = socket.socket(); "
+                    "sock.bind(('127.0.0.1', 0)); "
+                    "print(sock.getsockname()[1]); "
+                    "sock.close()"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            detail = (probe.stderr or probe.stdout or "").strip()
+            raise RuntimeError(
+                f"Could not allocate an OpenClaw gateway port in the container "
+                f"(rc={probe.returncode}): {detail[-500:]}"
+            )
+        raw_port = (probe.stdout or "").strip().splitlines()
+        try:
+            port = int(raw_port[-1])
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError(
+                f"Container returned an invalid OpenClaw gateway port: "
+                f"{probe.stdout!r}"
+            ) from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"Container returned an out-of-range gateway port: {port}")
+        logger.info("[%s] Allocated OpenClaw gateway port inside container: %s", task_id, port)
+        return port
 
     @property
     def expects_gateway(self) -> bool:
@@ -159,7 +220,8 @@ PY"""
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         gateway_proc = None
         agent_proc = None
-        elapsed_time = float(spec.timeout_seconds)
+        elapsed_time = 0.0
+        start_time: float | None = None
         # Initialized here (not just where the retry loop starts) so the
         # except block below can always report it, even if a failure happens
         # before the agent loop starts accumulating retries.
@@ -194,13 +256,16 @@ PY"""
             image_model = self.image_model or spec.model
             self._set_image_model(spec.task_id, image_model)
 
+            gateway_port = self._resolve_gateway_port(spec.task_id)
+
             gateway_proc = run_background(
                 spec.task_id,
                 bash_cmd=(
                     f"export OPENROUTER_API_KEY='{self.openrouter_api_key}' && "
                     f"export OPENROUTER_BASE_URL='{self.openrouter_base_url}' && "
+                    f"export OPENCLAW_GATEWAY_PORT='{gateway_port}' && "
                     "for attempt in 1 2; do "
-                    f"openclaw gateway run --port {self.gateway_port} "
+                    f"openclaw gateway run --port {gateway_port} "
                     "--bind loopback --allow-unconfigured; "
                     "status=$?; "
                     "if [ $status -eq 0 ] || [ $attempt -eq 2 ]; then "
@@ -237,7 +302,7 @@ PY"""
                         spec.task_id,
                         "/bin/bash",
                         "-c",
-                        "openclaw health",
+                        f"OPENCLAW_GATEWAY_PORT='{gateway_port}' openclaw health",
                     ],
                     capture_output=True,
                     text=True,
@@ -267,11 +332,24 @@ PY"""
             while True:
                 log_offset = agent_log.stat().st_size if agent_log.exists() else 0
                 counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
-                remaining = max(1, int(spec.timeout_seconds - counted_elapsed))
+                remaining = int(spec.timeout_seconds - counted_elapsed)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        cmd="OpenClaw task",
+                        timeout=spec.timeout_seconds,
+                    )
+                remaining = max(1, remaining)
                 message = safe_prompt if resume_attempt == 0 else safe_resume_prompt
                 agent_proc = run_background(
                     spec.task_id,
-                    bash_cmd=f"openclaw agent --session-id chat --timeout {remaining} --message '{message}'",
+                    bash_cmd=(
+                        # The gateway is allocated per container; keep the
+                        # agent CLI on that port instead of its default 18789.
+                        f"export OPENCLAW_GATEWAY_PORT='{gateway_port}' && "
+                        f"echo $$ > {shlex.quote(OPENCLAW_AGENT_PID_PATH)} && "
+                        f"exec openclaw agent --session-id chat --timeout {remaining} "
+                        f"--message '{message}'"
+                    ),
                     log_path=agent_log,
                     append=resume_attempt > 0,
                 )
@@ -283,9 +361,13 @@ PY"""
                 except subprocess.TimeoutExpired:
                     logger.info("[%s] Agent timed out...", spec.task_id)
                     elapsed_time = float(spec.timeout_seconds)
-                    agent_proc.kill()
-                    agent_proc.wait()
-                    break
+                    self._flush_timed_out_run(spec.task_id, agent_proc)
+                    return AgentExecution(
+                        elapsed_time=elapsed_time,
+                        error="OpenClaw run timed out",
+                        gateway_proc=gateway_proc,
+                        agent_proc=agent_proc,
+                    )
                 attempt_elapsed = time.perf_counter() - attempt_started
                 # Retry time stays INSIDE elapsed_time, deliberately; see the
                 # note in the claudecode runner.  This runner could never
@@ -306,12 +388,16 @@ PY"""
                     break
                 provider_error_reason = self._find_error_marker(agent_log, log_offset)
                 if provider_error_reason is None:
-                    # Unchanged from before this loop existed: a non-zero exit
-                    # carrying no provider signature is the agent's own failure,
-                    # and the workspace it left behind is still the measurement.
-                    break
+                    raise RuntimeError(
+                        "OpenClaw agent failed without a resumable provider error "
+                        f"(rc={agent_proc.returncode})"
+                    )
                 excluded_retry_time += attempt_elapsed
-                if resume_attempt >= OPENCLAW_RESUME_ATTEMPTS:
+                if (
+                    OPENCLAW_RESUME_ATTEMPTS is not None
+                    and resume_attempt >= OPENCLAW_RESUME_ATTEMPTS
+                    and unbounded_provider_error(provider_error_reason) is None
+                ):
                     raise RuntimeError(
                         f"OpenClaw agent failed after a provider error "
                         f"({provider_error_reason}) with no resume attempts left "
@@ -334,7 +420,11 @@ PY"""
                     spec.task_id,
                     provider_error_reason,
                     resume_attempt,
-                    OPENCLAW_RESUME_ATTEMPTS,
+                    (
+                        "unlimited"
+                        if unbounded_provider_error(provider_error_reason)
+                        else OPENCLAW_RESUME_ATTEMPTS or "unlimited"
+                    ),
                 )
 
             logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)
@@ -345,15 +435,102 @@ PY"""
                 agent_proc=agent_proc,
                 excluded_retry_time=excluded_retry_time,
             )
+        except subprocess.TimeoutExpired:
+            # This covers a deadline reached between retry attempts, before a
+            # new child was started.  If a live child exists, flush it using
+            # the same path as the direct wait timeout.
+            elapsed_time = float(spec.timeout_seconds)
+            self._flush_timed_out_run(spec.task_id, agent_proc)
+            return AgentExecution(
+                elapsed_time=elapsed_time,
+                error="OpenClaw run timed out",
+                gateway_proc=gateway_proc,
+                agent_proc=agent_proc,
+                excluded_retry_time=excluded_retry_time,
+            )
         except Exception as exc:
             logger.error("[%s] Execution error: %s", spec.task_id, exc)
+            if agent_proc is not None and agent_proc.poll() is None:
+                # Any unexpected runner failure must still leave the native
+                # transcript in a settled state before collect_usage runs.
+                self._flush_timed_out_run(spec.task_id, agent_proc)
+            if start_time is not None:
+                elapsed_time = max(0.0, time.perf_counter() - start_time)
             return AgentExecution(
-                elapsed_time=float(spec.timeout_seconds),
+                elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
                 excluded_retry_time=excluded_retry_time,
             )
+
+    @staticmethod
+    def _signal_openclaw_process(task_id: str, signal_name: str) -> None:
+        """Signal the exact in-container OpenClaw CLI when possible."""
+        if signal_name not in {"INT", "TERM", "KILL"}:
+            raise ValueError(f"unsupported signal: {signal_name}")
+        pid_file = shlex.quote(OPENCLAW_AGENT_PID_PATH)
+        script = f"""
+pid_file={pid_file}
+if test -s "$pid_file" && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    kill -{signal_name} "$(cat "$pid_file")" 2>/dev/null || true
+else
+    pkill -{signal_name} -f '[o]penclaw agent' 2>/dev/null || true
+fi
+"""
+        try:
+            subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-lc", script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "[%s] OpenClaw timeout signal %s errored: %s",
+                task_id,
+                signal_name,
+                exc,
+            )
+
+    def _flush_timed_out_run(
+        self, task_id: str, agent_proc: subprocess.Popen | None
+    ) -> None:
+        """Give OpenClaw time to persist native usage before force stopping it."""
+        if agent_proc is None or agent_proc.poll() is not None:
+            if agent_proc is not None:
+                close_proc_log(agent_proc)
+            return
+
+        self._signal_openclaw_process(task_id, "INT")
+        try:
+            agent_proc.wait(timeout=OPENCLAW_TIMEOUT_FLUSH_SECONDS)
+            close_proc_log(agent_proc)
+            return
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "[%s] OpenClaw did not exit during the %.1fs usage flush grace period",
+                task_id,
+                OPENCLAW_TIMEOUT_FLUSH_SECONDS,
+            )
+
+        self._signal_openclaw_process(task_id, "TERM")
+        try:
+            agent_proc.wait(timeout=3)
+            close_proc_log(agent_proc)
+            return
+        except subprocess.TimeoutExpired:
+            self._signal_openclaw_process(task_id, "KILL")
+            try:
+                agent_proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                agent_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("[%s] OpenClaw docker exec did not exit after KILL", task_id)
+        finally:
+            close_proc_log(agent_proc)
 
     @staticmethod
     def _find_error_marker(log_path: Path, offset: int) -> str | None:
@@ -368,6 +545,13 @@ PY"""
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict:
         transcript_host = output_dir / "chat.jsonl"
         output_dir.mkdir(parents=True, exist_ok=True)
+        # New OpenClaw versions keep transcript_events in SQLite.  Materialize
+        # it here as well as in the grading path: a timeout/error must not lose
+        # native usage merely because grading was skipped or failed.
+        try:
+            self._materialize_transcript(task_id)
+        except Exception as exc:
+            logger.warning("[%s] Transcript materialization before usage failed: %s", task_id, exc)
         r_cp = subprocess.run(
             ["docker", "cp", f"{task_id}:{self.transcript_container_path}", str(transcript_host)],
             capture_output=True,
@@ -527,9 +711,15 @@ PY"""
             "stderr": (remove_legacy.stderr or "").strip()[:400],
         }
         for key, value in OPENCLAW_POSTURE.config.items():
+            if isinstance(value, (list, dict)):
+                cli_value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            elif isinstance(value, bool):
+                cli_value = "true" if value else "false"
+            else:
+                cli_value = str(value)
             r = subprocess.run(
                 ["docker", "exec", task_id, "/bin/bash", "-c",
-                 f"openclaw config set {shlex.quote(key)} {shlex.quote(str(value))}"],
+                 f"openclaw config set {shlex.quote(key)} {shlex.quote(cli_value)}"],
                 capture_output=True, text=True,
             )
             applied["config"][key] = {
@@ -566,7 +756,8 @@ PY"""
              "test ! -e /root/.openclaw/exec-approvals.json; "
              "echo legacy_exec_approvals_absent=$?; "
              "openclaw config get tools.exec.security 2>&1; "
-             "openclaw config get tools.exec.ask 2>&1"],
+             "openclaw config get tools.exec.ask 2>&1; "
+             "openclaw config get tools.deny 2>&1"],
             capture_output=True, text=True,
         )
         applied["readback"] = (readback.stdout or "").strip()[:2000]

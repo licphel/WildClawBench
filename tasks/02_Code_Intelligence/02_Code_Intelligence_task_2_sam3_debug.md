@@ -145,5 +145,5 @@ workspace/02_Code_Intelligence/task_2_sam3_debug
 ## Warmup
 
 ```bash
-~/miniconda3/envs/eval/bin/pip install numpy==1.26.4 opencv-python==4.9.0.80
+~/miniconda3/envs/eval/bin/pip install --no-input --disable-pip-version-check --index-url https://mirrors.aliyun.com/pypi/simple/ --timeout 30 --retries 2 numpy==1.26.4 opencv-python==4.9.0.80
 ```

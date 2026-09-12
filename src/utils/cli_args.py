@@ -38,6 +38,23 @@ def build_run_batch_parser(default_model: str, default_parallel: int) -> argpars
         help="Number of parallel containers (default: 1, i.e. sequential)",
     )
     parser.add_argument(
+        "--task-offset",
+        type=int,
+        default=0,
+        help="Skip this many tasks at the start of a category",
+    )
+    parser.add_argument(
+        "--max-tasks",
+        type=int,
+        default=None,
+        help="Run at most this many tasks after --task-offset",
+    )
+    parser.add_argument(
+        "--summary-suffix",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--lobster-name",
         default=None,
         help="Lobster name (used in output directory for comparison)",

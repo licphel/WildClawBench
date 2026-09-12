@@ -109,14 +109,20 @@ OPENCLAW = ApprovalPosture(
         "tools.profile": "full",
         "tools.exec.security": "full",
         "tools.exec.ask": "off",
+        # ask_user is a model-facing interaction tool, not an exec approval.
+        # A headless benchmark has no operator who can answer it, so leaving
+        # it available can suspend a task until the outer timeout expires.
+        "tools.deny": ["ask_user"],
     },
     rationale=(
         "OpenClaw has no bypass flag; its exec defaults are security \"deny\" "
         "with ask \"on-miss\" and an askFallback of deny, so a headless run "
         "either blocks on an approval nobody will give or has every exec "
         "denied. The three tools.* keys are the current 2026.9.1 config "
-        "surface. The legacy exec-approvals JSON is intentionally absent "
-        "because the current gateway stores that state in SQLite."
+        "surface. The headless harness also denies ask_user because there is "
+        "no operator to answer it. The legacy exec-approvals JSON is "
+        "intentionally absent because the current gateway stores that state "
+        "in SQLite."
     ),
 )
 
