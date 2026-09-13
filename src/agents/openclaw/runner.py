@@ -326,6 +326,11 @@ PY"""
             safe_resume_prompt = (OPENCLAW_RESUME_PREFIX + spec.prompt).replace(
                 "'", "'\\''"
             )
+            thinking_flag = (
+                f" --thinking {shlex.quote(spec.thinking)}"
+                if spec.thinking
+                else ""
+            )
             agent_log = spec.output_dir / "agent.log"
             start_time = time.perf_counter()
             resume_attempt = 0
@@ -348,6 +353,7 @@ PY"""
                         f"export OPENCLAW_GATEWAY_PORT='{gateway_port}' && "
                         f"echo $$ > {shlex.quote(OPENCLAW_AGENT_PID_PATH)} && "
                         f"exec openclaw agent --session-id chat --timeout {remaining} "
+                        f"{thinking_flag} "
                         f"--message '{message}'"
                     ),
                     log_path=agent_log,

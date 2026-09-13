@@ -657,6 +657,7 @@ class HermesAgentAgent(BaseAgent):
                 "base_url": base_url,
                 "api_mode": "codex_responses",
                 "max_iterations": 90,
+                "max_tokens": 32000,
                 "reasoning_config": reasoning_config,
                 "session_id": f"wildclaw-{task_id}",
             },

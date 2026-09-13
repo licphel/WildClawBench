@@ -75,10 +75,11 @@ because five files inside that repository import it as
 ``src.utils.transient_errors``.
 """
 
-# Failures a running session can never talk its way out of: the upstream has
-# repudiated the conversation state the session is built on, or the account
-# has no instant-inference quota left. A runner that is watching a *still
-# running* agent may stop it on these, because continuing cannot recover.
+# Failures a running session cannot recover from without another provider
+# attempt: the upstream has repudiated the conversation state the session is
+# built on, or the account has no instant-inference quota left. A runner that
+# is watching a *still running* agent may stop it and let the common retry
+# policy restart it; the retry itself is intentionally unbounded below.
 UNRECOVERABLE_SESSION_PATTERNS = (
     # The upstream repudiating the encrypted conversation state a session is
     # built on -- surfaced as a 4xx carrying this marker. Continuing the same
@@ -113,6 +114,17 @@ UPSTREAM_FAILURE_PATTERNS = (
     "network aborted",
     "ETIMEDOUT",
     "EAI_AGAIN",
+    # The Gateway's post-first-output watchdog uses this explicit marker so a
+    # translated client can resume the same session after a stream that made
+    # partial progress but never received a terminal event.
+    "upstream_stream_stall",
+    "upstream stream stalled",
+    # OpenClaw's agent log uses the short marker for a provider-side stream
+    # failure; the gateway may emit the longer incomplete-body wording.
+    "provider internal error",
+    "incomplete chunked read",
+    "peer closed connection without sending complete message body",
+    "stream ended early",
     # Hermes reports a provider-unavailable turn as a successful HTTP
     # envelope whose payload contains the upstream's concrete failure.  BEAM
     # promotes that payload into ``error_detail``; these markers make the
@@ -122,13 +134,6 @@ UPSTREAM_FAILURE_PATTERNS = (
     "ConnectError",
     "UNEXPECTED_EOF_WHILE_READING",
     "HTTP 500",
-    # OpenClaw reports a provider-side stream failure in the agent log using
-    # this short marker. The gateway's longer wording is included below too;
-    # both are recoverable upstream failures, not task-level errors.
-    "provider internal error",
-    "incomplete chunked read",
-    "peer closed connection without sending complete message body",
-    "stream ended early",
     "502 Bad Gateway",
     "503 Service Unavailable",
     # The relay refusing to route because every upstream channel in the group
@@ -599,19 +604,10 @@ MAX_TASK_ATTEMPTS_RESUMABLE_PROVIDER_ERROR = 3
 #: measuring nothing at all.  Zero is the value the data supports.
 RESUME_BACKOFF_S = 0.0
 
-#: How many times one agent turn may be resumed, same-session, after a
-#: resumable_provider_error -- matching WildClaw's own
-#: HERMES_RESUME_ATTEMPTS/OPENCLAW_RESUME_ATTEMPTS (both 3), so a task
-#: resumed under eval_framework's shared runner and one resumed under
-#: WildClaw's eval/run_batch.py get the same number of chances before either
-#: escalates to a fresh Task/container.  This bounds the *resume* layer only:
-#: it is spent before MAX_TASK_ATTEMPTS_RESUMABLE_PROVIDER_ERROR is ever
-#: reached, not instead of it -- exhausting a resume budget is itself the
-#: "still failing" signal the task-level retry then acts on.
-#: Ordinary same-session provider recovery remains bounded at this limit. The
-#: encrypted-session and instant-inference quota signatures bypass it in the
-#: runner (see ``unbounded_provider_error``); they stop only after the
-#: provider accepts a request or the operator stops the run.
+#: Ordinary same-session provider recovery remains bounded at three resumes.
+#: The two external-state signatures in ``UNBOUNDED_RETRY_PATTERNS`` bypass
+#: this limit in each caller; they stop only after the provider accepts a
+#: request or the operator stops the run.
 RESUME_ATTEMPTS: int | None = 3
 
 

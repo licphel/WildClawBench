@@ -9,6 +9,10 @@ BENCH_CONFIG_PATH = "/tmp/hermes_bench_config.json"
 HERMES_INSTALL_DIR = "/opt/hermes"
 HERMES_WORKSPACE = "/tmp_workspace"
 HERMES_SESSION_DIR = "/root/.hermes/sessions"
+# Keep the benchmark's explicit output budget aligned with the gateway's
+# fallback and the OpenClaw model catalog.  The benchmark runner constructs
+# AIAgent directly, so a models-config maxTokens entry alone is not enough.
+BENCHMARK_MAX_OUTPUT_TOKENS = 32000
 
 
 def _sanitize_resume_history(messages: list[dict]) -> list[dict]:
@@ -118,6 +122,7 @@ def main() -> int:
         base_url=cfg.get("base_url", ""),
         api_mode=cfg.get("api_mode", "codex_responses"),
         max_iterations=cfg.get("max_iterations", 90),
+        max_tokens=cfg.get("max_tokens", BENCHMARK_MAX_OUTPUT_TOKENS),
         save_trajectories=True,
         verbose_logging=True,
         reasoning_config=cfg.get("reasoning_config"),
