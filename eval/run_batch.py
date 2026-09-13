@@ -43,7 +43,6 @@ from src.utils.transient_errors import (
     MAX_TASK_ATTEMPTS,
     attempt_evidence,
     should_retry_attempt,
-    unbounded_provider_error,
 )
 from src.utils import gateway_usage
 
@@ -547,18 +546,11 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
 
     result = run_single_task(*args, **kwargs)
     attempt = 1
-    unbounded = False
     while True:
         retry, why = should_retry_attempt(
             result.get("error"), attempt_evidence(result)
         )
-        # Once this task has demonstrated one of the explicitly unbounded
-        # provider failures, keep the no-cap mode even if a later retry is
-        # reported with a different transient spelling.  The task is still
-        # waiting on the same external provider condition; changing the log
-        # wording must not silently reinstate the finite cap.
-        unbounded = unbounded or bool(unbounded_provider_error(result.get("error")))
-        if not retry or (not unbounded and attempt > MAX_TRANSIENT_RETRIES):
+        if not retry or attempt > MAX_TRANSIENT_RETRIES:
             if result.get("error"):
                 logger.info(
                     "[%s] Kept as the measurement, not retried: %s",

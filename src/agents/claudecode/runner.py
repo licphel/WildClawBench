@@ -22,7 +22,6 @@ from src.utils.transient_errors import (
     RESUME_ATTEMPTS,
     RESUME_BACKOFF_S,
     resumable_provider_error,
-    unbounded_provider_error,
 )
 
 load_dotenv()
@@ -31,10 +30,10 @@ logger = logging.getLogger(__name__)
 CLAUDECODE_SKILLS_DIR = "/root/.claude/skills"
 CLAUDECODE_COMPAT_TRANSCRIPT_PATH = "/tmp/claudecode/openclaw_chat.jsonl"
 OPENCLAW_COMPAT_TRANSCRIPT_PATH = "/root/.openclaw/agents/main/sessions/chat.jsonl"
-# Ordinary same-session resumes retain the shared three-resume limit (see
+# Same-session resumes retain the shared three-resume limit (see
 # transient_errors.RESUME_ATTEMPTS, matched with HERMES_RESUME_ATTEMPTS /
-# OPENCLAW_RESUME_ATTEMPTS). The encrypted-session and instant-inference quota
-# signatures bypass it -- see unbounded_provider_error below.
+# OPENCLAW_RESUME_ATTEMPTS), including the encrypted-session and
+# instant-inference quota signatures.
 CLAUDECODE_RESUME_ATTEMPTS: int | None = RESUME_ATTEMPTS
 CLAUDECODE_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 # A host-side docker exec timeout kills the client, not necessarily the
@@ -747,7 +746,6 @@ PY"""
             if (
                 CLAUDECODE_RESUME_ATTEMPTS is not None
                 and attempt >= CLAUDECODE_RESUME_ATTEMPTS
-                and unbounded_provider_error(provider_error) is None
             ):
                 raise RuntimeError(f"ClaudeCode run failed (rc={r.returncode}, provider_error={provider_error}):\n{output}")
             if remaining <= 30:
@@ -765,11 +763,7 @@ PY"""
                 "[%s] ClaudeCode exited non-zero; retrying --continue (%s/%s)",
                     task_id,
                     attempt,
-                    (
-                        "unlimited"
-                        if unbounded_provider_error(provider_error)
-                        else CLAUDECODE_RESUME_ATTEMPTS or "unlimited"
-                    ),
+                    CLAUDECODE_RESUME_ATTEMPTS or "unlimited",
             )
 
     def _flush_timed_out_run(self, task_id: str) -> None:

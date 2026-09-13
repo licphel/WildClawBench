@@ -18,7 +18,6 @@ from src.utils.transient_errors import (
     RESUME_ATTEMPTS,
     RESUME_BACKOFF_S,
     resumable_provider_error,
-    unbounded_provider_error,
 )
 from src.utils.docker_utils import (
     close_proc_log,
@@ -402,7 +401,6 @@ PY"""
                 if (
                     OPENCLAW_RESUME_ATTEMPTS is not None
                     and resume_attempt >= OPENCLAW_RESUME_ATTEMPTS
-                    and unbounded_provider_error(provider_error_reason) is None
                 ):
                     raise RuntimeError(
                         f"OpenClaw agent failed after a provider error "
@@ -426,11 +424,7 @@ PY"""
                     spec.task_id,
                     provider_error_reason,
                     resume_attempt,
-                    (
-                        "unlimited"
-                        if unbounded_provider_error(provider_error_reason)
-                        else OPENCLAW_RESUME_ATTEMPTS or "unlimited"
-                    ),
+                    OPENCLAW_RESUME_ATTEMPTS or "unlimited",
                 )
 
             logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)

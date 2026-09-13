@@ -604,10 +604,11 @@ MAX_TASK_ATTEMPTS_RESUMABLE_PROVIDER_ERROR = 3
 #: measuring nothing at all.  Zero is the value the data supports.
 RESUME_BACKOFF_S = 0.0
 
-#: Ordinary same-session provider recovery remains bounded at three resumes.
-#: The two external-state signatures in ``UNBOUNDED_RETRY_PATTERNS`` bypass
-#: this limit in each caller; they stop only after the provider accepts a
-#: request or the operator stops the run.
+#: Same-session provider recovery is bounded at three resumes, including
+#: the two external-state signatures in ``UNBOUNDED_RETRY_PATTERNS`` --
+#: ``unbounded_provider_error`` still classifies them as external state (not
+#: an agent measurement) for logging/evidence purposes, but no caller bypasses
+#: this cap for them; three resumes is the shared limit for everyone.
 RESUME_ATTEMPTS: int | None = 3
 
 

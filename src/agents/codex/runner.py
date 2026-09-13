@@ -25,7 +25,6 @@ from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.transient_errors import (
     RESUME_ATTEMPTS,
     resumable_provider_error,
-    unbounded_provider_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -920,7 +919,6 @@ if __name__ == "__main__":
             resume_limit_reached = (
                 DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS is not None
                 and attempt >= DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
-                and unbounded_provider_error(retry_reason) is None
             )
             if resume_limit_reached:
                 if is_resume:
@@ -950,9 +948,7 @@ if __name__ == "__main__":
 
             resume_no = attempt + 1
             max_resume_attempts: int | str = (
-                "unlimited"
-                if unbounded_provider_error(retry_reason)
-                else DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
+                DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS
                 if DEFAULT_ENCRYPTED_CONTENT_RESUME_ATTEMPTS is not None
                 else "unlimited"
             )

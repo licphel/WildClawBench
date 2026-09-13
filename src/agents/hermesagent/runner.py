@@ -27,7 +27,6 @@ from src.utils.transient_errors import (
     RESUME_ATTEMPTS,
     RESUME_BACKOFF_S,
     resumable_provider_error,
-    unbounded_provider_error,
     unrecoverable_session_error,
 )
 
@@ -248,7 +247,6 @@ class HermesAgentAgent(BaseAgent):
                 if (
                     HERMES_RESUME_ATTEMPTS is not None
                     and resume_attempt >= HERMES_RESUME_ATTEMPTS
-                    and unbounded_provider_error(provider_error_reason) is None
                 ):
                     raise RuntimeError(f"Hermes runner failed (rc={agent_proc.returncode})")
                 if remaining <= 30:
@@ -263,11 +261,7 @@ class HermesAgentAgent(BaseAgent):
                     spec.task_id,
                     f" after provider error ({provider_error_reason})" if provider_error_reason else "",
                     resume_attempt,
-                    (
-                        "unlimited"
-                        if unbounded_provider_error(provider_error_reason)
-                        else HERMES_RESUME_ATTEMPTS or "unlimited"
-                    ),
+                    HERMES_RESUME_ATTEMPTS or "unlimited",
                 )
             self._close_runner_streams(agent_proc)
 
