@@ -39,6 +39,29 @@ class PyLMAgent(BaseAgent):
     def transcript_container_path(self) -> str:
         return self.transcript_path
 
+    def prepare_grading_transcript(self, task_id: str) -> str:
+        """Convert Perdura's own trajectory export into the shared grading
+        transcript, mirroring OpenClawAgent/ClaudeCodeAgent/HermesAgentAgent's
+        own ``prepare_grading_transcript``.
+
+        Perdura never writes ``transcript_path`` natively -- unlike OpenClaw,
+        the baseline the path convention is named after -- so without this,
+        grading would only ever see whatever
+        ``eval_framework.wildclaw_cli_container_entry._write_transcript``'s
+        dead Codex-log regex fallback produced. The actual conversion (locate
+        the exported ``pylm-trajectory.zip`` inside the still-running
+        container, read its ``canonical/chat.jsonl`` member, map it into the
+        openclaw compat shape, and push it back in at ``transcript_path``)
+        lives in ``eval_framework.wildclaw_cli_runner.
+        prepare_pylm_grading_transcript`` so both this (run_batch.py's
+        multi-task loop) and that module's own single-task ``run_cli_task``
+        share one implementation. See that function's docstring for the
+        empty-channel and failure fallbacks -- both leave ``transcript_path``
+        unchanged rather than making grading worse.
+        """
+        cli_runner = self._import_cli_runner()
+        return cli_runner.prepare_pylm_grading_transcript(task_id, self.transcript_path)
+
     @staticmethod
     def _repo_root() -> Path:
         # .../PyLM_Eval/benchmarks/WildClawBench/src/agents/pylm/runner.py
