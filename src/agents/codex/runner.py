@@ -151,6 +151,8 @@ class CodexAgent(BaseAgent):
     def __init__(
         self,
         image: str | None = None,
+        agent_api_key: str = "",
+        agent_base_url: str = "",
         openrouter_api_key: str = "",
         openrouter_base_url: str = "",
         reasoning_effort_default: str = DEFAULT_REASONING_EFFORT,
@@ -159,6 +161,19 @@ class CodexAgent(BaseAgent):
         if not resolved_image:
             raise ValueError("DOCKER_IMAGE_CODEX must be set when no Codex image is passed")
         self.image: str = resolved_image
+        # The agent's own model-provider credential (Codex CLI's
+        # config_providers.openrouter, despite the section name -- see
+        # _render_codex_config's env_key below). Independent of
+        # openrouter_api_key/openrouter_base_url, which is the LLM-judge /
+        # in-task-multimodal credential ~75% of WildClawBench tasks declare.
+        # GLOBAL_API_KEY/GLOBAL_API_BASE mirrors run_pylm.sh's
+        # pylm_provider_setup.py naming.
+        self.agent_api_key = (
+            agent_api_key or os.environ.get("GLOBAL_API_KEY", "")
+        ).strip()
+        self.agent_base_url = normalize_openrouter_base_url_for_openclaw(
+            agent_base_url or os.environ.get("GLOBAL_API_BASE", "")
+        )
         self.openrouter_api_key = (
             openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         ).strip()
@@ -253,7 +268,7 @@ class CodexAgent(BaseAgent):
                 # same-wire Responses path (CodexOAuthUpstream.prepare and
                 # .prepare_native), so the per-task in-container proxy that
                 # used to rewrite every JSON body to add it is gone.
-                codex_base_url = self.openrouter_base_url
+                codex_base_url = self.agent_base_url
                 self._write_codex_config(
                     task_id=task_id,
                     model=spec.model,
@@ -426,6 +441,9 @@ class CodexAgent(BaseAgent):
         proxy_https = os.environ.get("HTTPS_PROXY_INNER", "").strip()
         no_proxy = "" if not proxy_http else os.environ.get("NO_PROXY_INNER", "").strip()
         env_map: dict[str, str] = {
+            # Agent's own model provider -- config.toml's env_key names this.
+            "GLOBAL_API_KEY": self.agent_api_key,
+            # LLM-judge / in-task-multimodal credential (image helper below).
             "OPENROUTER_API_KEY": self.openrouter_api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
             "http_proxy": proxy_http,
@@ -586,7 +604,7 @@ class CodexAgent(BaseAgent):
         task_id: str = "",
     ) -> str:
         bare_model = model.split("/", 1)[1] if model.startswith("openrouter/") else model
-        safe_base_url = (base_url or self.openrouter_base_url).replace('"', '\\"')
+        safe_base_url = (base_url or self.agent_base_url).replace('"', '\\"')
         reasoning_line = (
             f'model_reasoning_effort = "{reasoning_effort}"\n'
             if reasoning_effort
@@ -625,7 +643,11 @@ class CodexAgent(BaseAgent):
             f'[model_providers.openrouter]\n'
             f'name = "openrouter"\n'
             f'base_url = "{safe_base_url}"\n'
-            f'env_key = "OPENROUTER_API_KEY"\n'
+            # Reads the agent's own model-provider credential from the
+            # container env (see env_map in _start_container above) -- kept
+            # independent of OPENROUTER_API_KEY, which is the LLM-judge /
+            # in-task-multimodal credential.
+            f'env_key = "GLOBAL_API_KEY"\n'
             f"{provider_wire_api_line}"
             f"{http_headers_line}"
         )

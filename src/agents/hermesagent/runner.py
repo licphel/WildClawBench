@@ -63,8 +63,8 @@ class HermesAgentAgent(BaseAgent):
     def __init__(
         self,
         image: str | None = None,
-        openrouter_api_key: str = "",
-        openrouter_base_url: str = "https://openrouter.ai/api/v1",
+        agent_api_key: str = "",
+        agent_base_url: str = "https://openrouter.ai/api/v1",
         brave_api_key: str = "",
     ) -> None:
         self.image = (image or HERMES_IMAGE).strip()
@@ -72,8 +72,18 @@ class HermesAgentAgent(BaseAgent):
             raise ValueError(
                 "HERMES_DOCKER_IMAGE must be set when no Hermes image is passed"
             )
-        self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self.openrouter_base_url = openrouter_base_url
+        # The agent's own model-provider credential -- only a fallback
+        # default here; _resolve_runtime_provider below always prefers the
+        # matching entry from the run's models-config (run_hermesagent.sh's
+        # 'shubiaobiao' provider, built from GLOBAL_API_KEY/GLOBAL_API_BASE)
+        # when one is present, which it always is for this benchmark.
+        # Independent of the LLM-judge / in-task-multimodal
+        # OPENROUTER_API_KEY/OPENROUTER_BASE_URL credential, which this
+        # class does not otherwise touch -- WildClawBench tasks that declare
+        # it get it via their own "## Env" section (_start_container's
+        # extra_env), reading the host process's OPENROUTER_* directly.
+        self.agent_api_key = agent_api_key or os.environ.get("GLOBAL_API_KEY", "")
+        self.agent_base_url = agent_base_url
         self.brave_api_key = brave_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     @property
@@ -326,8 +336,8 @@ class HermesAgentAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _resolve_runtime_provider(self, model: str, models_config: dict | None) -> tuple[str, str]:
-        api_key = self.openrouter_api_key
-        base_url = self.openrouter_base_url
+        api_key = self.agent_api_key
+        base_url = self.agent_base_url
         config_key, config_base_url = self._resolve_provider_config(model, models_config)
         if config_key:
             api_key = config_key

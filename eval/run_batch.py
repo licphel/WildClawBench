@@ -76,6 +76,17 @@ OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
 OPENROUTER_BASE_URL_CLAUDECODE = normalize_openrouter_base_url_for_claudecode(
     os.environ.get("OPENROUTER_BASE_URL", "")
 )
+# The agent's own model-provider credential (independent of OPENROUTER_*
+# above, which is the LLM-judge / in-task-multimodal credential). Set by
+# run_claudecode.sh/run_hermesagent.sh (GLOBAL_API_KEY/GLOBAL_API_BASE),
+# mirroring run_pylm.sh's pylm_provider_setup.py naming. Codex reads these
+# straight from the environment inside CodexAgent.__init__ instead of
+# through an explicit constructor arg here; OpenClaw's active "proxy"
+# provider gets its credential from --models-config, not from these agent
+# vars or from OPENROUTER_*.
+GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "")
+GLOBAL_API_BASE = os.environ.get("GLOBAL_API_BASE", "")
+GLOBAL_API_BASE_CLAUDECODE = normalize_openrouter_base_url_for_claudecode(GLOBAL_API_BASE)
 MODELS_API_KEY_PLACEHOLDER = "${GATEWAY_TOKEN}"
 
 #: Baselines graded even when the run reported an error, so a failed task keeps
@@ -586,16 +597,18 @@ def main() -> None:
     )
     if args.agent_backend == "claudecode":
         backend: BaseAgent = ClaudeCodeAgent(
-            anthropic_api_key=OPENROUTER_API_KEY,
-            openrouter_base_url=OPENROUTER_BASE_URL_CLAUDECODE
+            anthropic_api_key=GLOBAL_API_KEY,
+            anthropic_base_url=GLOBAL_API_BASE_CLAUDECODE,
+            openrouter_api_key=OPENROUTER_API_KEY,
+            openrouter_base_url=OPENROUTER_BASE_URL_CLAUDECODE,
         )
     elif args.agent_backend == "codex":
         backend = CodexAgent()
     elif args.agent_backend == "hermesagent":
         from src.agents.hermesagent import HermesAgentAgent
         backend = HermesAgentAgent(
-            openrouter_api_key=OPENROUTER_API_KEY,
-            openrouter_base_url=OPENROUTER_BASE_URL_OPENCLAW,
+            agent_api_key=GLOBAL_API_KEY,
+            agent_base_url=GLOBAL_API_BASE or "https://openrouter.ai/api/v1",
         )
     elif args.agent_backend == "pylm":
         backend = PyLMAgent()
