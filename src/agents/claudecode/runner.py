@@ -50,6 +50,7 @@ class ClaudeCodeAgent(BaseAgent):
         image: str | None = None,
         anthropic_api_key: str = "",
         anthropic_base_url: str = "",
+        openrouter_api_key: str = "",
         openrouter_base_url: str = "",
     ) -> None:
         self.image = (image or os.environ.get("DOCKER_IMAGE_CLAUDECODE", "")).strip()
@@ -57,13 +58,27 @@ class ClaudeCodeAgent(BaseAgent):
             raise ValueError(
                 "DOCKER_IMAGE_CLAUDECODE must be set when no Claude Code image is passed"
             )
+        # The agent's own model-provider credential (ANTHROPIC_API_KEY /
+        # ANTHROPIC_BASE_URL, injected into the container below).
+        # Independent of openrouter_api_key/openrouter_base_url, which is the
+        # LLM-judge / in-task-multimodal credential ~75% of WildClawBench
+        # tasks declare. GLOBAL_API_KEY/GLOBAL_API_BASE mirrors run_pylm.sh's
+        # pylm_provider_setup.py naming.
         explicit_api_key = anthropic_api_key.strip()
-        self.api_key = explicit_api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self.api_key = explicit_api_key or os.environ.get("GLOBAL_API_KEY", "")
+        explicit_base_url = anthropic_base_url.strip()
+        self.api_base_url = (
+            explicit_base_url.rstrip("/") if explicit_base_url
+            else normalize_openrouter_base_url_for_claudecode(
+                os.environ.get("GLOBAL_API_BASE", "")
+            )
+        )
+        self.openrouter_api_key = (
+            openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        ).strip()
         self.openrouter_base_url = normalize_openrouter_base_url_for_claudecode(
             openrouter_base_url or os.environ.get("OPENROUTER_BASE_URL", "")
         )
-        explicit_base_url = anthropic_base_url.strip()
-        self.api_base_url = explicit_base_url.rstrip("/") if explicit_base_url else self.openrouter_base_url
 
     @property
     def expects_gateway(self) -> bool:
@@ -502,7 +517,9 @@ class ClaudeCodeAgent(BaseAgent):
             # ClaudeCode's built-in WebSearchTool and other side queries use
             # getSmallFastModel(); route them through the benchmark model.
             "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model,
-            "OPENROUTER_API_KEY": self.api_key,
+            # LLM-judge / in-task-multimodal credential -- independent of
+            # ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL above.
+            "OPENROUTER_API_KEY": self.openrouter_api_key,
             "OPENROUTER_BASE_URL": self.openrouter_base_url,
             # Keep the official CLI's fixed sandbox/compatibility flags; do
             # not expose prompt-cache or reasoning overrides as environment
