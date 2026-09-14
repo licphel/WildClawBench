@@ -45,6 +45,7 @@ from src.utils.transient_errors import (
     should_retry_attempt,
 )
 from src.utils import gateway_usage
+from credential_resolution import ensure_wildclaw_judge_env
 
 load_dotenv()
 logging.basicConfig(
@@ -67,6 +68,16 @@ OUTPUT_DIR       = ROOT_DIR / os.environ.get("OUTPUT_SUBDIR", "output")
 
 DEFAULT_MODEL    = "gpt-5.6-terra"
 DEFAULT_PARALLEL = 1
+
+# Hard requirement, regardless of how this script was invoked: resolve
+# JUDGE_MODEL/OPENROUTER_API_KEY/OPENROUTER_BASE_URL (same precedence as
+# config_lib.sh's resolve_judge_env bash function) or fail loudly. See
+# credential_resolution.py's module docstring for the full rationale --
+# this is what stops a direct `python eval/run_batch.py` invocation (i.e.
+# bypassing every run_*.sh launcher) from silently running every judge
+# call and usage probe with empty credentials, which is exactly what
+# corrupted a prior benchmark run's scores.
+ensure_wildclaw_judge_env()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
