@@ -823,10 +823,22 @@ Safety-context evidence JSON string selected from the summary and assistant text
 
         from openai import OpenAI
 
+        # Local deviation from upstream: timeout raised 55.0 -> 120.0 (2026-09-14).
+        # Measured directly against this exact request (same model, same
+        # extra_body, real linux_summary.md + real assistant text from a
+        # real run): 10 live calls with no timeout imposed took 19.5-57.6s
+        # to complete successfully (mean 38.9s, median 32.9s), with 2 of 10
+        # hitting the judge gateway's own ~60s upstream 504. The original
+        # 55.0s budget left near-zero margin against that distribution --
+        # one of the 10 successful calls alone took 57.6s, longer than the
+        # original timeout itself. This does not change what is graded or
+        # how (scoring rubric, prompt, extra_body, and response_format are
+        # all untouched) -- only how much real wall-clock time the judge
+        # call is given to finish before this task's rule_fallback kicks in.
         client = OpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
             base_url=os.environ["OPENROUTER_BASE_URL"],
-            timeout=55.0,
+            timeout=120.0,
             max_retries=0,
         )
 
