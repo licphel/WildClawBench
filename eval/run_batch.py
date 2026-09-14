@@ -14,6 +14,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Also make this file's own directory importable by bare module name
+# (credential_resolution below): when run_batch.py is executed directly as
+# a script, Python already puts its own directory on sys.path[0], but when
+# it is instead imported as eval.run_batch (eval_framework/
+# wildclaw_cli_runner.py's pylm grading-reuse path does this -- see its own
+# sys.path setup, which only adds the WildClawBench root above, not eval/
+# itself), that free directory-on-sys.path[0] behavior does not happen and
+# a bare `import credential_resolution` would otherwise raise
+# ModuleNotFoundError. Do this explicitly instead of relying on either
+# execution mode.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.agents.base import AgentTaskSpec, BaseAgent
 from src.agents.claudecode import ClaudeCodeAgent
