@@ -191,7 +191,16 @@ class CodexAgent(BaseAgent):
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         elapsed_time = float(spec.timeout_seconds)
-        start_time = time.perf_counter()
+        # start_time is set later, right before the real prompt execution
+        # begins -- see the assignment above write_execution_status(...,
+        # status="codex_running"). Container start, posture recording,
+        # workspace prep, skills, warmup, and config writing all happen
+        # before that point and must not eat into spec.timeout_seconds,
+        # the declared *task execution* budget -- matching the pattern
+        # already used by openclaw (gateway startup has its own separate
+        # OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS) and hermesagent
+        # (start_time is likewise set only after all setup completes).
+        start_time: float | None = None
         task_id = spec.task_id
         initialize_host_run_artifacts(
             output_dir=spec.output_dir,
@@ -284,6 +293,7 @@ class CodexAgent(BaseAgent):
                     self._install_image_helper(task_id, spec.model)
                 snapshot_workspace_state(task_id)
                 write_execution_status(spec.output_dir, status="codex_running")
+                start_time = time.perf_counter()
                 wrapper_retry_seconds = self._run_prompt(
                     task_id=task_id,
                     prompt=self._build_task_prompt(
@@ -351,7 +361,13 @@ class CodexAgent(BaseAgent):
                     excluded_retry_time=retry_time_holder["excluded_retry_time"],
                 )
             except Exception as exc:
-                elapsed_time = time.perf_counter() - start_time
+                # start_time is None if setup itself raised before the real
+                # prompt execution began -- report 0.0 rather than crash on
+                # None - float; this path is now reachable exactly because
+                # setup no longer shares start_time with execution.
+                elapsed_time = (
+                    time.perf_counter() - start_time if start_time is not None else 0.0
+                )
                 logger.error("[%s] Codex execution error: %s", task_id, exc)
                 append_agent_log_event(
                     spec.output_dir,

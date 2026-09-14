@@ -171,7 +171,14 @@ class ClaudeCodeAgent(BaseAgent):
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
         elapsed_time = 0.0
-        start_time = time.perf_counter()
+        # start_time is set only after setup completes, right before the
+        # real prompt execution begins -- container start, workspace prep,
+        # skills, warmup, and the workspace snapshot must not eat into
+        # spec.timeout_seconds, the declared *task execution* budget.
+        # Matches the pattern already used by openclaw (its gateway startup
+        # has its own separate OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS) and
+        # hermesagent (start_time is likewise set only after setup).
+        start_time: float | None = None
         task_id = spec.task_id
         # _run_prompt only returns excluded_retry_time on success (rc==0); a
         # RuntimeError/TimeoutExpired it raises loses that return value, so
@@ -191,6 +198,7 @@ class ClaudeCodeAgent(BaseAgent):
             )
             run_warmup(task_id, spec.task.get("warmup", ""))
             snapshot_workspace_state(task_id)
+            start_time = time.perf_counter()
             wrapper_retry_seconds = self._run_prompt(
                 task_id,
                 spec.prompt,
@@ -241,7 +249,13 @@ class ClaudeCodeAgent(BaseAgent):
             # launched, but protects the native log if an unexpected wrapper
             # exception occurs while the in-container process is still live.
             self._flush_timed_out_run(task_id)
-            elapsed_time = max(0.0, time.perf_counter() - start_time)
+            # start_time is None if setup itself raised before the real
+            # prompt execution began -- report 0.0 rather than crash on
+            # None - float; this path is now reachable exactly because
+            # setup no longer shares start_time with execution.
+            elapsed_time = (
+                max(0.0, time.perf_counter() - start_time) if start_time is not None else 0.0
+            )
             return AgentExecution(
                 elapsed_time=elapsed_time,
                 error=str(exc),
