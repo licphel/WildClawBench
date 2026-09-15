@@ -210,12 +210,27 @@ def setup_skills(
     skills_path: str,
     container_skills_root: str = "/root/skills",
 ) -> None:
+    # Same failure class as run_warmup/setup_workspace: no timeout on any of
+    # this function's three `docker exec`/`docker cp` calls means a stall
+    # (observed: the whole task silently hanging here, past `setup_workspace`'s
+    # "Copying /app" log line with nothing further logged -- this function has
+    # no logging of its own) blocks until the caller's much longer per-task
+    # watchdog kills the whole run. 120s matches setup_workspace's own bound
+    # for the same kind of local docker exec/cp operation.
+    _SKILLS_STEP_TIMEOUT = 120
     container_skills_root = container_skills_root.rstrip("/")
-    subprocess.run(
-        ["docker", "exec", task_id, "mkdir", "-p", container_skills_root],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        subprocess.run(
+            ["docker", "exec", task_id, "mkdir", "-p", container_skills_root],
+            capture_output=True,
+            text=True,
+            timeout=_SKILLS_STEP_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"[{task_id}] Creating skills root {container_skills_root} timed out "
+            f"after {exc.timeout:.0f}s (no output captured)"
+        ) from exc
     seen_dest_names: set[str] = set()
     for line in skills.splitlines():
         line = line.strip()
@@ -235,16 +250,24 @@ def setup_skills(
             )
             continue
         seen_dest_names.add(dest_name)
-        subprocess.run(
-            ["docker", "exec", task_id,
-             "mkdir", "-p", f"{container_skills_root}/{dest_name}"],
-            capture_output=True, text=True,
-        )
-        r = subprocess.run(
-            ["docker", "cp",
-             f"{skills_path}/{src_rel}/.", f"{task_id}:{container_skills_root}/{dest_name}/"],
-            capture_output=True, text=True,
-        )
+        try:
+            subprocess.run(
+                ["docker", "exec", task_id,
+                 "mkdir", "-p", f"{container_skills_root}/{dest_name}"],
+                capture_output=True, text=True,
+                timeout=_SKILLS_STEP_TIMEOUT,
+            )
+            r = subprocess.run(
+                ["docker", "cp",
+                 f"{skills_path}/{src_rel}/.", f"{task_id}:{container_skills_root}/{dest_name}/"],
+                capture_output=True, text=True,
+                timeout=_SKILLS_STEP_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"[{task_id}] Copying skill {line!r} to {container_skills_root}/{dest_name} "
+                f"timed out after {exc.timeout:.0f}s (no output captured)"
+            ) from exc
         if r.returncode != 0:
             logger.warning(
                 "[%s] Failed to copy skill %s to %s/%s: %s",
