@@ -164,11 +164,23 @@ def start_container(task_id: str, workspace_path: str, extra_env: str = "",
 
 def setup_workspace(task_id: str, thinking: str | None = None) -> None:
     logger.info("[%s] Copying /app → %s", task_id, TMP_WORKSPACE)
-    r = subprocess.run(
-        ["docker", "exec", task_id, "/bin/bash", "-c",
-         f"cp -r /app/. {TMP_WORKSPACE} && chmod -R u+w {TMP_WORKSPACE}"],
-        capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c",
+             f"cp -r /app/. {TMP_WORKSPACE} && chmod -R u+w {TMP_WORKSPACE}"],
+            capture_output=True, text=True,
+            # Local disk I/O, not network, but no timeout here means the same
+            # failure mode as the network-bound steps: a stall (e.g. under
+            # host disk pressure) blocks silently until the caller's own
+            # much longer watchdog fires, with nothing logged in between.
+            # No retry (unlike run_warmup/uv sync) -- a stuck `cp`/`chmod` on
+            # local disk isn't the kind of transient blip a retry fixes.
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Workspace copy timed out after {exc.timeout:.0f}s (no output captured)"
+        ) from exc
     if r.returncode != 0:
         raise RuntimeError(f"Workspace copy failed:\n{r.stderr}")
 
@@ -304,6 +316,14 @@ def run_warmup(
     retry_delay = 10.0
     max_retries = 5
     retry_desc = str(max_retries)
+    # A warmup command with no timeout that stalls (observed: `npm install`
+    # against the container-side proxy going silent mid-fetch, no error, no
+    # data) blocks here indefinitely -- the retry loop below never gets a
+    # second attempt, and whatever caller wraps this doesn't find out until
+    # its own much longer watchdog fires. 180s comfortably covers the
+    # slowest legitimate warmup steps seen (apt-get with build deps, pip/npm
+    # installs) while still leaving room to retry inside the per-task budget.
+    attempt_timeout = 180.0
 
     logger.info(
         "[%s] Running warmup (%d commands, retries=%s, retry_delay=%.1fs)",
@@ -337,15 +357,20 @@ def run_warmup(
                     f"nohup /bin/bash -c {shlex.quote(background_cmd)} "
                     f"> {shlex.quote(log_path)} 2>&1 < /dev/null &"
                 )
-                r = subprocess.run(
-                    ["docker", "exec", task_id, "/bin/bash", "-c", wrapped],
-                    capture_output=True,
-                    text=True,
-                )
+                exec_cmd = ["docker", "exec", task_id, "/bin/bash", "-c", wrapped]
             else:
+                exec_cmd = ["docker", "exec", task_id, "/bin/bash", "-c", cmd]
+
+            try:
                 r = subprocess.run(
-                    ["docker", "exec", task_id, "/bin/bash", "-c", cmd],
-                    capture_output=True, text=True,
+                    exec_cmd, capture_output=True, text=True, timeout=attempt_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                r = subprocess.CompletedProcess(
+                    exec_cmd,
+                    returncode=-1,
+                    stdout="",
+                    stderr=f"docker exec timed out after {attempt_timeout:.0f}s (no output captured)",
                 )
 
             if r.returncode != 0:
