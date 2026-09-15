@@ -35,6 +35,11 @@ class AgentExecution:
     # task's usage.json as "excluded_retry_time" -- see run_batch.py -- to
     # match eval_framework/backends/*.py's raw["excluded_retry_time"].
     excluded_retry_time: float | None = None
+    # Deliberate external provider cooldown (currently the 60s
+    # rate-limit/overload wait). This is a subset of excluded_retry_time but
+    # is also surfaced separately because it is excluded from elapsed_time,
+    # not merely refunded from the next attempt's timeout budget.
+    excluded_provider_cooldown_time: float | None = None
 
 
 class BaseAgent(ABC):

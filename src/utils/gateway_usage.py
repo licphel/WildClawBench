@@ -73,7 +73,8 @@ codex        same
 hermesagent  opened *after* container start, prep, skills, warmup and the
              hermes config write -- agent only
 openclaw     opened after all setup and the gateway's 2s readiness sleep --
-             agent only
+             agent only; an explicit 60s provider rate-limit/overload cooldown
+             is excluded and recorded as ``excluded_provider_cooldown_time``
 pylm         the whole ``docker exec`` of the container entrypoint, so it
              excludes container start but includes the entrypoint's own
              provider setup and trajectory export
@@ -104,7 +105,10 @@ Each wrapper still *measures* the time its own retry attempts and backoff
 cost, because the **task budget** still refunds it: a run resumed after a
 transient provider error gets its full timeout of real work.  That refund is a
 fairness knob about how long the agent may run; it is not, any more, a
-subtraction from the number that gets reported.
+subtraction from the number that gets reported.  An explicit provider
+rate-limit/overload cooldown is the exception: it is an external wait,
+excluded from the active clock, and recorded separately as
+``excluded_provider_cooldown_time``.
 
 *Scope: not unified.*  claudecode and codex time the whole task including
 container startup; hermesagent, openclaw and pylm time the agent alone.  This
@@ -251,7 +255,10 @@ RUNTIME_DEFINITIONS = {
                 "the wrapper's own resumed attempts are inside the number, and "
                 "so are the agent's internal ones -- for openclaw that is the "
                 "CLI reconnecting inside the container (MAX_RETRIES = 5, "
-                "1s/2s/4s/8s/16s backoff), which no wrapper ever saw",
+                "1s/2s/4s/8s/16s backoff), which no wrapper ever saw.  When "
+                "OpenClaw waits for an explicit provider rate-limit/overload "
+                "cooldown, that external wait is excluded and recorded in "
+                "excluded_provider_cooldown_time",
     },
     RUNTIME_CONTAINER_CLI_WITH_RETRIES: {
         "includes_container_setup": False,

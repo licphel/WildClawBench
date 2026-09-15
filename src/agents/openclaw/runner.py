@@ -15,9 +15,12 @@ from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.transient_errors import (
+    RATE_LIMIT_OVERLOAD_RETRY_DELAY_S,
     RESUME_ATTEMPTS,
     RESUME_BACKOFF_S,
+    rate_limit_or_overload_error,
     resumable_provider_error,
+    unbounded_provider_error,
 )
 from src.utils.docker_utils import (
     close_proc_log,
@@ -42,8 +45,9 @@ OPENCLAW_HOME = "/root/.openclaw"
 OPENCLAW_TRANSCRIPT_PATH = f"{OPENCLAW_HOME}/agents/main/sessions/chat.jsonl"
 
 # Ordinary same-session resumes retain the shared three-resume limit (see
-# transient_errors.RESUME_ATTEMPTS). The encrypted-session and
-# instant-inference quota signatures bypass it.
+# transient_errors.RESUME_ATTEMPTS). External provider state (encrypted
+# session, instant-inference quota, rate limit, or overload) bypasses it until
+# the upstream accepts a request or the operator stops the run.
 OPENCLAW_RESUME_ATTEMPTS: int | None = RESUME_ATTEMPTS
 OPENCLAW_RETRY_DELAY_SECONDS = RESUME_BACKOFF_S
 OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = 120.0
@@ -225,6 +229,18 @@ PY"""
         # except block below can always report it, even if a failure happens
         # before the agent loop starts accumulating retries.
         excluded_retry_time = 0.0
+        # A provider cooldown is outside both the task timeout and the
+        # reported active runtime. Failed agent attempts remain visible in
+        # elapsed_time; only the deliberate external wait is removed.
+        excluded_cooldown_time = 0.0
+
+        def active_elapsed() -> float:
+            if start_time is None:
+                return 0.0
+            return max(
+                0.0,
+                time.perf_counter() - start_time - excluded_cooldown_time,
+            )
 
         try:
             exec_path = os.path.join(spec.workspace_path, "exec")
@@ -372,18 +388,18 @@ PY"""
                         error="OpenClaw run timed out",
                         gateway_proc=gateway_proc,
                         agent_proc=agent_proc,
+                        excluded_retry_time=excluded_retry_time,
+                        excluded_provider_cooldown_time=excluded_cooldown_time,
                     )
                 attempt_elapsed = time.perf_counter() - attempt_started
-                # Retry time stays INSIDE elapsed_time, deliberately; see the
-                # note in the claudecode runner.  This runner could never
-                # deduct the openclaw CLI's own reconnects (MAX_RETRIES = 5
-                # with 1s/2s/4s/8s/16s backoff, in
-                # baselines/openclaw/src/agents/openai-ws-connection.ts)
-                # anyway, so deducting only the wrapper's half made the number
-                # neither inclusive nor exclusive.  excluded_retry_time is
-                # still accumulated: the task budget still refunds a resumed
-                # attempt.
-                elapsed_time = time.perf_counter() - start_time
+                # Ordinary retry time stays INSIDE elapsed_time, deliberately;
+                # OpenClaw's own reconnects happen inside the CLI and cannot
+                # be observed by this wrapper.  The one explicit exception is
+                # the provider cooldown above: active_elapsed() removes that
+                # external wait from both the task clock and the reported
+                # runtime. excluded_retry_time still refunds every resumed
+                # sub-attempt from the next attempt's task budget.
+                elapsed_time = active_elapsed()
                 if agent_proc.returncode == 0:
                     logger.info(
                         "[%s] Agent finished successfully, elapsed: %.2f seconds",
@@ -401,6 +417,7 @@ PY"""
                 if (
                     OPENCLAW_RESUME_ATTEMPTS is not None
                     and resume_attempt >= OPENCLAW_RESUME_ATTEMPTS
+                    and unbounded_provider_error(provider_error_reason) is None
                 ):
                     raise RuntimeError(
                         f"OpenClaw agent failed after a provider error "
@@ -412,6 +429,19 @@ PY"""
                         f"OpenClaw agent failed after a provider error "
                         f"({provider_error_reason}) and no useful time remains for resume"
                     )
+                cooldown_reason = rate_limit_or_overload_error(provider_error_reason)
+                if cooldown_reason is not None:
+                    cooldown_started = time.perf_counter()
+                    logger.warning(
+                        "[%s] Provider %s; cooling down for %.1fs before same-session resume",
+                        spec.task_id,
+                        cooldown_reason,
+                        RATE_LIMIT_OVERLOAD_RETRY_DELAY_S,
+                    )
+                    time.sleep(RATE_LIMIT_OVERLOAD_RETRY_DELAY_S)
+                    cooldown_elapsed = time.perf_counter() - cooldown_started
+                    excluded_retry_time += cooldown_elapsed
+                    excluded_cooldown_time += cooldown_elapsed
                 if OPENCLAW_RETRY_DELAY_SECONDS > 0:
                     delay_started = time.perf_counter()
                     time.sleep(OPENCLAW_RETRY_DELAY_SECONDS)
@@ -424,7 +454,11 @@ PY"""
                     spec.task_id,
                     provider_error_reason,
                     resume_attempt,
-                    OPENCLAW_RESUME_ATTEMPTS or "unlimited",
+                    (
+                        "unlimited"
+                        if unbounded_provider_error(provider_error_reason)
+                        else OPENCLAW_RESUME_ATTEMPTS or "unlimited"
+                    ),
                 )
 
             logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)
@@ -434,6 +468,7 @@ PY"""
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
                 excluded_retry_time=excluded_retry_time,
+                excluded_provider_cooldown_time=excluded_cooldown_time,
             )
         except subprocess.TimeoutExpired:
             # This covers a deadline reached between retry attempts, before a
@@ -447,6 +482,7 @@ PY"""
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
                 excluded_retry_time=excluded_retry_time,
+                excluded_provider_cooldown_time=excluded_cooldown_time,
             )
         except Exception as exc:
             logger.error("[%s] Execution error: %s", spec.task_id, exc)
@@ -455,13 +491,14 @@ PY"""
                 # transcript in a settled state before collect_usage runs.
                 self._flush_timed_out_run(spec.task_id, agent_proc)
             if start_time is not None:
-                elapsed_time = max(0.0, time.perf_counter() - start_time)
+                elapsed_time = active_elapsed()
             return AgentExecution(
                 elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=gateway_proc,
                 agent_proc=agent_proc,
                 excluded_retry_time=excluded_retry_time,
+                excluded_provider_cooldown_time=excluded_cooldown_time,
             )
 
     @staticmethod

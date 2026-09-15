@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -52,8 +53,11 @@ from src.utils.grading import (
 )
 from src.utils.transient_errors import (
     MAX_TASK_ATTEMPTS,
+    RATE_LIMIT_OVERLOAD_RETRY_DELAY_S,
     attempt_evidence,
+    rate_limit_or_overload_error,
     should_retry_attempt,
+    unbounded_provider_error,
 )
 from src.utils import gateway_usage
 from credential_resolution import ensure_wildclaw_judge_env
@@ -339,6 +343,7 @@ def run_single_task(
     # A float (0.0 included) means the backend computed it; see
     # AgentExecution.excluded_retry_time in src/agents/base.py.
     excluded_retry_time: float | None = None
+    excluded_provider_cooldown_time: float | None = None
 
     # The inference gateway sees every request on the wire, so it is the one
     # counter that means the same thing for all five baselines.  It is a
@@ -376,6 +381,7 @@ def run_single_task(
         agent_proc = execution.agent_proc
         elapsed_time = execution.elapsed_time
         excluded_retry_time = execution.excluded_retry_time
+        excluded_provider_cooldown_time = execution.excluded_provider_cooldown_time
         if execution.error:
             result["error"] = execution.error
     except Exception as exc:
@@ -456,6 +462,10 @@ def run_single_task(
             # AgentExecution.excluded_retry_time; matches the field name
             # eval_framework/backends/*.py writes as raw["excluded_retry_time"].
             usage["excluded_retry_time"] = round(excluded_retry_time, 2)
+        if excluded_provider_cooldown_time is not None:
+            usage["excluded_provider_cooldown_time"] = round(
+                excluded_provider_cooldown_time, 2
+            )
 
         # Label it and, where the gateway saw this task exclusively, let the
         # gateway's count take the top-level fields.  The backend's own numbers
@@ -568,11 +578,17 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
 
     result = run_single_task(*args, **kwargs)
     attempt = 1
+    unbounded = False
     while True:
         retry, why = should_retry_attempt(
             result.get("error"), attempt_evidence(result)
         )
-        if not retry or attempt > MAX_TRANSIENT_RETRIES:
+        # External provider state must not be converted into a finite task
+        # failure just because the first few attempts hit it consecutively.
+        # Keep this state across attempts so a later spelling of the same
+        # transient does not silently restore the ordinary cap.
+        unbounded = unbounded or bool(unbounded_provider_error(result.get("error")))
+        if not retry or (not unbounded and attempt > MAX_TRANSIENT_RETRIES):
             if result.get("error"):
                 logger.info(
                     "[%s] Kept as the measurement, not retried: %s",
@@ -594,6 +610,17 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
             "[%s] Rebuilding container after an upstream inference anomaly: %s",
             result.get("task_id"), why,
         )
+        cooldown_reason = rate_limit_or_overload_error(result.get("error"))
+        if cooldown_reason is None:
+            cooldown_reason = rate_limit_or_overload_error(why)
+        if cooldown_reason is not None:
+            logger.warning(
+                "[%s] Provider %s; cooling down for %.1fs before fresh task retry",
+                result.get("task_id"),
+                cooldown_reason,
+                RATE_LIMIT_OVERLOAD_RETRY_DELAY_S,
+            )
+            time.sleep(RATE_LIMIT_OVERLOAD_RETRY_DELAY_S)
         result = run_single_task(*args, **kwargs)
         attempt += 1
     if result.get("error") and attempt > 1:

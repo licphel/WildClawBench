@@ -99,6 +99,25 @@ UNRECOVERABLE_SESSION_PATTERNS = (
     "quota for instant inference",
 )
 
+# Upstream account/scheduler refusals that deserve a deliberate cooldown
+# before the next request.  These strings are deliberately specific: a plain
+# task transcript can mention "overload" without the provider having refused
+# the current request, but these forms are emitted by the relay/SDK error
+# paths we are classifying.
+RATE_LIMIT_OVERLOAD_PATTERNS = (
+    "rate_limit_exceeded",
+    "rate limit exceeded",
+    "api rate limit reached",
+    "too many requests",
+    "http 429",
+    "status 429",
+    "server_is_overloaded",
+    "server is overloaded",
+    "api overloaded",
+    "api overload",
+    "current group has no available channels",
+)
+
 # Failures upstream of the agent that a running agent may still recover from
 # on its own: the provider, the relay in front of it, or the socket between
 # them. They justify a resume once the run has actually exited non-zero, but
@@ -136,11 +155,6 @@ UPSTREAM_FAILURE_PATTERNS = (
     "HTTP 500",
     "502 Bad Gateway",
     "503 Service Unavailable",
-    # The relay refusing to route because every upstream channel in the group
-    # is busy or cooling down. Same class as "Upstream service temporarily
-    # unavailable" -- observed in claudecode runs, which carried this marker
-    # in its own now-removed list.
-    "current group has no available channels",
     # perdura's own retry-exhausted summary (see
     # perdura/infra/runtime/execution/step_decision_provider.py). A single
     # slow/hanging upstream call can consume the whole step deadline on its
@@ -166,6 +180,7 @@ UPSTREAM_FAILURE_PATTERNS = (
     # measurement of an agent that never got to run.
     "APIConnectionError",
     "APITimeoutError",
+    *RATE_LIMIT_OVERLOAD_PATTERNS,
 )
 
 PROVIDER_ERROR_PATTERNS = UNRECOVERABLE_SESSION_PATTERNS + UPSTREAM_FAILURE_PATTERNS
@@ -173,7 +188,9 @@ PROVIDER_ERROR_PATTERNS = UNRECOVERABLE_SESSION_PATTERNS + UPSTREAM_FAILURE_PATT
 # These failures are not agent measurements: the current upstream session or
 # instant-inference allocation is unusable.  The caller must keep retrying the
 # provider path rather than spending a finite task-attempt budget on it.
-UNBOUNDED_RETRY_PATTERNS = UNRECOVERABLE_SESSION_PATTERNS
+UNBOUNDED_RETRY_PATTERNS = (
+    UNRECOVERABLE_SESSION_PATTERNS + RATE_LIMIT_OVERLOAD_PATTERNS
+)
 
 # A task that ran out of wall-clock. Deliberately matched on the generic
 # phrasing rather than any one harness's wording ("pylm run timed out
@@ -307,6 +324,12 @@ def _matched_pattern(error: str | None, patterns: tuple[str, ...]) -> str | None
         if pattern.lower() in lowered:
             return pattern
     return None
+
+
+def rate_limit_or_overload_error(output: str | None) -> str | None:
+    """Return the provider cooldown signature in ``output``, if any."""
+
+    return _matched_pattern(output, RATE_LIMIT_OVERLOAD_PATTERNS)
 
 
 def is_transient_error(error: str | None) -> bool:
@@ -604,12 +627,16 @@ MAX_TASK_ATTEMPTS_RESUMABLE_PROVIDER_ERROR = 3
 #: measuring nothing at all.  Zero is the value the data supports.
 RESUME_BACKOFF_S = 0.0
 
-#: Same-session provider recovery is bounded at three resumes, including
-#: the two external-state signatures in ``UNBOUNDED_RETRY_PATTERNS`` --
-#: ``unbounded_provider_error`` still classifies them as external state (not
-#: an agent measurement) for logging/evidence purposes, but no caller bypasses
-#: this cap for them; three resumes is the shared limit for everyone.
+#: Same-session provider recovery is bounded at three resumes for ordinary
+#: transport failures.  Callers may bypass this cap for signatures returned by
+#: ``unbounded_provider_error``: encrypted-session/quota state and explicit
+#: rate-limit/overload refusals are external conditions, not agent work.
 RESUME_ATTEMPTS: int | None = 3
+
+# A provider rate-limit/overload cooldown is outside the WildClaw task clock.
+# Runners add the measured sleep to their excluded retry time and report the
+# active agent span, so this is not a hidden extension of the model's budget.
+RATE_LIMIT_OVERLOAD_RETRY_DELAY_S = 60.0
 
 
 def should_resume_in_session(error: str | None) -> bool:
