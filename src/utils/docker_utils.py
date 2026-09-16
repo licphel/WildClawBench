@@ -603,24 +603,57 @@ def inject_lobster_workspace(task_id: str, workspace_path: str) -> None:
 
 
 def _copy_dir_from_container(task_id: str, src: str, dest: str) -> bool:
-    r = subprocess.run(
-        ["docker", "cp", f"{task_id}:{src}", dest],
-        capture_output=True, text=True,
-    )
-    if r.returncode == 0:
+    dest_path = Path(dest)
+    dest_path.mkdir(parents=True, exist_ok=True)
+    src_dir = src
+    if src.endswith("/."):
+        src_dir = src[:-2]
+    elif src.endswith("/"):
+        src_dir = src.rstrip("/")
+    if _extract_container_tree(task_id, src_dir, dest_path):
         logger.info("[%s] Collected container directory %s → %s", task_id, src, dest)
         return True
     return False
 
 
 def _copy_file_from_container(task_id: str, src: str, dest: Path) -> bool:
-    r = subprocess.run(
-        ["docker", "cp", f"{task_id}:{src}", str(dest)],
-        capture_output=True,
-        text=True,
-    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as out:
+        r = subprocess.run(
+            ["docker", "exec", task_id, "cat", src],
+            stdout=out,
+            stderr=subprocess.PIPE,
+        )
     if r.returncode == 0:
         logger.info("[%s] Collected container file %s → %s", task_id, src, dest)
         return True
-    logger.warning("[%s] Container file copy failed (%s): %s", task_id, src, r.stderr.strip())
+    dest.unlink(missing_ok=True)
+    stderr = (r.stderr or b"").decode("utf-8", "replace").strip()
+    logger.warning("[%s] Container file copy failed (%s): %s", task_id, src, stderr)
     return False
+
+
+def _extract_container_tree(task_id: str, src_dir: str, dest: Path) -> bool:
+    """Copy a container directory onto the host as the calling user.
+
+    ``docker cp`` is written by dockerd and materializes dest as root. The
+    host-side ``tar -x`` in this pipe creates the files, so they belong to
+    the evaluator. Used after a concurrent fanout tears down staging: a
+    root-owned restage made score.json unwritable.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    producer = subprocess.Popen(
+        ["docker", "exec", task_id, "tar", "-C", src_dir, "-cf", "-", "."],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if producer.stdout is None:
+        return False
+    consumer = subprocess.run(
+        ["tar", "-x", "--no-same-owner", "-C", str(dest), "-f", "-"],
+        stdin=producer.stdout,
+        capture_output=True,
+    )
+    producer.stdout.close()
+    _ignored, _prod_err = producer.communicate()
+    return producer.returncode == 0 and consumer.returncode == 0
