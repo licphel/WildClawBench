@@ -39,7 +39,7 @@ This module's ``ensure_wildclaw_judge_env`` implements the *exact same*
 precedence as ``config_lib.sh``'s bash ``resolve_judge_env`` function (read
 that function's own large comment block for the full rationale):
 
-  1. ``JUDGE_MODEL`` defaults to ``gpt-5.5`` (see
+  1. ``JUDGE_MODEL`` defaults to ``gpt-5.6-terra`` (see
      ``_default_judge_model_from_config_lib`` below for how that default is
      kept in sync with bash rather than copy-pasted) unless already set.
   2. If the resolved ``JUDGE_MODEL`` differs from ``RUNNER_MODEL`` (the
@@ -87,7 +87,7 @@ class WildClawCredentialError(RuntimeError):
 # Keep this equal to config_lib.sh's _WILDCLAW_DEFAULT_JUDGE_MODEL; it is
 # used only if that file cannot be found/parsed (e.g. this repo checked out
 # standalone, without the outer PyLM_Eval_why repo alongside it).
-_FALLBACK_DEFAULT_JUDGE_MODEL = "gpt-5.5"
+_FALLBACK_DEFAULT_JUDGE_MODEL = "gpt-5.6-terra"
 
 _THIS_FILE = Path(__file__).resolve()
 # WildClawBench root (mirrors run_batch.py's own ROOT_DIR).

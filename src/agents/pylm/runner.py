@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from src.agents.approval_posture import PERDURA as PERDURA_POSTURE, record as record_posture
@@ -40,24 +41,11 @@ class PyLMAgent(BaseAgent):
         return self.transcript_path
 
     def prepare_grading_transcript(self, task_id: str) -> str:
-        """Convert Perdura's own trajectory export into the shared grading
-        transcript, mirroring OpenClawAgent/ClaudeCodeAgent/HermesAgentAgent's
-        own ``prepare_grading_transcript``.
+        """Push live Perdura assistant text into the shared grading transcript.
 
-        Perdura never writes ``transcript_path`` natively -- unlike OpenClaw,
-        the baseline the path convention is named after -- so without this,
-        grading would only ever see whatever
-        ``eval_framework.wildclaw_cli_container_entry._write_transcript``'s
-        dead Codex-log regex fallback produced. The actual conversion (locate
-        the exported ``pylm-trajectory.zip`` inside the still-running
-        container, read its ``canonical/chat.jsonl`` member, map it into the
-        openclaw compat shape, and push it back in at ``transcript_path``)
-        lives in ``eval_framework.wildclaw_cli_runner.
-        prepare_pylm_grading_transcript`` so both this (run_batch.py's
-        multi-task loop) and that module's own single-task ``run_cli_task``
-        share one implementation. See that function's docstring for the
-        empty-channel and failure fallbacks -- both leave ``transcript_path``
-        unchanged rather than making grading worse.
+        Scoring does not read the review zip. The converter lives in
+        ``eval_framework.wildclaw_cli_runner.prepare_pylm_grading_transcript``
+        so run_batch and ``run_cli_task`` share one path.
         """
         cli_runner = self._import_cli_runner()
         return cli_runner.prepare_pylm_grading_transcript(task_id, self.transcript_path)
@@ -69,10 +57,12 @@ class PyLMAgent(BaseAgent):
 
     @classmethod
     def _import_cli_runner(cls):
-        root = cls._repo_root()
-        root_text = str(root)
+        # PYTHONPATH must win. resolve() on this file follows the WildClawBench
+        # gitlink/symlink into the main checkout and insert(0) would shadow a
+        # worktree eval_framework (which is how the venv-cache skip gets lost).
+        root_text = str(cls._repo_root())
         if root_text not in sys.path:
-            sys.path.insert(0, root_text)
+            sys.path.append(root_text)
         import eval_framework.wildclaw_cli_runner as cli_runner
 
         return cli_runner
@@ -130,6 +120,8 @@ class PyLMAgent(BaseAgent):
         if staging is not None:
             self._staging_dirs[spec.task_id] = staging
 
+        in_setup = True
+        setup_started = time.perf_counter()
         try:
             cli_runner._start_container_with_live_mounts(
                 start_container,
@@ -153,6 +145,20 @@ class PyLMAgent(BaseAgent):
                 str(spec.task.get("warmup") or ""),
                 detach_background=True,
             )
+            setup_elapsed = time.perf_counter() - setup_started
+            setup_budget = cli_runner.WILDCLAW_HOST_SETUP_MAX_SECONDS
+            if setup_elapsed > setup_budget:
+                return AgentExecution(
+                    elapsed_time=setup_elapsed,
+                    error=(
+                        f"WildClaw setup phase exceeded its {setup_budget:.0f}s "
+                        f"budget after {setup_elapsed:.0f}s (container start, "
+                        "workspace, skills, warmup); agent was not started"
+                    ),
+                    gateway_proc=None,
+                    agent_proc=None,
+                )
+            in_setup = False
 
             # Default from src/agents/approval_posture.py rather than a
             # literal here, so the declared posture and the launched one cannot
@@ -209,6 +215,13 @@ class PyLMAgent(BaseAgent):
             )
         except Exception as exc:
             self._summaries[spec.task_id] = {}
+            if in_setup:
+                return AgentExecution(
+                    elapsed_time=time.perf_counter() - setup_started,
+                    error=f"WildClaw setup failed before agent start: {exc}",
+                    gateway_proc=None,
+                    agent_proc=None,
+                )
             return AgentExecution(
                 elapsed_time=float(spec.timeout_seconds),
                 error=str(exc),

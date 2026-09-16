@@ -42,7 +42,7 @@ def test_default_judge_model_falls_back_when_config_lib_missing(tmp_path):
     )
 
 
-def _no_dotenv_env(tmp_path, monkeypatch, config_lib_text='_WILDCLAW_DEFAULT_JUDGE_MODEL="gpt-5.5"\n'):
+def _no_dotenv_env(tmp_path, monkeypatch, config_lib_text='_WILDCLAW_DEFAULT_JUDGE_MODEL="gpt-5.6-terra"\n'):
     """Point the module at a tmp_path-scoped, deterministic .env/config_lib.sh
     pair instead of the real outer-repo files, so tests don't depend on --
     or risk touching -- the real shared .env.
@@ -57,17 +57,36 @@ def _no_dotenv_env(tmp_path, monkeypatch, config_lib_text='_WILDCLAW_DEFAULT_JUD
 
 def test_independent_judge_when_model_differs_and_openai_key_present(tmp_path, monkeypatch):
     _no_dotenv_env(tmp_path, monkeypatch)
-    env = {"RUNNER_MODEL": "gpt-5.6-terra", "OPENAI_API_KEY": "sk-openai"}
+    env = {
+        "RUNNER_MODEL": "gpt-5.6-terra",
+        "JUDGE_MODEL": "gpt-5.5",
+        "OPENAI_API_KEY": "sk-openai",
+    }
     cr.ensure_wildclaw_judge_env(env)
     assert env["JUDGE_MODEL"] == "gpt-5.5"
     assert env["OPENROUTER_API_KEY"] == "sk-openai"
     assert env["OPENROUTER_BASE_URL"] == "https://api.openai.com/v1"
 
 
+def test_default_judge_matches_runner_and_self_grades(tmp_path, monkeypatch):
+    _no_dotenv_env(tmp_path, monkeypatch)
+    env = {
+        "RUNNER_MODEL": "gpt-5.6-terra",
+        "OPENAI_API_KEY": "sk-openai",
+        "GATEWAY_TOKEN": "agent-key",
+        "GATEWAY_V1": "http://agent-gateway/v1",
+    }
+    cr.ensure_wildclaw_judge_env(env)
+    assert env["JUDGE_MODEL"] == "gpt-5.6-terra"
+    assert env["OPENROUTER_API_KEY"] == "agent-key"
+    assert env["OPENROUTER_BASE_URL"] == "http://agent-gateway/v1"
+
+
 def test_openai_base_url_takes_precedence_over_openai_api_base(tmp_path, monkeypatch):
     _no_dotenv_env(tmp_path, monkeypatch)
     env = {
         "RUNNER_MODEL": "gpt-5.6-terra",
+        "JUDGE_MODEL": "gpt-5.5",
         "OPENAI_API_KEY": "sk-openai",
         "OPENAI_BASE_URL": "https://openai.example/v1",
         "OPENAI_API_BASE": "https://ignored.example/v1",
@@ -80,6 +99,7 @@ def test_openai_api_base_used_when_openai_base_url_unset(tmp_path, monkeypatch):
     _no_dotenv_env(tmp_path, monkeypatch)
     env = {
         "RUNNER_MODEL": "gpt-5.6-terra",
+        "JUDGE_MODEL": "gpt-5.5",
         "OPENAI_API_KEY": "sk-openai",
         "OPENAI_API_BASE": "https://openai-base.example/v1",
     }
@@ -110,7 +130,7 @@ def test_missing_openai_key_falls_back_to_agent_gateway(tmp_path, monkeypatch):
         "GATEWAY_V1": "http://agent-gateway/v1",
     }
     cr.ensure_wildclaw_judge_env(env)
-    assert env["JUDGE_MODEL"] == "gpt-5.5"
+    assert env["JUDGE_MODEL"] == "gpt-5.6-terra"
     assert env["OPENROUTER_API_KEY"] == "agent-key"
     assert env["OPENROUTER_BASE_URL"] == "http://agent-gateway/v1"
 
@@ -147,7 +167,10 @@ def test_reads_openai_credentials_directly_from_dotenv_file(tmp_path, monkeypatc
         "OPENAI_API_BASE=https://openai-dotenv.example/v1\n"
         "SOME_UNRELATED_VAR=ignored\n"
     )
-    env = {"RUNNER_MODEL": "gpt-5.6-terra"}  # OPENAI_API_KEY NOT in env itself
+    env = {
+        "RUNNER_MODEL": "gpt-5.6-terra",
+        "JUDGE_MODEL": "gpt-5.5",
+    }  # OPENAI_API_KEY NOT in env itself
     cr.ensure_wildclaw_judge_env(env)
     assert env["JUDGE_MODEL"] == "gpt-5.5"
     assert env["OPENROUTER_API_KEY"] == "sk-from-dotenv"
@@ -160,7 +183,7 @@ def test_dotenv_export_prefix_and_quotes_are_handled(tmp_path, monkeypatch):
         'export OPENAI_API_KEY="sk-quoted"\n'
         "export OPENAI_BASE_URL='https://quoted.example/v1'\n"
     )
-    env = {"RUNNER_MODEL": "gpt-5.6-terra"}
+    env = {"RUNNER_MODEL": "gpt-5.6-terra", "JUDGE_MODEL": "gpt-5.5"}
     cr.ensure_wildclaw_judge_env(env)
     assert env["OPENROUTER_API_KEY"] == "sk-quoted"
     assert env["OPENROUTER_BASE_URL"] == "https://quoted.example/v1"
@@ -181,7 +204,7 @@ def test_does_not_overwrite_already_present_openrouter_vars(tmp_path, monkeypatc
     assert env["OPENROUTER_API_KEY"] == "already-set-key"
     assert env["OPENROUTER_BASE_URL"] == "http://already-set/v1"
     # JUDGE_MODEL was missing, so it gets backfilled with the default.
-    assert env["JUDGE_MODEL"] == "gpt-5.5"
+    assert env["JUDGE_MODEL"] == "gpt-5.6-terra"
 
 
 def test_does_not_overwrite_already_present_judge_model(tmp_path, monkeypatch):
@@ -206,6 +229,7 @@ def test_does_not_overwrite_partial_openrouter_key_but_fills_gap(tmp_path, monke
     _no_dotenv_env(tmp_path, monkeypatch)
     env = {
         "RUNNER_MODEL": "gpt-5.6-terra",
+        "JUDGE_MODEL": "gpt-5.5",
         "OPENAI_API_KEY": "sk-openai",
         "OPENROUTER_API_KEY": "pre-set-key",
     }

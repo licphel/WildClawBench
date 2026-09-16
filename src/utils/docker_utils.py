@@ -337,16 +337,19 @@ def run_warmup(
         return
 
     retry_delay = 10.0
-    max_retries = 5
+    # One retry is enough to absorb a single flaky fetch. Five retries at
+    # 180s each (the previous default) turned a hung mirror into a 20-minute
+    # setup that ate the agent's own budget and scored the task 0 with
+    # zero model requests (02_task_2, 20260915T144058Z).
+    max_retries = 1
     retry_desc = str(max_retries)
     # A warmup command with no timeout that stalls (observed: `npm install`
     # against the container-side proxy going silent mid-fetch, no error, no
     # data) blocks here indefinitely -- the retry loop below never gets a
     # second attempt, and whatever caller wraps this doesn't find out until
-    # its own much longer watchdog fires. 180s comfortably covers the
-    # slowest legitimate warmup steps seen (apt-get with build deps, pip/npm
-    # installs) while still leaving room to retry inside the per-task budget.
-    attempt_timeout = 180.0
+    # its own much longer watchdog fires. 90s covers a real pip/npm hit from
+    # cache or a nearby index; a silent hang is not a slow install.
+    attempt_timeout = 90.0
 
     logger.info(
         "[%s] Running warmup (%d commands, retries=%s, retry_delay=%.1fs)",

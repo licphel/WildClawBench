@@ -69,6 +69,7 @@ def grade(**kwargs) -> dict:
     """
     import os
     import json
+    import time
     from pathlib import Path
 
     grading_model = os.environ.get("JUDGE_MODEL", "openai/gpt-5.4")
@@ -130,14 +131,25 @@ def grade(**kwargs) -> dict:
             '{"cp_1": 1.0, "cp_2": 0.5, ..., "cp_8": 0.0, "structure_quality": 0.8}'
         )
 
-        resp = client.chat.completions.create(
-            model=grading_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
-        raw = resp.choices[0].message.content.strip()
-        raw = raw.strip("`").removeprefix("json").strip()
-        cp_scores = json.loads(raw)
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=grading_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = raw.strip("`").removeprefix("json").strip()
+                cp_scores = json.loads(raw)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        if last_error is not None:
+            scores["llm_error"] = str(last_error)
     except Exception as e:
         scores["llm_error"] = str(e)
 

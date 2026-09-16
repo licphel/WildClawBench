@@ -155,6 +155,14 @@ UPSTREAM_FAILURE_PATTERNS = (
     "HTTP 500",
     "502 Bad Gateway",
     "503 Service Unavailable",
+    "504 Gateway Time-out",
+    "504 Gateway Timeout",
+    "Gateway Time-out",
+    # The relay refusing to route because every upstream channel in the group
+    # is busy or cooling down. Same class as "Upstream service temporarily
+    # unavailable" -- observed in claudecode runs, which carried this marker
+    # in its own now-removed list.
+    "current group has no available channels",
     # perdura's own retry-exhausted summary (see
     # perdura/infra/runtime/execution/step_decision_provider.py). A single
     # slow/hanging upstream call can consume the whole step deadline on its
