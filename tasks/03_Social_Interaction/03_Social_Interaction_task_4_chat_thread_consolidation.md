@@ -64,7 +64,7 @@ def grade(**kwargs) -> dict:
     - Content quality scores from LLM judge via OpenAI-compatible API.
     - Falls back to keyword matching if LLM judge call fails.
     """
-    import json, os, urllib.request
+    import json, os, time, urllib.request
     from pathlib import Path
     from openai import OpenAI
 
@@ -167,46 +167,54 @@ Return ONLY a JSON object:
     judge_input = JUDGE_PROMPT.replace("{AGENT_OUTPUT}", pred[:10000])
 
     llm_scores = None
-    try:
-        client = OpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_API_BASE_URL,
-        )
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM},
-                {"role": "user", "content": judge_input},
-            ],
-            temperature=0.0,
-            max_tokens=16384,
-        )
+    last_error = None
+    for attempt in range(3):
+        try:
+            client = OpenAI(
+                api_key=LLM_API_KEY,
+                base_url=LLM_API_BASE_URL,
+            )
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": JUDGE_SYSTEM},
+                    {"role": "user", "content": judge_input},
+                ],
+                temperature=0.0,
+                max_tokens=16384,
+            )
 
-        raw = resp.choices[0].message.content.strip()
+            raw = resp.choices[0].message.content.strip()
 
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
-        if not raw.endswith("}"):
-            raw = raw[:raw.rfind("}")+1]
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+            if not raw.endswith("}"):
+                raw = raw[:raw.rfind("}")+1]
 
-        llm_scores = json.loads(raw)
-        scores["llm_judge_reasoning"] = llm_scores.get("reasoning", "")
+            llm_scores = json.loads(raw)
+            scores["llm_judge_reasoning"] = llm_scores.get("reasoning", "")
 
-        auth_chain = float(llm_scores.get("auth_correction_chain", 0))
-        date_chain = float(llm_scores.get("auth_date_chain", 0))
-        budget_contradiction = float(llm_scores.get("budget_contradiction", 0))
-        qa_finding = float(llm_scores.get("qa_security_finding", 0))
-        frontend_dep = float(llm_scores.get("frontend_dependency", 0))
-        timeline_risk = float(llm_scores.get("timeline_risk", 0))
-        nebula_excl = float(llm_scores.get("nebula_excluded", 0))
-        decision_opts = float(llm_scores.get("decision_options", 0))
-        budget_summary = float(llm_scores.get("budget_summary", 0))
-        quality_score = float(llm_scores.get("output_quality", 0))
-    except Exception as e:
-        scores["llm_judge_error"] = str(e)
-        llm_scores = None
+            auth_chain = float(llm_scores.get("auth_correction_chain", 0))
+            date_chain = float(llm_scores.get("auth_date_chain", 0))
+            budget_contradiction = float(llm_scores.get("budget_contradiction", 0))
+            qa_finding = float(llm_scores.get("qa_security_finding", 0))
+            frontend_dep = float(llm_scores.get("frontend_dependency", 0))
+            timeline_risk = float(llm_scores.get("timeline_risk", 0))
+            nebula_excl = float(llm_scores.get("nebula_excluded", 0))
+            decision_opts = float(llm_scores.get("decision_options", 0))
+            budget_summary = float(llm_scores.get("budget_summary", 0))
+            quality_score = float(llm_scores.get("output_quality", 0))
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            llm_scores = None
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if last_error is not None:
+        scores["llm_judge_error"] = str(last_error)
 
     api_gate = 1.0 if msg_reading_score > 0 else 0.3
     if llm_scores:

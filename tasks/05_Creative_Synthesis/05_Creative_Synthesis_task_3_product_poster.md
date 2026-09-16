@@ -58,6 +58,7 @@ def grade(**kwargs) -> dict:
     import os
     import json
     import base64
+    import time
     from pathlib import Path
 
     grading_model = os.environ.get("JUDGE_MODEL", "openai/gpt-5.4")
@@ -87,6 +88,10 @@ def grade(**kwargs) -> dict:
         scores["dimensions_correct"] = 1.0 if (w == 1080 and h == 1440) else 0.0
     except Exception:
         scores["dimensions_correct"] = 0.0
+
+    scores["content_completeness"] = 0.0
+    scores["feature_highlighting"] = 0.0
+    scores["design_impact"] = 0.0
 
     try:
         from openai import OpenAI
@@ -146,21 +151,34 @@ def grade(**kwargs) -> dict:
             '{"content_completeness": 0.0, "feature_highlighting": 0.0, "design_impact": 0.0}'
         )
 
-        resp = client.chat.completions.create(
-            model=grading_model,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": grading_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-            ]}],
-            temperature=0,
-        )
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=grading_model,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": grading_prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                    ]}],
+                    temperature=0,
+                )
 
-        raw = resp.choices[0].message.content.strip()
-        raw = raw.strip("`").removeprefix("json").strip()
-        llm_scores = json.loads(raw)
+                raw = resp.choices[0].message.content.strip()
+                raw = raw.strip("`").removeprefix("json").strip()
+                llm_scores = json.loads(raw)
 
-        for key in ["content_completeness", "feature_highlighting", "design_impact"]:
-            scores[key] = round(min(max(float(llm_scores.get(key, 0.0)), 0.0), 1.0), 4)
+                for key in ["content_completeness", "feature_highlighting", "design_impact"]:
+                    scores[key] = round(min(max(float(llm_scores.get(key, 0.0)), 0.0), 1.0), 4)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        if last_error is not None:
+            scores.update(zero_scores)
+            scores["llm_error"] = str(last_error)
+            return scores
 
     except Exception as e:
         scores.update(zero_scores)

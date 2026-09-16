@@ -67,7 +67,7 @@ Write the report to `/tmp_workspace/results/results.md`.
 ```python
 def grade(**kwargs) -> dict:
     """Escalation Routing — LLM-as-Judge grader."""
-    import json, os, urllib.request
+    import json, os, time, urllib.request
     from pathlib import Path
     from openai import OpenAI
 
@@ -189,29 +189,38 @@ Return ONLY JSON: {"qa_test_identified":0,"dpa_severity_elevated":0,"sql_partial
 
     llm_content_score = 0.5
     llm_scores = None
-    try:
-        judge_input = JUDGE_PROMPT.replace("{AGENT_OUTPUT}", pred[:10000])
-        client = OpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_API_BASE_URL,
-        )
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert grader. Output ONLY valid JSON, no markdown fences."},
-                {"role": "user", "content": judge_input},
-            ],
-            temperature=0.0,
-            max_tokens=16384,
-        )
-        raw = resp.choices[0].message.content.strip()
-        if "```json" in raw: raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw: raw = raw.split("```")[1].split("```")[0].strip()
-        if not raw.endswith("}"): raw = raw[:raw.rfind("}")+1]
-        llm_scores = json.loads(raw)
-        scores["llm_judge"] = llm_scores
-    except Exception as e:
-        scores["llm_judge_error"] = str(e)
+    last_error = None
+    for attempt in range(3):
+        try:
+            judge_input = JUDGE_PROMPT.replace("{AGENT_OUTPUT}", pred[:10000])
+            client = OpenAI(
+                api_key=LLM_API_KEY,
+                base_url=LLM_API_BASE_URL,
+            )
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grader. Output ONLY valid JSON, no markdown fences."},
+                    {"role": "user", "content": judge_input},
+                ],
+                temperature=0.0,
+                max_tokens=16384,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if "```json" in raw: raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw: raw = raw.split("```")[1].split("```")[0].strip()
+            if not raw.endswith("}"): raw = raw[:raw.rfind("}")+1]
+            llm_scores = json.loads(raw)
+            scores["llm_judge"] = llm_scores
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            llm_scores = None
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if last_error is not None:
+        scores["llm_judge_error"] = str(last_error)
 
     api_gate = 1.0 if gc > 0 else 0.3
 
