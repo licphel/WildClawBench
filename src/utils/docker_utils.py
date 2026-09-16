@@ -5,6 +5,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +26,14 @@ TMP_WORKSPACE = "/tmp_workspace"
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
+
+
+def _flush_logs() -> None:
+    """Nohup/file redirects buffer Python logging; force the line out now."""
+    for handle in (logger.handlers or logging.getLogger().handlers):
+        handle.flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 _DEFAULT_CONTAINER_NO_PROXY = "localhost,127.0.0.1,::1,host.docker.internal"
@@ -358,8 +367,11 @@ def run_warmup(
         retry_desc,
         retry_delay,
     )
+    _flush_logs()
+    started = time.perf_counter()
     for idx, cmd in enumerate(commands, start=1):
         logger.info("[%s] warmup: %s", task_id, cmd)
+        _flush_logs()
         stripped_cmd = cmd.rstrip()
 
         attempts = 0
@@ -422,14 +434,24 @@ def run_warmup(
                 time.sleep(max(0.0, retry_delay))
                 continue
 
-            if attempts > 1:
-                logger.info(
-                    "[%s] Warmup command succeeded after %d attempts: %s",
-                    task_id,
-                    attempts,
-                    cmd,
-                )
+            logger.info(
+                "[%s] warmup command %d/%d ok in %.1fs (attempts=%d)",
+                task_id,
+                idx,
+                len(commands),
+                time.perf_counter() - started,
+                attempts,
+            )
+            _flush_logs()
             break
+
+    logger.info(
+        "[%s] warmup complete (%d commands, %.1fs); starting agent",
+        task_id,
+        len(commands),
+        time.perf_counter() - started,
+    )
+    _flush_logs()
 
 
 def run_background(
