@@ -336,6 +336,8 @@ def run_warmup(
 ) -> None:
     """Execute warmup bash commands line by line inside the container (skip blank lines and comments)."""
     if not warmup.strip():
+        logger.info("[%s] no warmup; starting agent", task_id)
+        _flush_logs()
         return
     commands = [
         line.strip()
@@ -343,6 +345,8 @@ def run_warmup(
         if line.strip() and not line.strip().startswith("#")
     ]
     if not commands:
+        logger.info("[%s] no warmup; starting agent", task_id)
+        _flush_logs()
         return
 
     retry_delay = 10.0
