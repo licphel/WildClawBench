@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -26,6 +27,93 @@ TMP_WORKSPACE = "/tmp_workspace"
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
+
+# pip package name -> import name. Used to skip warmup installs the image
+# already satisfies (perdura/hermes/openclaw images ship agent-browser,
+# ffmpeg, playwright, openai, Pillow, numpy, fastapi).
+_PIP_IMPORT_NAMES = {
+    "openai": "openai",
+    "pillow": "PIL",
+    "numpy": "numpy",
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn",
+    "playwright": "playwright",
+    "requests": "requests",
+    "beautifulsoup4": "bs4",
+    "pymupdf": "fitz",
+    "pyyaml": "yaml",
+    "ortools": "ortools",
+    "weasyprint": "weasyprint",
+    "opencv-python": "cv2",
+}
+
+_APT_BINARIES = {
+    "ffmpeg": "ffmpeg",
+    "poppler-utils": "pdftotext",
+}
+
+
+def warmup_presence_check(cmd: str) -> str | None:
+    """Shell snippet that exits 0 if ``cmd`` is an install already satisfied.
+
+    Returns None when the line is not a skippable install (mock servers,
+    rm, sleep, import probes). The snippet is run inside the task container
+    *before* the install, so a baked-in ``agent-browser`` / ``ffmpeg`` is
+    not overwritten (ENOTEMPTY on ``npm install -g`` under par=6).
+    """
+    text = cmd.strip()
+    if not text or text.endswith("&"):
+        return None
+
+    npm = re.search(r"npm\s+(?:install|i)\s+-g\s+(\S+)", text)
+    if npm:
+        pkg = npm.group(1).split("@", 1)[0]
+        return f"command -v {shlex.quote(pkg)} >/dev/null 2>&1"
+
+    if re.search(r"\bplaywright\s+install\s+chromium\b", text) or re.search(
+        r"python3\s+-m\s+playwright\s+install\s+chromium", text
+    ):
+        return (
+            "command -v playwright >/dev/null 2>&1 && "
+            "{ test -d /root/.cache/ms-playwright || test -d /ms-playwright; }"
+        )
+
+    apt = re.search(r"apt(?:-get)?\s+(?:update\s*&&\s*)?install\s+(?:-y\s+)?(.+)$", text)
+    if apt:
+        pkgs = [
+            tok
+            for tok in apt.group(1).split()
+            if not tok.startswith("-")
+        ]
+        bins = [_APT_BINARIES.get(p, p) for p in pkgs]
+        if not bins:
+            return None
+        return " && ".join(
+            f"command -v {shlex.quote(b)} >/dev/null 2>&1" for b in bins
+        )
+
+    pip = re.search(r"\bpip(?:3)?\s+install\s+(?:-q\s+)?(.+)$", text)
+    if pip:
+        names = []
+        for tok in pip.group(1).split():
+            if tok.startswith("-") or tok == "2>/dev/null":
+                continue
+            pkg = re.split(r"[>=<[]", tok, maxsplit=1)[0]
+            if pkg:
+                names.append(pkg)
+        imports = [_PIP_IMPORT_NAMES.get(n.lower(), n.replace("-", "_")) for n in names]
+        if not imports:
+            return None
+        quoted = ", ".join(imports)
+        # Match the interpreter the install line itself used when it is a
+        # fully qualified conda pip; otherwise the image PATH python3.
+        if "/miniconda3/envs/eval/bin/pip" in text:
+            py = "~/miniconda3/envs/eval/bin/python"
+        else:
+            py = "python3"
+        return f"{py} -c {shlex.quote(f'import {quoted}')} >/dev/null 2>&1"
+
+    return None
 
 
 def _flush_logs() -> None:
@@ -377,6 +465,27 @@ def run_warmup(
         logger.info("[%s] warmup: %s", task_id, cmd)
         _flush_logs()
         stripped_cmd = cmd.rstrip()
+        skip_check = warmup_presence_check(stripped_cmd)
+        if skip_check:
+            try:
+                already = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", skip_check],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                already = subprocess.CompletedProcess(skip_check, returncode=1)
+            if already.returncode == 0:
+                logger.info(
+                    "[%s] warmup command %d/%d skipped (already in image): %s",
+                    task_id,
+                    idx,
+                    len(commands),
+                    cmd,
+                )
+                _flush_logs()
+                continue
 
         attempts = 0
         while True:
