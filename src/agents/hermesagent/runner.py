@@ -220,12 +220,19 @@ class HermesAgentAgent(BaseAgent):
                         excluded_retry_time=excluded_retry_time,
                     )
                 if not provider_error_reason:
-                    provider_error_reason = self._find_error_marker(
-                        spec.output_dir / "agent.log", log_offset
+                    # bench_runner.py returns zero only when Hermes reports
+                    # result["completed"] == True.  Do not scan a clean
+                    # successful transcript for generic strings such as
+                    # "Too Many Requests": those commonly come from a task's
+                    # own web/API tool output and are not provider failures.
+                    provider_error_reason = self._find_post_exit_provider_error(
+                        spec.output_dir / "agent.log",
+                        log_offset,
+                        agent_proc.returncode,
                     )
                 attempt_elapsed = time.perf_counter() - attempt_started
                 self._close_runner_streams(agent_proc)
-                if agent_proc.returncode == 0 and not provider_error_reason:
+                if agent_proc.returncode == 0:
                     # Retry time stays INSIDE elapsed_time, deliberately; see
                     # the note in the claudecode runner.  excluded_retry_time
                     # is still accumulated below because the *task budget*
@@ -828,6 +835,27 @@ fi
             if marker:
                 return marker
         return None
+
+    @classmethod
+    def _find_post_exit_provider_error(
+        cls,
+        log_path: Path,
+        offset: int,
+        returncode: int | None,
+    ) -> str | None:
+        """Classify provider errors only after a failed bench-runner exit.
+
+        ``resumable_provider_error`` is intentionally a string predicate, so
+        it cannot tell a provider response from a task tool's response quoted
+        in ``agent.log``.  The bench runner's exit code supplies the missing
+        context: zero means the agent reported a completed task, while a
+        non-zero exit is the only case where post-exit provider scanning is
+        allowed.  This prevents a successful task that searched a rate-limited
+        website from being run a second time.
+        """
+        if returncode == 0:
+            return None
+        return cls._find_error_marker(log_path, offset)
 
     @staticmethod
     def _cleanup_bench_config(task_id: str) -> None:
