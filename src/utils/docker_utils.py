@@ -198,6 +198,30 @@ def container_proxy_env(source: dict[str, str] | None = None) -> dict[str, str]:
         resolved["no_proxy"] = no_proxy
     return resolved
 
+def _container_env_value(key: str) -> str:
+    """Env injected into the *task* container.
+
+    ``OPENROUTER_API_KEY`` / ``OPENROUTER_BASE_URL`` on the host process are
+    the LLM-judge credentials after ``resolve_judge_env``. Task.md Env
+    declarations want the real OpenRouter account snapshotted into
+    ``WILDCLAW_TASK_OPENROUTER_*`` (or ``OPENROUTER_API_BASE`` from ``.env``,
+    which judge resolution does not overwrite). Grading ``docker exec`` still
+    reads process-level ``OPENROUTER_*`` and is unchanged.
+    """
+    if key == "OPENROUTER_API_KEY":
+        return (
+            os.environ.get("WILDCLAW_TASK_OPENROUTER_API_KEY")
+            or os.environ.get(key, "")
+        )
+    if key == "OPENROUTER_BASE_URL":
+        return (
+            os.environ.get("WILDCLAW_TASK_OPENROUTER_BASE_URL")
+            or os.environ.get("OPENROUTER_API_BASE")
+            or os.environ.get(key, "")
+        )
+    return os.environ.get(key, "")
+
+
 def remove_container(name: str) -> None:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
@@ -225,7 +249,7 @@ def start_container(task_id: str, workspace_path: str, extra_env: str = "",
         key = line.strip()
         if not key or key.startswith("#"):
             continue
-        value = os.environ.get(key, "")
+        value = _container_env_value(key)
         env_args += ["-e", f"{key}={value}"]
         masked = (value[:4] + "***") if value else "(empty)"
         logger.info("[%s] Injecting env var: %s=%s", task_id, key, masked)

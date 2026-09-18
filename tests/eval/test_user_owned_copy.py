@@ -6,6 +6,18 @@ from pathlib import Path
 from src.utils import docker_utils
 
 
+def test_container_env_uses_task_openrouter_not_judge(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "gateway-token")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "http://agent-gateway/v1")
+    monkeypatch.setenv("WILDCLAW_TASK_OPENROUTER_API_KEY", "sk-or-v1-real")
+    monkeypatch.setenv("WILDCLAW_TASK_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    assert docker_utils._container_env_value("OPENROUTER_API_KEY") == "sk-or-v1-real"
+    assert (
+        docker_utils._container_env_value("OPENROUTER_BASE_URL")
+        == "https://openrouter.ai/api/v1"
+    )
+
+
 def test_copy_file_uses_docker_exec_cat_not_docker_cp(tmp_path, monkeypatch) -> None:
     dest = tmp_path / "out" / "chat.jsonl"
     calls: list[list[str]] = []

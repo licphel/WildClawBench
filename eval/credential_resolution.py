@@ -199,6 +199,44 @@ def _read_dotenv_values(keys: Iterable[str], path: Path = _ENV_FILE) -> dict[str
     return values
 
 
+def _snapshot_task_openrouter(
+    env: MutableMapping[str, str],
+    env_file: Path | None = None,
+) -> None:
+    """Keep the real OpenRouter account for task.md Env injection.
+
+    ``resolve_judge_env`` overwrites process ``OPENROUTER_API_KEY`` /
+    ``OPENROUTER_BASE_URL`` for the LLM judge. Task containers must not
+    see that overwrite. Prefer ``.env``'s ``OPENROUTER_API_KEY`` and
+    ``OPENROUTER_API_BASE`` (judge never writes the latter).
+    """
+    if env_file is None:
+        env_file = _ENV_FILE
+    dotenv_values = _read_dotenv_values(
+        {
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_API_BASE",
+            "OPENROUTER_BASE_URL",
+        },
+        env_file,
+    )
+    if not env.get("WILDCLAW_TASK_OPENROUTER_API_KEY"):
+        key = dotenv_values.get("OPENROUTER_API_KEY") or env.get(
+            "OPENROUTER_API_KEY", ""
+        )
+        if key:
+            env["WILDCLAW_TASK_OPENROUTER_API_KEY"] = key
+    if not env.get("WILDCLAW_TASK_OPENROUTER_BASE_URL"):
+        base = (
+            dotenv_values.get("OPENROUTER_API_BASE")
+            or dotenv_values.get("OPENROUTER_BASE_URL")
+            or env.get("OPENROUTER_API_BASE", "")
+            or env.get("OPENROUTER_BASE_URL", "")
+        )
+        if base:
+            env["WILDCLAW_TASK_OPENROUTER_BASE_URL"] = base
+
+
 def ensure_wildclaw_judge_env(env: MutableMapping[str, str] | None = None) -> None:
     """Resolve ``JUDGE_MODEL``/``OPENROUTER_API_KEY``/``OPENROUTER_BASE_URL``
     in ``env`` (defaults to ``os.environ``), in place, using the exact same
@@ -216,6 +254,8 @@ def ensure_wildclaw_judge_env(env: MutableMapping[str, str] | None = None) -> No
     """
     if env is None:
         env = os.environ
+
+    _snapshot_task_openrouter(env)
 
     # Pass the module-level path globals explicitly (rather than relying on
     # each helper's own default parameter, which is bound once at import

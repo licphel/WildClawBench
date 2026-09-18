@@ -82,6 +82,24 @@ def test_default_judge_matches_runner_and_self_grades(tmp_path, monkeypatch):
     assert env["OPENROUTER_BASE_URL"] == "http://agent-gateway/v1"
 
 
+def test_self_grade_snapshots_dotenv_openrouter_for_tasks(tmp_path, monkeypatch):
+    env_file = _no_dotenv_env(tmp_path, monkeypatch)
+    env_file.write_text(
+        'OPENROUTER_API_KEY="sk-or-v1-real"\n'
+        'OPENROUTER_API_BASE="https://openrouter.ai/api/v1"\n'
+    )
+    env = {
+        "RUNNER_MODEL": "gpt-5.6-terra",
+        "GATEWAY_TOKEN": "agent-key",
+        "GATEWAY_V1": "http://agent-gateway/v1",
+    }
+    cr.ensure_wildclaw_judge_env(env)
+    assert env["OPENROUTER_API_KEY"] == "agent-key"
+    assert env["OPENROUTER_BASE_URL"] == "http://agent-gateway/v1"
+    assert env["WILDCLAW_TASK_OPENROUTER_API_KEY"] == "sk-or-v1-real"
+    assert env["WILDCLAW_TASK_OPENROUTER_BASE_URL"] == "https://openrouter.ai/api/v1"
+
+
 def test_openai_base_url_takes_precedence_over_openai_api_base(tmp_path, monkeypatch):
     _no_dotenv_env(tmp_path, monkeypatch)
     env = {
