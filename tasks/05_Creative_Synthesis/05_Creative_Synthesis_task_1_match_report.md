@@ -95,6 +95,7 @@ def grade(**kwargs) -> dict:
     import os
     import json
     import subprocess
+    import time
     from pathlib import Path
 
     grading_model = os.environ.get("JUDGE_MODEL", "openai/gpt-5.4")
@@ -157,19 +158,27 @@ def grade(**kwargs) -> dict:
 Respond strictly in JSON with no other content:
 {{"text_content_accuracy": 0.0}}"""
 
-    try:
-        response = client.chat.completions.create(
-            model=grading_model,
-            messages=[{"role": "user", "content": llm_grading_prompt}],
-            temperature=0,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = raw.strip("`").removeprefix("json").strip()
-        llm_scores = json.loads(raw)
-        scores["text_content_accuracy"] = float(llm_scores.get("text_content_accuracy", 0.0))
-    except Exception as e:
-        scores["text_content_accuracy"] = 0.0
-        scores["llm_error"] = str(e)
+    scores["text_content_accuracy"] = 0.0
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=grading_model,
+                messages=[{"role": "user", "content": llm_grading_prompt}],
+                temperature=0,
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = raw.strip("`").removeprefix("json").strip()
+            llm_scores = json.loads(raw)
+            scores["text_content_accuracy"] = float(llm_scores.get("text_content_accuracy", 0.0))
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if last_error is not None:
+        scores["llm_error"] = str(last_error)
 
     # ========== 4. Video content alignment (Pred-GT Matching) ==========
     gt_events = [
@@ -283,15 +292,23 @@ Respond strictly in JSON with no other content:
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                 })
 
-            resp = client.chat.completions.create(
-                model=grading_model,
-                messages=[{"role": "user", "content": content_parts}],
-                temperature=0,
-            )
-            try:
-                s = float(resp.choices[0].message.content.strip())
-                gt_scores[gi] = min(max(s, 0.0), 1.0)
-            except ValueError:
+            clip_error = None
+            for attempt in range(3):
+                try:
+                    resp = client.chat.completions.create(
+                        model=grading_model,
+                        messages=[{"role": "user", "content": content_parts}],
+                        temperature=0,
+                    )
+                    s = float(resp.choices[0].message.content.strip())
+                    gt_scores[gi] = min(max(s, 0.0), 1.0)
+                    clip_error = None
+                    break
+                except Exception as e:
+                    clip_error = e
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            if clip_error is not None:
                 gt_scores[gi] = 0.0
     except Exception:
         pass

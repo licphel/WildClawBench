@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +27,101 @@ TMP_WORKSPACE = "/tmp_workspace"
 WORKSPACE_BASELINE_PATH = "/tmp/wildclaw_workspace_baseline.json"
 
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
+
+# pip package name -> import name. Used to skip warmup installs the image
+# already satisfies (perdura/hermes/openclaw images ship agent-browser,
+# ffmpeg, playwright, openai, Pillow, numpy, fastapi).
+_PIP_IMPORT_NAMES = {
+    "openai": "openai",
+    "pillow": "PIL",
+    "numpy": "numpy",
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn",
+    "playwright": "playwright",
+    "requests": "requests",
+    "beautifulsoup4": "bs4",
+    "pymupdf": "fitz",
+    "pyyaml": "yaml",
+    "ortools": "ortools",
+    "weasyprint": "weasyprint",
+    "opencv-python": "cv2",
+}
+
+_APT_BINARIES = {
+    "ffmpeg": "ffmpeg",
+    "poppler-utils": "pdftotext",
+}
+
+
+def warmup_presence_check(cmd: str) -> str | None:
+    """Shell snippet that exits 0 if ``cmd`` is an install already satisfied.
+
+    Returns None when the line is not a skippable install (mock servers,
+    rm, sleep, import probes). The snippet is run inside the task container
+    *before* the install, so a baked-in ``agent-browser`` / ``ffmpeg`` is
+    not overwritten (ENOTEMPTY on ``npm install -g`` under par=6).
+    """
+    text = cmd.strip()
+    if not text or text.endswith("&"):
+        return None
+
+    npm = re.search(r"npm\s+(?:install|i)\s+-g\s+(\S+)", text)
+    if npm:
+        pkg = npm.group(1).split("@", 1)[0]
+        return f"command -v {shlex.quote(pkg)} >/dev/null 2>&1"
+
+    if re.search(r"\bplaywright\s+install\s+chromium\b", text) or re.search(
+        r"python3\s+-m\s+playwright\s+install\s+chromium", text
+    ):
+        return (
+            "command -v playwright >/dev/null 2>&1 && "
+            "{ test -d /root/.cache/ms-playwright || test -d /ms-playwright; }"
+        )
+
+    apt = re.search(r"apt(?:-get)?\s+(?:update\s*&&\s*)?install\s+(?:-y\s+)?(.+)$", text)
+    if apt:
+        pkgs = [
+            tok
+            for tok in apt.group(1).split()
+            if not tok.startswith("-")
+        ]
+        bins = [_APT_BINARIES.get(p, p) for p in pkgs]
+        if not bins:
+            return None
+        return " && ".join(
+            f"command -v {shlex.quote(b)} >/dev/null 2>&1" for b in bins
+        )
+
+    pip = re.search(r"\bpip(?:3)?\s+install\s+(?:-q\s+)?(.+)$", text)
+    if pip:
+        names = []
+        for tok in pip.group(1).split():
+            if tok.startswith("-") or tok == "2>/dev/null":
+                continue
+            pkg = re.split(r"[>=<[]", tok, maxsplit=1)[0]
+            if pkg:
+                names.append(pkg)
+        imports = [_PIP_IMPORT_NAMES.get(n.lower(), n.replace("-", "_")) for n in names]
+        if not imports:
+            return None
+        quoted = ", ".join(imports)
+        # Match the interpreter the install line itself used when it is a
+        # fully qualified conda pip; otherwise the image PATH python3.
+        if "/miniconda3/envs/eval/bin/pip" in text:
+            py = "~/miniconda3/envs/eval/bin/python"
+        else:
+            py = "python3"
+        return f"{py} -c {shlex.quote(f'import {quoted}')} >/dev/null 2>&1"
+
+    return None
+
+
+def _flush_logs() -> None:
+    """Nohup/file redirects buffer Python logging; force the line out now."""
+    for handle in (logger.handlers or logging.getLogger().handlers):
+        handle.flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 _DEFAULT_CONTAINER_NO_PROXY = "localhost,127.0.0.1,::1,host.docker.internal"
@@ -327,6 +424,8 @@ def run_warmup(
 ) -> None:
     """Execute warmup bash commands line by line inside the container (skip blank lines and comments)."""
     if not warmup.strip():
+        logger.info("[%s] no warmup; starting agent", task_id)
+        _flush_logs()
         return
     commands = [
         line.strip()
@@ -334,19 +433,24 @@ def run_warmup(
         if line.strip() and not line.strip().startswith("#")
     ]
     if not commands:
+        logger.info("[%s] no warmup; starting agent", task_id)
+        _flush_logs()
         return
 
     retry_delay = 10.0
-    max_retries = 5
+    # One retry is enough to absorb a single flaky fetch. Five retries at
+    # 180s each (the previous default) turned a hung mirror into a 20-minute
+    # setup that ate the agent's own budget and scored the task 0 with
+    # zero model requests (02_task_2, 20260915T144058Z).
+    max_retries = 1
     retry_desc = str(max_retries)
     # A warmup command with no timeout that stalls (observed: `npm install`
     # against the container-side proxy going silent mid-fetch, no error, no
     # data) blocks here indefinitely -- the retry loop below never gets a
     # second attempt, and whatever caller wraps this doesn't find out until
-    # its own much longer watchdog fires. 180s comfortably covers the
-    # slowest legitimate warmup steps seen (apt-get with build deps, pip/npm
-    # installs) while still leaving room to retry inside the per-task budget.
-    attempt_timeout = 180.0
+    # its own much longer watchdog fires. 90s covers a real pip/npm hit from
+    # cache or a nearby index; a silent hang is not a slow install.
+    attempt_timeout = 90.0
 
     logger.info(
         "[%s] Running warmup (%d commands, retries=%s, retry_delay=%.1fs)",
@@ -355,9 +459,33 @@ def run_warmup(
         retry_desc,
         retry_delay,
     )
+    _flush_logs()
+    started = time.perf_counter()
     for idx, cmd in enumerate(commands, start=1):
         logger.info("[%s] warmup: %s", task_id, cmd)
+        _flush_logs()
         stripped_cmd = cmd.rstrip()
+        skip_check = warmup_presence_check(stripped_cmd)
+        if skip_check:
+            try:
+                already = subprocess.run(
+                    ["docker", "exec", task_id, "/bin/bash", "-c", skip_check],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                already = subprocess.CompletedProcess(skip_check, returncode=1)
+            if already.returncode == 0:
+                logger.info(
+                    "[%s] warmup command %d/%d skipped (already in image): %s",
+                    task_id,
+                    idx,
+                    len(commands),
+                    cmd,
+                )
+                _flush_logs()
+                continue
 
         attempts = 0
         while True:
@@ -419,14 +547,24 @@ def run_warmup(
                 time.sleep(max(0.0, retry_delay))
                 continue
 
-            if attempts > 1:
-                logger.info(
-                    "[%s] Warmup command succeeded after %d attempts: %s",
-                    task_id,
-                    attempts,
-                    cmd,
-                )
+            logger.info(
+                "[%s] warmup command %d/%d ok in %.1fs (attempts=%d)",
+                task_id,
+                idx,
+                len(commands),
+                time.perf_counter() - started,
+                attempts,
+            )
+            _flush_logs()
             break
+
+    logger.info(
+        "[%s] warmup complete (%d commands, %.1fs); starting agent",
+        task_id,
+        len(commands),
+        time.perf_counter() - started,
+    )
+    _flush_logs()
 
 
 def run_background(
@@ -600,24 +738,57 @@ def inject_lobster_workspace(task_id: str, workspace_path: str) -> None:
 
 
 def _copy_dir_from_container(task_id: str, src: str, dest: str) -> bool:
-    r = subprocess.run(
-        ["docker", "cp", f"{task_id}:{src}", dest],
-        capture_output=True, text=True,
-    )
-    if r.returncode == 0:
+    dest_path = Path(dest)
+    dest_path.mkdir(parents=True, exist_ok=True)
+    src_dir = src
+    if src.endswith("/."):
+        src_dir = src[:-2]
+    elif src.endswith("/"):
+        src_dir = src.rstrip("/")
+    if _extract_container_tree(task_id, src_dir, dest_path):
         logger.info("[%s] Collected container directory %s → %s", task_id, src, dest)
         return True
     return False
 
 
 def _copy_file_from_container(task_id: str, src: str, dest: Path) -> bool:
-    r = subprocess.run(
-        ["docker", "cp", f"{task_id}:{src}", str(dest)],
-        capture_output=True,
-        text=True,
-    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as out:
+        r = subprocess.run(
+            ["docker", "exec", task_id, "cat", src],
+            stdout=out,
+            stderr=subprocess.PIPE,
+        )
     if r.returncode == 0:
         logger.info("[%s] Collected container file %s → %s", task_id, src, dest)
         return True
-    logger.warning("[%s] Container file copy failed (%s): %s", task_id, src, r.stderr.strip())
+    dest.unlink(missing_ok=True)
+    stderr = (r.stderr or b"").decode("utf-8", "replace").strip()
+    logger.warning("[%s] Container file copy failed (%s): %s", task_id, src, stderr)
     return False
+
+
+def _extract_container_tree(task_id: str, src_dir: str, dest: Path) -> bool:
+    """Copy a container directory onto the host as the calling user.
+
+    ``docker cp`` is written by dockerd and materializes dest as root. The
+    host-side ``tar -x`` in this pipe creates the files, so they belong to
+    the evaluator. Used after a concurrent fanout tears down staging: a
+    root-owned restage made score.json unwritable.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    producer = subprocess.Popen(
+        ["docker", "exec", task_id, "tar", "-C", src_dir, "-cf", "-", "."],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if producer.stdout is None:
+        return False
+    consumer = subprocess.run(
+        ["tar", "-x", "--no-same-owner", "-C", str(dest), "-f", "-"],
+        stdin=producer.stdout,
+        capture_output=True,
+    )
+    producer.stdout.close()
+    _ignored, _prod_err = producer.communicate()
+    return producer.returncode == 0 and consumer.returncode == 0

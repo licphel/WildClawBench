@@ -71,7 +71,7 @@ modality: pure-text
 ```python
 def grade(**kwargs) -> dict:
     """Cross-department status summary (Chinese version) — multi-layer grader (programmatic + LLM judge)."""
-    import json, os, urllib.request
+    import json, os, time, urllib.request
     from pathlib import Path
     from openai import OpenAI
 
@@ -255,29 +255,38 @@ report_quality: 适合董事会级别、结构清晰、包含需要 COO 决策�
 请仅返回 JSON: {"meeting_change":0,"sdk_deadlock_upgraded":0,"api_dispute":0,"soc2_mismatch":0,"launch_tension":0,"finance_reconciliation":0,"hr_risks":0,"vendor_delay":0,"report_quality":0,"reasoning":"简要说明"}"""
 
     llm = None
-    try:
-        judge_input = JUDGE_PROMPT.replace("{AGENT_OUTPUT}", pred[:10000])
-        client = OpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_API_BASE_URL,
-        )
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "你是一位专业的评审员。请仅输出有效的 JSON，不要添加 markdown 代码块。"},
-                {"role": "user", "content": judge_input},
-            ],
-            temperature=0.0,
-            max_tokens=16384,
-        )
-        raw = resp.choices[0].message.content.strip()
-        if "```json" in raw: raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw: raw = raw.split("```")[1].split("```")[0].strip()
-        if not raw.endswith("}"): raw = raw[:raw.rfind("}")+1]
-        llm = json.loads(raw)
-        scores["llm_judge"] = llm
-    except Exception as e:
-        scores["llm_judge_error"] = str(e)
+    last_error = None
+    for attempt in range(3):
+        try:
+            judge_input = JUDGE_PROMPT.replace("{AGENT_OUTPUT}", pred[:10000])
+            client = OpenAI(
+                api_key=LLM_API_KEY,
+                base_url=LLM_API_BASE_URL,
+            )
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "你是一位专业的评审员。请仅输出有效的 JSON，不要添加 markdown 代码块。"},
+                    {"role": "user", "content": judge_input},
+                ],
+                temperature=0.0,
+                max_tokens=16384,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if "```json" in raw: raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw: raw = raw.split("```")[1].split("```")[0].strip()
+            if not raw.endswith("}"): raw = raw[:raw.rfind("}")+1]
+            llm = json.loads(raw)
+            scores["llm_judge"] = llm
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            llm = None
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if last_error is not None:
+        scores["llm_judge_error"] = str(last_error)
 
     if llm:
         meeting_chg = float(llm.get("meeting_change", 0)) * api_gate
