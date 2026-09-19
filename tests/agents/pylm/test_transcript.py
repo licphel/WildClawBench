@@ -413,6 +413,89 @@ def test_succeeded_tool_call_becomes_a_tool_use_and_tool_result_pair() -> None:
     assert json.loads(result_block["content"]) == "wrote 5 bytes"
 
 
+SECRET = "sk-ant-9rfiwe-q3wef9fiwe-kfj39f8wefnlKJ29fjwfiw"
+
+
+def _assistant_tool_inputs(converted: list[dict]) -> str:
+    chunks: list[str] = []
+    for entry in converted:
+        msg = entry.get("message") or {}
+        if msg.get("role") != "assistant":
+            continue
+        for block in msg.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            chunks.append(json.dumps(block.get("input"), ensure_ascii=False, sort_keys=True))
+    return "\n".join(chunks)
+
+
+def test_tool_result_syscall_does_not_put_outcome_in_tool_use_input() -> None:
+    """Kernel ``tool.result`` delivers the previous tool's return in
+    ``arguments.outcome``. That must not be copied into assistant tool_use
+    input, or leaked-API graders treat git-diff stdout as disclosure."""
+    entries = [
+        _tool_call_entry(
+            operation_id="op-tool-result-1",
+            name="tool.result",
+            arguments={
+                "outcome": {
+                    "kind": "returned",
+                    "value": {"exit_code": 0, "stdout": f"---STAT---\n{SECRET}\n"},
+                }
+            },
+            result_value={
+                "exit_code": 0,
+                "stdout": f"---STAT---\n{SECRET}\n",
+            },
+        )
+    ]
+    converted = perdura_channel_messages_to_openclaw_messages(entries)
+    use_block = converted[0]["message"]["content"][0]
+    assert use_block["type"] == "tool_use"
+    assert use_block["name"] == "tool.result"
+    assert SECRET not in json.dumps(use_block["input"])
+    assert use_block["input"] == {}
+    result_block = converted[1]["message"]["content"][0]
+    assert result_block["type"] == "tool_result"
+    assert SECRET in result_block["content"]
+    assert SECRET not in _assistant_tool_inputs(converted)
+
+
+def test_observation_show_does_not_put_preview_text_in_tool_use_input() -> None:
+    entries = [
+        _tool_call_entry(
+            operation_id="op-obs-1",
+            name="observation.show",
+            arguments={"preview": f"...{SECRET[:12]}...", "text": f"diff {SECRET}"},
+            result_value={"preview": f"diff {SECRET}", "type": "value"},
+        )
+    ]
+    converted = perdura_channel_messages_to_openclaw_messages(entries)
+    use_block = converted[0]["message"]["content"][0]
+    assert use_block["input"] == {}
+    assert SECRET not in _assistant_tool_inputs(converted)
+    assert "text" not in use_block["input"]
+    assert "preview" not in use_block["input"]
+    assert SECRET in converted[1]["message"]["content"][0]["content"]
+
+
+def test_shell_invocation_keeps_command_arguments_on_tool_use() -> None:
+    """A real agent-authored exec still exposes its command to graders."""
+    entries = [
+        _tool_call_entry(
+            operation_id="op-shell-1",
+            name="shell.invocation",
+            arguments={"identity": {"command": ["git", "diff"]}},
+            result_value={"stdout": f"{SECRET}\n"},
+        )
+    ]
+    converted = perdura_channel_messages_to_openclaw_messages(entries)
+    use_block = converted[0]["message"]["content"][0]
+    assert use_block["input"]["identity"]["command"] == ["git", "diff"]
+    assert SECRET not in _assistant_tool_inputs(converted)
+    assert SECRET in converted[1]["message"]["content"][0]["content"]
+
+
 def test_failed_tool_call_surfaces_the_error_as_the_tool_result() -> None:
     entries = [
         _tool_call_entry(

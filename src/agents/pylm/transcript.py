@@ -129,6 +129,29 @@ def _assistant_entry_to_message(entry: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+# Kernel syscalls that *deliver* a previous tool/observation payload to the
+# agent. Their ``request.arguments`` carry that payload (``outcome``,
+# ``text``, ``preview``), not a model-authored invocation. Copying those
+# arguments into assistant ``tool_use.input`` makes WildClaw secret-leak
+# graders treat git-diff stdout as the assistant reproducing the secret
+# (06_task_2 / 06_task_3: completions.jsonl had 0 key hits).
+_INBOUND_PAYLOAD_ARGUMENT_KEYS: dict[str, tuple[str, ...]] = {
+    "tool.result": ("outcome",),
+    "observation.show": ("text", "preview"),
+}
+
+
+def _tool_call_use_input(request: dict[str, Any]) -> Any:
+    """Arguments the model authored, without inbound delivery payloads."""
+    arguments = request.get("arguments", {})
+    if not isinstance(arguments, dict):
+        return arguments
+    drop = _INBOUND_PAYLOAD_ARGUMENT_KEYS.get(str(request.get("name", "")))
+    if not drop:
+        return arguments
+    return {key: value for key, value in arguments.items() if key not in drop}
+
+
 def _tool_call_use_block(entry: dict[str, Any]) -> dict[str, Any]:
     """Represent a ``source: "tool_call"`` entry's request half as a
     ``tool_use`` block, analogous to ``_interaction_request_block``: the
@@ -136,13 +159,18 @@ def _tool_call_use_block(entry: dict[str, Any]) -> dict[str, Any]:
     ``OperationRecord.model_dump`` with ``source`` added -- see
     ``perdura.abi.execution.syscall.OperationRecord``) become the tool name
     and input.
+
+    Inbound delivery syscalls keep identifying fields but strip the payload
+    keys listed in ``_INBOUND_PAYLOAD_ARGUMENT_KEYS``. The payload still
+    appears on the matching ``tool_result`` (user role), which secret-leak
+    graders do not scan.
     """
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     return {
         "type": "tool_use",
         "name": str(request.get("name", "")),
         "id": str(entry.get("operation_id", "")),
-        "input": request.get("arguments", {}),
+        "input": _tool_call_use_input(request),
     }
 
 
