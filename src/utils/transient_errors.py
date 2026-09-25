@@ -163,16 +163,15 @@ UPSTREAM_FAILURE_PATTERNS = (
     # unavailable" -- observed in claudecode runs, which carried this marker
     # in its own now-removed list.
     "current group has no available channels",
-    # perdura's own retry-exhausted summary (see
-    # perdura/infra/runtime/execution/step_decision_provider.py). A single
-    # slow/hanging upstream call can consume the whole step deadline on its
-    # first attempt, leaving perdura's internal RetryConfig (up to 10
-    # attempts) no budget for a second try within that step -- so this
-    # surfaces as a hard task failure on what is otherwise a transient
-    # upstream stall. Retrying the whole task (fresh container, fresh
-    # deadline) gives it another shot instead of an unlucky slow response
-    # ending the task outright.
-    "Model inference failed after provider reliability processing",
+    # Deliberately absent: perdura's "Model inference failed after provider
+    # reliability processing".  It is a summary, not an upstream signature --
+    # on the 2026-09-24 GLM WildClaw run 239 of its 243 occurrences followed a
+    # *successful* completion that carried text and no tool call
+    # (step_decision_provider's missing_required_native_tool_call).  Re-running
+    # the whole task there re-measures a model that already said it was done.
+    # Recovering from a completion the agent cannot use is the baseline's own
+    # job; a real upstream failure behind it still reaches this list through
+    # the gateway's own signatures (5xx, stall, transport errors).
     # The provider SDKs' own transport-failure class names.  A client that
     # cannot open a connection to the inference endpoint has measured the
     # inference path, not the agent -- the same statement ECONNRESET above
