@@ -33,38 +33,37 @@ file, a port) to produce ``GATEWAY_V1``/``GATEWAY_TOKEN`` in the first
 place. This module only ever *reads* those two vars if something else
 (a ``run_*.sh`` launcher, normally) already set them; it cannot synthesize
 them from ``.env`` the way it can synthesize ``OPENROUTER_*`` from
-``OPENAI_API_KEY``.
+``GLM_API_KEY`` / ``GLM_API_BASE``.
 
 This module's ``ensure_wildclaw_judge_env`` implements the *exact same*
 precedence as ``config_lib.sh``'s bash ``resolve_judge_env`` function (read
 that function's own large comment block for the full rationale):
 
-  1. ``JUDGE_MODEL`` defaults to ``gpt-5.6-terra`` (see
+  1. ``JUDGE_MODEL`` defaults to ``glm-5.3-flash`` (see
      ``_default_judge_model_from_config_lib`` below for how that default is
      kept in sync with bash rather than copy-pasted) unless already set.
-  2. If the resolved ``JUDGE_MODEL`` differs from ``RUNNER_MODEL`` (the
-     model under test -- exported by ``config_lib.sh``'s
-     ``load_runner_config``, or empty if unset) AND a real
-     ``OPENAI_API_KEY`` is available (environment, or read directly out of
-     the outer repo's ``.env``): route ``OPENROUTER_API_KEY``/
-     ``OPENROUTER_BASE_URL`` at the real OpenAI API
-     (``OPENAI_BASE_URL``, else ``OPENAI_API_BASE``, else
-     ``https://api.openai.com/v1``) -- an independent judge.
-  3. Otherwise (an explicit self-grade, or no ``OPENAI_API_KEY`` available):
-     fall back to this run's own agent gateway credentials
-     (``GATEWAY_TOKEN``/``GATEWAY_V1``), matching bash's behavior exactly.
+  2. If the resolved ``JUDGE_MODEL`` equals ``RUNNER_MODEL`` (the model
+     under test -- exported by ``config_lib.sh``'s ``load_runner_config``,
+     or empty if unset): route ``OPENROUTER_API_KEY`` /
+     ``OPENROUTER_BASE_URL`` at this run's own agent gateway
+     (``GATEWAY_TOKEN`` / ``GATEWAY_V1``) -- an explicit self-grade.
+     Missing gateway credentials raise ``WildClawCredentialError``.
+  3. Otherwise: route ``OPENROUTER_*`` at ``GLM_API_KEY`` / ``GLM_API_BASE``
+     (environment, or read directly out of the outer repo's ``.env``).
+     Missing GLM credentials raise ``WildClawCredentialError`` rather than
+     falling back to the agent gateway, whose ``--pin-model`` would silently
+     substitute the runner model.
 
 One divergence from the bash function is deliberate: ``resolve_judge_env``
-always "degrades" to the agent's own gateway credentials rather than ever
-hard-failing, on the assumption that ``resolve_wildclaw_gateway`` already
-succeeded (or the launcher already exited 1) by the time it runs, so
-``GATEWAY_TOKEN``/``GATEWAY_V1`` are always available as a fallback in
-practice. This module cannot assume that -- it must also cover direct
-invocation, where *nothing* has been resolved -- so when neither branch above
-has anything to fall back on, it raises ``WildClawCredentialError`` instead
-of silently proceeding with empty credentials. That all-empty case is
-precisely how the prior run's judge/usage credentials were silently
-corrupted; this module exists to fail loudly instead.
+runs after ``resolve_wildclaw_gateway`` has already produced
+``GATEWAY_TOKEN`` / ``GATEWAY_V1`` (or the launcher has already exited 1),
+so a self-grade can assume those two vars are present. This module cannot
+assume that -- it must also cover direct invocation, where *nothing* has
+been resolved -- so a self-grade with no gateway credentials raises
+``WildClawCredentialError`` instead of silently proceeding with empty
+credentials. That all-empty case is precisely how the prior run's
+judge/usage credentials were silently corrupted; this module exists to fail
+loudly instead.
 """
 
 from __future__ import annotations
@@ -87,7 +86,7 @@ class WildClawCredentialError(RuntimeError):
 # Keep this equal to config_lib.sh's _WILDCLAW_DEFAULT_JUDGE_MODEL; it is
 # used only if that file cannot be found/parsed (e.g. this repo checked out
 # standalone, without the outer PyLM_Eval_why repo alongside it).
-_FALLBACK_DEFAULT_JUDGE_MODEL = "gpt-5.6-terra"
+_FALLBACK_DEFAULT_JUDGE_MODEL = "glm-5.3-flash"
 
 _THIS_FILE = Path(__file__).resolve()
 # WildClawBench root (mirrors run_batch.py's own ROOT_DIR).
@@ -249,8 +248,9 @@ def ensure_wildclaw_judge_env(env: MutableMapping[str, str] | None = None) -> No
     ``run_*.sh`` launchers already resolved these (the normal case), this
     is a no-op beyond possibly backfilling a still-missing ``JUDGE_MODEL``.
 
-    Raises ``WildClawCredentialError`` if no judge credential -- real OpenAI
-    or this run's own agent gateway -- can be resolved at all.
+    Raises ``WildClawCredentialError`` if no judge credential -- GLM_API_*
+    when the judge differs from the runner, or this run's own agent gateway
+    for an explicit self-grade -- can be resolved at all.
     """
     if env is None:
         env = os.environ
@@ -272,46 +272,42 @@ def ensure_wildclaw_judge_env(env: MutableMapping[str, str] | None = None) -> No
         env.setdefault("JUDGE_MODEL", judge_model)
         return
 
-    openai_key = env.get("OPENAI_API_KEY", "")
-    openai_base = env.get("OPENAI_BASE_URL") or env.get("OPENAI_API_BASE") or ""
-    if not openai_key:
-        dotenv_values = _read_dotenv_values(
-            {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"}, _ENV_FILE
-        )
-        openai_key = dotenv_values.get("OPENAI_API_KEY", "")
-        openai_base = (
-            openai_base
-            or dotenv_values.get("OPENAI_BASE_URL")
-            or dotenv_values.get("OPENAI_API_BASE")
-            or ""
-        )
-    openai_base = openai_base or "https://api.openai.com/v1"
-
     gateway_token = env.get("GATEWAY_TOKEN", "")
     gateway_v1 = env.get("GATEWAY_V1", "")
 
-    if judge_model != runner_model and openai_key:
-        resolved_key, resolved_base = openai_key, openai_base
-    elif gateway_token and gateway_v1:
-        resolved_key, resolved_base = gateway_token, gateway_v1
+    if judge_model == runner_model:
+        if gateway_token and gateway_v1:
+            resolved_key, resolved_base = gateway_token, gateway_v1
+        else:
+            raise WildClawCredentialError(
+                "WildClawBench self-grade requires GATEWAY_TOKEN/GATEWAY_V1 "
+                f"when JUDGE_MODEL equals RUNNER_MODEL ({judge_model!r}). "
+                "run_batch.py must be invoked through one of "
+                "eval_framework/baseline_verifier/wildclawbench/"
+                "run_{pylm,codex,claudecode,hermesagent,openclaw}.sh."
+            )
     else:
-        raise WildClawCredentialError(
-            "WildClawBench judge/gateway credentials could not be resolved: "
-            "no OPENROUTER_API_KEY/OPENROUTER_BASE_URL already set, no "
-            "usable OPENAI_API_KEY (checked the environment and "
-            f"{_ENV_FILE}), and no agent gateway credential "
-            "(GATEWAY_TOKEN/GATEWAY_V1) either. run_batch.py must be "
-            "invoked through one of eval_framework/baseline_verifier/"
-            "wildclawbench/run_{pylm,codex,claudecode,hermesagent,"
-            "openclaw}.sh (or script/run.sh <backend>, which delegates to "
-            "one of those) -- those resolve this run's per-experiment "
-            "inference gateway and an independent LLM judge before ever "
-            "reaching run_batch.py. Calling `python eval/run_batch.py` "
-            "directly, without going through one of those launchers, is "
-            "exactly what silently corrupted a prior benchmark run's "
-            "judge/usage credentials; this check exists to fail loudly "
-            "instead of repeating that."
-        )
+        glm_key = env.get("GLM_API_KEY", "")
+        glm_base = env.get("GLM_API_BASE", "")
+        if not glm_key or not glm_base:
+            dotenv_values = _read_dotenv_values(
+                {"GLM_API_KEY", "GLM_API_BASE"}, _ENV_FILE
+            )
+            glm_key = glm_key or dotenv_values.get("GLM_API_KEY", "")
+            glm_base = glm_base or dotenv_values.get("GLM_API_BASE", "")
+        if not glm_key or not glm_base:
+            raise WildClawCredentialError(
+                "WildClawBench judge credentials could not be resolved: "
+                f"JUDGE_MODEL ({judge_model!r}) differs from RUNNER_MODEL "
+                f"({runner_model!r}), so grading must go through GLM_API_KEY "
+                "and GLM_API_BASE (checked the environment and "
+                f"{_ENV_FILE}). Refusing to fall back to the agent gateway, "
+                "whose --pin-model would silently substitute the runner "
+                "model. run_batch.py must be invoked through one of "
+                "eval_framework/baseline_verifier/wildclawbench/"
+                "run_{pylm,codex,claudecode,hermesagent,openclaw}.sh."
+            )
+        resolved_key, resolved_base = glm_key, glm_base
 
     env.setdefault("JUDGE_MODEL", judge_model)
     env.setdefault("OPENROUTER_API_KEY", resolved_key)
