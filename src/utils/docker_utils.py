@@ -639,6 +639,13 @@ def collect_output_from_container(
     task_output_dir = output_dir / "task_output"
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        dumped = _persist_mock_audits(task_id, output_dir)
+        if dumped:
+            logger.info("[%s] persisted mock audits: %s", task_id, ",".join(dumped))
+    except Exception as exc:
+        logger.warning("[%s] mock audit persist failed: %s", task_id, exc)
+
     _copy_dir_from_container(task_id, "/tmp/openclaw/.", str(task_output_dir))
 
     workspace_out = task_output_dir / "workspace"
@@ -657,6 +664,24 @@ def collect_output_from_container(
     )
     if not ok:
         logger.warning("[%s] results/ directory does not exist or is empty", task_id)
+
+
+def _persist_mock_audits(task_id: str, output_dir: Path) -> list[str]:
+    """Dump in-memory Social mock audits before the container is removed."""
+
+    parent = Path(__file__).resolve().parents[4]
+    parent_s = str(parent)
+    if parent_s not in sys.path:
+        sys.path.insert(0, parent_s)
+    try:
+        from eval_framework.wildclaw_mock_audit import dump_from_container
+    except ImportError:
+        logger.warning(
+            "[%s] eval_framework.wildclaw_mock_audit not importable; skip audit dump",
+            task_id,
+        )
+        return []
+    return dump_from_container(task_id, output_dir)
 
 
 def snapshot_workspace_state(task_id: str) -> None:

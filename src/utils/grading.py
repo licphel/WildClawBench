@@ -38,6 +38,7 @@ def _judge_relay_base_url() -> str:
         from eval_framework.judge_relay import (  # type: ignore
             ensure_judge_relay,
             judge_reasoning_effort,
+            resolve_audio_judge,
         )
     except ImportError:
         logger.warning("eval_framework.judge_relay not importable; skip relay")
@@ -55,8 +56,16 @@ def _judge_relay_base_url() -> str:
     if not base or not key:
         return ""
     effort = judge_reasoning_effort(os.environ.get("JUDGE_MODEL", "glm-5.3-flash"))
+    audio = resolve_audio_judge()
+    audio_base, audio_key, audio_model = audio if audio else (None, None, "qwen3.5-omni-flash")
     relay = ensure_judge_relay(
-        base, key, effort=effort, advertise_host=_JUDGE_RELAY_ADVERTISE
+        base,
+        key,
+        effort=effort,
+        advertise_host=_JUDGE_RELAY_ADVERTISE,
+        audio_base=audio_base,
+        audio_key=audio_key,
+        audio_model=audio_model,
     )
     return relay.base_url
 
