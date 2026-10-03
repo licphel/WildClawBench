@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
@@ -16,6 +17,48 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TMP_WORKSPACE = "/tmp_workspace"
 MAX_GRADING_RETRIES = 2
+# Task containers reach the host judge relay on docker0 unless overridden.
+_JUDGE_RELAY_ADVERTISE = os.environ.get(
+    "WILDCLAW_JUDGE_RELAY_ADVERTISE", "172.17.0.1"
+)
+
+
+def _judge_relay_base_url() -> str:
+    """Point OPENROUTER_BASE_URL at the shared judge policy relay.
+
+    GLM judges get reasoning_effort=low; Terra gets medium. The relay strips
+    max_tokens and thinking.disabled. Missing parent eval_framework is a
+    no-op so standalone WildClawBench checkouts still grade.
+    """
+    parent = Path(__file__).resolve().parents[4]
+    parent_s = str(parent)
+    if parent_s not in sys.path:
+        sys.path.insert(0, parent_s)
+    try:
+        from eval_framework.judge_relay import (  # type: ignore
+            ensure_judge_relay,
+            judge_reasoning_effort,
+        )
+    except ImportError:
+        logger.warning("eval_framework.judge_relay not importable; skip relay")
+        return ""
+    base = (
+        os.environ.get("OPENROUTER_BASE_URL")
+        or os.environ.get("GLM_API_BASE")
+        or ""
+    ).strip()
+    key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("GLM_API_KEY")
+        or ""
+    ).strip()
+    if not base or not key:
+        return ""
+    effort = judge_reasoning_effort(os.environ.get("JUDGE_MODEL", "glm-5.3-flash"))
+    relay = ensure_judge_relay(
+        base, key, effort=effort, advertise_host=_JUDGE_RELAY_ADVERTISE
+    )
+    return relay.base_url
 
 GRADER_PYTHON = "/opt/wildclaw-grader/bin/python"
 """The one interpreter every baseline is graded with.
@@ -173,6 +216,11 @@ def run_grading(
             env_args += ["-e", f"{key}={value}"]
             masked = (value[:4] + "***") if value else "(empty)"
             logger.info("[%s] Injecting grading env: %s=%s", task_id, key, masked)
+
+        relay_url = _judge_relay_base_url()
+        if relay_url:
+            env_args += ["-e", f"OPENROUTER_BASE_URL={relay_url}"]
+            logger.info("[%s] Judge relay OPENROUTER_BASE_URL=%s", task_id, relay_url)
 
         for key in (lobster_env or []):
             value = os.environ.get(key, "")
