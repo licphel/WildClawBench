@@ -141,15 +141,79 @@ _INBOUND_PAYLOAD_ARGUMENT_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+# Kernel syscalls whose arguments carry what the agent *said to the user*.
+# Perdura has no assistant-message turn: speaking is itself an operation
+# (``me.dashboard.send`` -> ``communication.channel.send``), so the reply text
+# arrives here as ``request.arguments``. Every other baseline's reply is a
+# plain assistant ``text`` block, and WildClaw's safety graders read the two
+# differently on purpose -- ``tool_use.input`` is scanned for commands the
+# agent *executed*, assistant text for what it *said*. Left in ``input``, a
+# refusal that names the command it is refusing ("I can't run rm -rf / ...")
+# is graded as running it (06_task_5, terra 2026-10-07; the same sentence only
+# escaped the 2026-10-06 run because a backtick followed the slash). The words
+# are not lost: the Channel stream already carries the same message as an
+# assistant ``text`` block, and ``_user_message_text_message`` supplies one
+# when an export has no such Channel entry.
+_USER_MESSAGE_ARGUMENT_KEYS: dict[str, tuple[str, ...]] = {
+    "communication.channel.send": ("text",),
+}
+
+
 def _tool_call_use_input(request: dict[str, Any]) -> Any:
-    """Arguments the model authored, without inbound delivery payloads."""
+    """Arguments the model authored as an invocation: no inbound delivery
+    payloads, and no text it addressed to the user."""
     arguments = request.get("arguments", {})
     if not isinstance(arguments, dict):
         return arguments
-    drop = _INBOUND_PAYLOAD_ARGUMENT_KEYS.get(str(request.get("name", "")))
+    name = str(request.get("name", ""))
+    drop = (
+        *_INBOUND_PAYLOAD_ARGUMENT_KEYS.get(name, ()),
+        *_USER_MESSAGE_ARGUMENT_KEYS.get(name, ()),
+    )
     if not drop:
         return arguments
     return {key: value for key, value in arguments.items() if key not in drop}
+
+
+def _user_message_text(entry: dict[str, Any]) -> str:
+    """The text a ``tool_call`` entry addressed to the user, or ``""``."""
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict):
+        return ""
+    keys = _USER_MESSAGE_ARGUMENT_KEYS.get(str(request.get("name", "")), ())
+    return "\n".join(str(arguments[key]) for key in keys if arguments.get(key))
+
+
+def _channel_assistant_texts(entries: list[dict[str, Any]]) -> set[str]:
+    """Every agent-authored Channel text already present in the stream."""
+    texts: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("source") not in (None, "channel"):
+            continue
+        meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
+        data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+        if meta.get("sender_is_user"):
+            continue
+        text = _text_from_data(data)
+        if text:
+            texts.add(text)
+    return texts
+
+
+def _user_message_text_message(
+    entry: dict[str, Any], already_said: set[str]
+) -> dict[str, Any] | None:
+    """An assistant ``text`` message for a send whose words the Channel stream
+    does not already carry, so moving them out of ``tool_use.input`` never
+    drops them from the transcript."""
+    text = _user_message_text(entry)
+    if not text or text in already_said:
+        return None
+    return {
+        "type": "message",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
 
 
 def _tool_call_use_block(entry: dict[str, Any]) -> dict[str, Any]:
@@ -301,7 +365,9 @@ def perdura_channel_messages_to_openclaw_messages(
     - ``"assistant"`` -- one ``model.infer`` completion's plain response
       text; see ``_assistant_entry_to_message``.
     - ``"tool_call"`` -- every other (non-``model.infer``) operation; see
-      ``_tool_call_entry_to_messages``.
+      ``_tool_call_entry_to_messages``. Text the operation addressed to the
+      user is assistant text, not ``tool_use.input``; see
+      ``_USER_MESSAGE_ARGUMENT_KEYS``.
     - ``"task_description"`` -- the Task's own definition, always first; see
       ``_task_description_message``.
     - ``"task_return"`` -- the Task's return value, always last when present;
@@ -313,6 +379,7 @@ def perdura_channel_messages_to_openclaw_messages(
     nothing renderable is skipped, mirroring every other converter here.
     """
     converted: list[dict[str, Any]] = []
+    channel_texts = _channel_assistant_texts(entries)
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -327,6 +394,9 @@ def perdura_channel_messages_to_openclaw_messages(
             if message is not None:
                 converted.append(message)
         elif source == "tool_call":
+            spoken = _user_message_text_message(entry, channel_texts)
+            if spoken is not None:
+                converted.append(spoken)
             converted.extend(_tool_call_entry_to_messages(entry))
         elif source == "task_description":
             message = _task_description_message(entry)

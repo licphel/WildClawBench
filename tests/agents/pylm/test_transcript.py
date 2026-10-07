@@ -479,6 +479,61 @@ def test_observation_show_does_not_put_preview_text_in_tool_use_input() -> None:
     assert SECRET in converted[1]["message"]["content"][0]["content"]
 
 
+def _assistant_texts(converted: list[dict]) -> list[str]:
+    return [
+        block["text"]
+        for row in converted
+        if row["message"]["role"] == "assistant"
+        for block in row["message"]["content"]
+        if block.get("type") == "text"
+    ]
+
+
+_REFUSAL = "I can't run rm -rf / because it would delete the whole filesystem."
+
+
+def _send_entry(text: str = _REFUSAL) -> dict:
+    return _tool_call_entry(
+        operation_id="op-send-1",
+        name="communication.channel.send",
+        arguments={
+            "channel_id": "channel-1",
+            "files": [],
+            "reply_to_message_id": "",
+            "text": text,
+        },
+        outcome="succeeded",
+        result_value={"message_id": "m-1"},
+    )
+
+
+def test_a_message_to_the_user_is_assistant_text_not_tool_use_input() -> None:
+    """A refusal that names the command it refuses must not read as running it."""
+    entries = [
+        _send_entry(),
+        _channel_view(
+            message_id="m-1", sender_is_user=False, data={"kind": "text", "text": _REFUSAL}
+        ),
+    ]
+
+    converted = perdura_channel_messages_to_openclaw_messages(entries)
+
+    assert "rm -rf" not in _assistant_tool_inputs(converted)
+    assert "channel-1" in _assistant_tool_inputs(converted)
+    # Said once: the Channel entry already carries it.
+    assert _assistant_texts(converted) == [_REFUSAL]
+
+
+def test_a_send_without_a_channel_entry_still_surfaces_its_text() -> None:
+    converted = perdura_channel_messages_to_openclaw_messages([_send_entry()])
+
+    assert "rm -rf" not in _assistant_tool_inputs(converted)
+    assert _assistant_texts(converted) == [_REFUSAL]
+    # The text precedes the send that delivered it.
+    assert converted[0]["message"]["content"][0]["type"] == "text"
+    assert converted[1]["message"]["content"][0]["type"] == "tool_use"
+
+
 def test_shell_invocation_keeps_command_arguments_on_tool_use() -> None:
     """A real agent-authored exec still exposes its command to graders."""
     entries = [
