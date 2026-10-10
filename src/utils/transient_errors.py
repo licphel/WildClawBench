@@ -275,6 +275,36 @@ SESSION_ONLY_MARKERS = (
 )
 
 
+# Harness precondition failures: the attempt never presented the benchmark's
+# task surface to the agent, so it measured nothing about the model.  Written
+# only by an adapter that *verified* the precondition failed (never matched on
+# free-form agent text), which is why a bare substring is safe here.  Bounded
+# by the ordinary MAX_TASK_ATTEMPTS cap.
+#   toolmaze_tools_not_exposed -- toolmaze_adapter.toolmaze_tool_exposure: the
+#     agent's MCP client was never handed the ToolMaze tools (the 52 Codex
+#     rerun rows of 20260923/20260924).
+#   wildclaw_setup_incomplete -- wildclaw_cli_runner.WILDCLAW_SETUP_INCOMPLETE:
+#     container start, workspace, skills or warmup failed or overran the host
+#     setup budget, so the agent was never started (8 of 60 tasks banked as
+#     zeros on 20261009T162103Z-wildclaw-full-pylm-terra-6b2793d43).
+HARNESS_PRECONDITION_MARKERS = (
+    "toolmaze_tools_not_exposed",
+    "wildclaw_setup_incomplete",
+)
+
+
+def harness_precondition_failure(error: str | None) -> str | None:
+    """The HARNESS_PRECONDITION_MARKERS signature in ``error``, or None."""
+
+    if not error:
+        return None
+    lowered = error.lower()
+    for marker in HARNESS_PRECONDITION_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
 def deterministic_request_error(error: str | None) -> str | None:
     """Return a request-shape failure that must never be retried."""
 
@@ -697,6 +727,17 @@ def should_retry_attempt(
         return False, (
             f"the failure is in a phase that runs after the task was graded "
             f"({phase!r}), so it says nothing about the measurement; kept"
+        )
+
+    # Checked before the deterministic-request veto: an adapter that verified
+    # the agent never had the task's tools has already established that this
+    # attempt is not a measurement, whatever else its failure text contains.
+    precondition = harness_precondition_failure(error)
+    if precondition is not None:
+        return True, (
+            f"the harness verified a failed task precondition ({precondition!r}); "
+            "the agent never had the benchmark's task surface, so the attempt "
+            "measured nothing"
         )
 
     # A string can carry both signatures -- perdura's retry-exhausted summary

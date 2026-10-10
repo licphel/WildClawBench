@@ -122,7 +122,12 @@ class PyLMAgent(BaseAgent):
 
         in_setup = True
         setup_started = time.perf_counter()
+        marker = cli_runner.WILDCLAW_SETUP_INCOMPLETE
         try:
+            # Built once per lock and shared by every task, so it is not this
+            # task's setup: the clock restarts once it is published.
+            shared_venv = cli_runner.prepare_pylm_task_runtime(self.image)
+            setup_started = time.perf_counter()
             cli_runner._start_container_with_live_mounts(
                 start_container,
                 spec.task_id,
@@ -132,6 +137,7 @@ class PyLMAgent(BaseAgent):
                 image=self.image,
                 enable_nested_isolation=False,
                 pylm_store_host_dir=spec.output_dir / "pylm_store",
+                shared_venv=shared_venv,
             )
             setup_workspace(spec.task_id)
             setup_skills(
@@ -153,7 +159,7 @@ class PyLMAgent(BaseAgent):
                     error=(
                         f"WildClaw setup phase exceeded its {setup_budget:.0f}s "
                         f"budget after {setup_elapsed:.0f}s (container start, "
-                        "workspace, skills, warmup); agent was not started"
+                        f"workspace, skills, warmup); agent was not started [{marker}]"
                     ),
                     gateway_proc=None,
                     agent_proc=None,
@@ -218,7 +224,7 @@ class PyLMAgent(BaseAgent):
             if in_setup:
                 return AgentExecution(
                     elapsed_time=time.perf_counter() - setup_started,
-                    error=f"WildClaw setup failed before agent start: {exc}",
+                    error=f"WildClaw setup failed before agent start [{marker}]: {exc}",
                     gateway_proc=None,
                     agent_proc=None,
                 )

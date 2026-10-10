@@ -55,6 +55,7 @@ from src.utils.transient_errors import (
     MAX_TASK_ATTEMPTS,
     RATE_LIMIT_OVERLOAD_RETRY_DELAY_S,
     attempt_evidence,
+    harness_precondition_failure,
     rate_limit_or_overload_error,
     should_retry_attempt,
     unbounded_provider_error,
@@ -412,6 +413,15 @@ def run_single_task(
         grade_on_error = (
             gateway_usage.backend_name(backend) in GRADE_ON_ERROR_BACKENDS
         )
+        # The agent never had the task: grading the untouched workspace would
+        # bank whatever the checks award for doing nothing as a measurement.
+        setup_incomplete = harness_precondition_failure(result.get("error"))
+        if setup_incomplete is not None:
+            grade_on_error = False
+            result["status"] = setup_incomplete
+            result["scores"] = write_error_score_file(
+                output_dir, task_id, result["error"]
+            )
         should_grade = task.get("automated_checks") and (
             not result.get("error") or grade_on_error
         )
@@ -624,7 +634,7 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
         result = run_single_task(*args, **kwargs)
         attempt += 1
     if result.get("error") and attempt > 1:
-        result["status"] = "all_attempts_failed"
+        result.setdefault("status", "all_attempts_failed")
         result["score"] = 0.0
     _publish_task_result(result)
     result.pop("_output_dir", None)
