@@ -67,7 +67,14 @@ def _judge_relay_base_url() -> str:
         audio_key=audio_key,
         audio_model=audio_model,
     )
-    return relay.base_url
+    return relay.new_grading_scope()
+
+
+def _relay_audit(relay_url: str) -> list[dict]:
+    if not relay_url:
+        return []
+    from eval_framework.judge_relay import grading_relay_audit
+    return grading_relay_audit(relay_url)
 
 GRADER_PYTHON = "/opt/wildclaw-grader/bin/python"
 """The one interpreter every baseline is graded with.
@@ -249,12 +256,50 @@ def run_grading(
         r = None
         interpreter = _grader_interpreter(task_id)
         for attempt in range(1, MAX_GRADING_RETRIES + 2):
+            if attempt > 1 and relay_url:
+                previous_url = relay_url
+                relay_url = _judge_relay_base_url()
+                env_args = [
+                    f"OPENROUTER_BASE_URL={relay_url}"
+                    if arg == f"OPENROUTER_BASE_URL={previous_url}" else arg
+                    for arg in env_args
+                ]
             r = subprocess.run(
                 ["docker", "exec", *env_args, task_id, interpreter, "/tmp/_grade_runner.py"],
                 capture_output=True,
                 text=True,
                 timeout=3200,
             )
+            audit = _relay_audit(relay_url)
+            if audit:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "judge_relay_audit.json").write_text(
+                    json.dumps(audit, indent=2), encoding="utf-8"
+                )
+                (output_dir / f"judge_relay_audit_attempt_{attempt}.json").write_text(
+                    json.dumps(audit, indent=2), encoding="utf-8"
+                )
+            failures = [row for row in audit if row["status"] is None or row["status"] >= 400]
+            if failures:
+                retryable = all(
+                    row["status"] is None or row.get("error") == "upstream_transport_error" or (
+                        row.get("error") == "upstream_http_error"
+                        and row["status"] in {408, 429, 500, 502, 503, 504}
+                    ) for row in failures
+                )
+                if retryable and attempt <= MAX_GRADING_RETRIES:
+                    logger.warning("[%s] Judge relay failed; retrying grading attempt %d", task_id, attempt)
+                    continue
+                # A checker may catch the API error and print numeric zeros.
+                # Preserve its stdout for diagnosis, but never accept those
+                # zeros as a successfully evaluated result.
+                (output_dir / "grading_stdout.txt").write_text(r.stdout, encoding="utf-8")
+                scores = {
+                    "error": "judge relay request failed; see judge_relay_audit.json",
+                    "grading_status": "infrastructure_error",
+                }
+                _write_score(output_dir, task_id, scores)
+                return scores
             if r.returncode == 0:
                 break
             if not is_transient_error(r.stderr) or attempt == MAX_GRADING_RETRIES + 1:
