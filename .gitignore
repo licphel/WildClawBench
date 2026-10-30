@@ -40,3 +40,5 @@ cookies.txt
 output.rar
 output_qwen.rar
 *.rar
+# Temporary Git worktrees are local development state.
+/.worktrees/
