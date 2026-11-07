@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from src.agents.approval_posture import OPENCLAW as OPENCLAW_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
+from src.utils.timing_spans import SpanRecorder
 from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.grading import extract_usage_from_jsonl
 from src.utils.transient_errors import (
@@ -221,6 +222,13 @@ PY"""
             logger.info("[%s] %s", task_id, (r.stdout or "").strip())
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
+        # Execution-time spans (src/utils/timing_spans.py): setup before
+        # start_time is uncounted env_setup; the agent loop (resumed
+        # attempts included) is counted agent; the resident gateway's
+        # start and readiness wait is counted boot, and its terminate (in
+        # run_batch.py, after grading) counted teardown.
+        timing = SpanRecorder(timeout_s=spec.timeout_seconds)
+        timing.start("env_setup")
         gateway_proc = None
         agent_proc = None
         elapsed_time = 0.0
@@ -273,6 +281,8 @@ PY"""
 
             gateway_port = self._resolve_gateway_port(spec.task_id)
 
+            timing.stop("env_setup")
+            timing.start("boot")
             gateway_proc = run_background(
                 spec.task_id,
                 bash_cmd=(
@@ -347,6 +357,8 @@ PY"""
                 else ""
             )
             agent_log = spec.output_dir / "agent.log"
+            timing.stop("boot")
+            timing.start("agent")
             start_time = time.perf_counter()
             resume_attempt = 0
             while True:
@@ -382,8 +394,11 @@ PY"""
                 except subprocess.TimeoutExpired:
                     logger.info("[%s] Agent timed out...", spec.task_id)
                     elapsed_time = float(spec.timeout_seconds)
+                    timing.stop("agent")
+                    timing.start("teardown")
                     self._flush_timed_out_run(spec.task_id, agent_proc)
                     return AgentExecution(
+                        timing=_timing_record(timing, timed_out=True),
                         elapsed_time=elapsed_time,
                         error="OpenClaw run timed out",
                         gateway_proc=gateway_proc,
@@ -438,7 +453,9 @@ PY"""
                         cooldown_reason,
                         RATE_LIMIT_OVERLOAD_RETRY_DELAY_S,
                     )
+                    timing.stop("agent")
                     time.sleep(RATE_LIMIT_OVERLOAD_RETRY_DELAY_S)
+                    timing.start("agent")
                     cooldown_elapsed = time.perf_counter() - cooldown_started
                     excluded_retry_time += cooldown_elapsed
                     excluded_cooldown_time += cooldown_elapsed
@@ -463,6 +480,7 @@ PY"""
 
             logger.info("[%s] Agent exit code: %s", spec.task_id, agent_proc.returncode)
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=False),
                 elapsed_time=elapsed_time,
                 error=None,
                 gateway_proc=gateway_proc,
@@ -475,8 +493,11 @@ PY"""
             # new child was started.  If a live child exists, flush it using
             # the same path as the direct wait timeout.
             elapsed_time = float(spec.timeout_seconds)
+            timing.stop("agent")
+            timing.start("teardown")
             self._flush_timed_out_run(spec.task_id, agent_proc)
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=True),
                 elapsed_time=elapsed_time,
                 error="OpenClaw run timed out",
                 gateway_proc=gateway_proc,
@@ -489,10 +510,13 @@ PY"""
             if agent_proc is not None and agent_proc.poll() is None:
                 # Any unexpected runner failure must still leave the native
                 # transcript in a settled state before collect_usage runs.
+                timing.stop("agent")
+                timing.start("teardown")
                 self._flush_timed_out_run(spec.task_id, agent_proc)
             if start_time is not None:
                 elapsed_time = active_elapsed()
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=False),
                 elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=gateway_proc,
@@ -807,3 +831,15 @@ PY"""
             text=True,
         )
         logger.info("[%s] imageModel set: %s", task_id, model)
+
+
+def _timing_record(timing: SpanRecorder, *, timed_out: bool) -> dict:
+    """Close whatever is still open and render the ``timing`` block.
+
+    A timeout is recorded with its real elapsed time (the spans as they
+    ran) and ``timed_out: true`` -- never as the budget itself, which is
+    what the legacy ``elapsed_time`` field reports on that path.
+    """
+    timing.stop_all()
+    timing.mark_timeout(timed_out)
+    return timing.to_record()

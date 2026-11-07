@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from src.agents.approval_posture import CLAUDE as CLAUDE_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
+from src.utils.timing_spans import SpanRecorder
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
 from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
@@ -170,6 +171,13 @@ class ClaudeCodeAgent(BaseAgent):
             return CLAUDECODE_COMPAT_TRANSCRIPT_PATH
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
+        # Execution-time spans (src/utils/timing_spans.py): setup before
+        # start_time is uncounted env_setup; the agent loop (resumed
+        # attempts included) is counted agent; the in-container CLI process
+        # is spawned inside it, so its boot is inside agent.
+        timing = SpanRecorder(timeout_s=spec.timeout_seconds)
+        timing.boot_included_in = "agent"
+        timing.start("env_setup")
         elapsed_time = 0.0
         # start_time is set only after setup completes, right before the
         # real prompt execution begins -- container start, workspace prep,
@@ -198,6 +206,8 @@ class ClaudeCodeAgent(BaseAgent):
             )
             run_warmup(task_id, spec.task.get("warmup", ""))
             snapshot_workspace_state(task_id)
+            timing.stop("env_setup")
+            timing.start("agent")
             start_time = time.perf_counter()
             wrapper_retry_seconds = self._run_prompt(
                 task_id,
@@ -227,6 +237,7 @@ class ClaudeCodeAgent(BaseAgent):
                     task_id, elapsed_time, wrapper_retry_seconds,
                 )
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=False),
                 elapsed_time=elapsed_time,
                 error=None,
                 gateway_proc=None,
@@ -235,8 +246,11 @@ class ClaudeCodeAgent(BaseAgent):
             )
         except subprocess.TimeoutExpired:
             logger.info("[%s] ClaudeCode timed out...", task_id)
+            timing.stop("agent")
+            timing.start("teardown")
             self._flush_timed_out_run(task_id)
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=True),
                 elapsed_time=float(spec.timeout_seconds),
                 error="ClaudeCode run timed out",
                 gateway_proc=None,
@@ -248,6 +262,8 @@ class ClaudeCodeAgent(BaseAgent):
             # The PID file makes this a no-op when setup failed before Claude
             # launched, but protects the native log if an unexpected wrapper
             # exception occurs while the in-container process is still live.
+            timing.stop("agent")
+            timing.start("teardown")
             self._flush_timed_out_run(task_id)
             # start_time is None if setup itself raised before the real
             # prompt execution began -- report 0.0 rather than crash on
@@ -257,6 +273,7 @@ class ClaudeCodeAgent(BaseAgent):
                 max(0.0, time.perf_counter() - start_time) if start_time is not None else 0.0
             )
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=False),
                 elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=None,
@@ -1136,3 +1153,15 @@ pkill -INT -x claude 2>/dev/null || true
             + totals["cache_read_tokens"] / 1_000_000 * cache_read_price
             + totals["cache_write_tokens"] / 1_000_000 * cache_write_price
         )
+
+
+def _timing_record(timing: SpanRecorder, *, timed_out: bool) -> dict:
+    """Close whatever is still open and render the ``timing`` block.
+
+    A timeout is recorded with its real elapsed time (the spans as they
+    ran) and ``timed_out: true`` -- never as the budget itself, which is
+    what the legacy ``elapsed_time`` field reports on that path.
+    """
+    timing.stop_all()
+    timing.mark_timeout(timed_out)
+    return timing.to_record()

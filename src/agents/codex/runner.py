@@ -14,6 +14,7 @@ from typing import Any
 
 from src.agents.approval_posture import CODEX as CODEX_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
+from src.utils.timing_spans import SpanRecorder
 from src.agents.codex.backend import (
     CODEX_PROMPT_PATH,
     load_skill_documents,
@@ -190,6 +191,13 @@ class CodexAgent(BaseAgent):
         return CODEX_SESSIONS_DIR
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
+        # Execution-time spans (src/utils/timing_spans.py): setup before
+        # start_time is uncounted env_setup; the agent loop (resumed
+        # attempts included) is counted agent; the in-container CLI process
+        # is spawned inside it, so its boot is inside agent.
+        timing = SpanRecorder(timeout_s=spec.timeout_seconds)
+        timing.boot_included_in = "agent"
+        timing.start("env_setup")
         elapsed_time = float(spec.timeout_seconds)
         # start_time is set later, right before the real prompt execution
         # begins -- see the assignment above write_execution_status(...,
@@ -293,6 +301,8 @@ class CodexAgent(BaseAgent):
                     self._install_image_helper(task_id, spec.model)
                 snapshot_workspace_state(task_id)
                 write_execution_status(spec.output_dir, status="codex_running")
+                timing.stop("env_setup")
+                timing.start("agent")
                 start_time = time.perf_counter()
                 wrapper_retry_seconds = self._run_prompt(
                     task_id=task_id,
@@ -328,6 +338,7 @@ class CodexAgent(BaseAgent):
                     exit_code=0,
                 )
                 return AgentExecution(
+                    timing=_timing_record(timing, timed_out=False),
                     elapsed_time=elapsed_time,
                     error=None,
                     gateway_proc=None,
@@ -354,6 +365,7 @@ class CodexAgent(BaseAgent):
                     error="Codex run timed out",
                 )
                 return AgentExecution(
+                    timing=_timing_record(timing, timed_out=True),
                     elapsed_time=elapsed_time,
                     error="Codex run timed out",
                     gateway_proc=None,
@@ -385,6 +397,7 @@ class CodexAgent(BaseAgent):
                     elapsed_time=round(elapsed_time, 2),
                 )
                 return AgentExecution(
+                    timing=_timing_record(timing, timed_out=False),
                     elapsed_time=elapsed_time,
                     error=str(exc),
                     gateway_proc=None,
@@ -1914,3 +1927,15 @@ _USAGE_KEYS = {
     "reasoningOutputTokens",
     "reasoning_tokens",
 }
+
+
+def _timing_record(timing: SpanRecorder, *, timed_out: bool) -> dict:
+    """Close whatever is still open and render the ``timing`` block.
+
+    A timeout is recorded with its real elapsed time (the spans as they
+    ran) and ``timed_out: true`` -- never as the budget itself, which is
+    what the legacy ``elapsed_time`` field reports on that path.
+    """
+    timing.stop_all()
+    timing.mark_timeout(timed_out)
+    return timing.to_record()

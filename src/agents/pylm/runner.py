@@ -10,6 +10,7 @@ from pathlib import Path
 
 from src.agents.approval_posture import PERDURA as PERDURA_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
+from src.utils.timing_spans import SpanRecorder
 
 
 class PyLMAgent(BaseAgent):
@@ -123,6 +124,11 @@ class PyLMAgent(BaseAgent):
         in_setup = True
         setup_started = time.perf_counter()
         marker = cli_runner.WILDCLAW_SETUP_INCOMPLETE
+        # Uncounted env_setup here; _run_container_cli assembles the counted
+        # in-container ``perdura run`` span and the provider_setup/export
+        # around it (eval_framework/wildclaw_cli_runner.py).
+        timing = SpanRecorder(timeout_s=spec.timeout_seconds)
+        timing.start("env_setup")
         try:
             # Built once per lock and shared by every task, so it is not this
             # task's setup: the clock restarts once it is published.
@@ -153,8 +159,10 @@ class PyLMAgent(BaseAgent):
             )
             setup_elapsed = time.perf_counter() - setup_started
             setup_budget = cli_runner.WILDCLAW_HOST_SETUP_MAX_SECONDS
+            timing.stop("env_setup")
             if setup_elapsed > setup_budget:
                 return AgentExecution(
+                    timing=timing.to_record(),
                     elapsed_time=setup_elapsed,
                     error=(
                         f"WildClaw setup phase exceeded its {setup_budget:.0f}s "
@@ -213,7 +221,9 @@ class PyLMAgent(BaseAgent):
             }
             record_posture(spec.output_dir, PERDURA_POSTURE, applied=posture_intent)
             self._summaries[spec.task_id] = summary
+            timing.absorb(summary.get("timing"))
             return AgentExecution(
+                timing=timing.to_record(),
                 elapsed_time=elapsed,
                 error=error,
                 gateway_proc=None,
@@ -221,14 +231,17 @@ class PyLMAgent(BaseAgent):
             )
         except Exception as exc:
             self._summaries[spec.task_id] = {}
+            timing.stop_all()
             if in_setup:
                 return AgentExecution(
+                    timing=timing.to_record(),
                     elapsed_time=time.perf_counter() - setup_started,
                     error=f"WildClaw setup failed before agent start [{marker}]: {exc}",
                     gateway_proc=None,
                     agent_proc=None,
                 )
             return AgentExecution(
+                timing=timing.to_record(),
                 elapsed_time=float(spec.timeout_seconds),
                 error=str(exc),
                 gateway_proc=None,

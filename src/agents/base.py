@@ -40,6 +40,12 @@ class AgentExecution:
     # is also surfaced separately because it is excluded from elapsed_time,
     # not merely refunded from the next attempt's timeout budget.
     excluded_provider_cooldown_time: float | None = None
+    # The uniform execution-time record (src/utils/timing_spans.py, mirrored
+    # from eval_framework/timing_spans.py): counted boot/agent/teardown spans
+    # beside the uncounted setup ones.  run_batch.py adds export/judge and
+    # the gateway teardown it owns, then writes it into usage.json and
+    # task_result.json as "timing".  None for a runner that has none.
+    timing: dict[str, Any] | None = None
 
 
 class BaseAgent(ABC):

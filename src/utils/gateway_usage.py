@@ -216,8 +216,11 @@ RUNTIME_RETIRED_SEMANTICS = frozenset(
 
 #: ``includes_container_setup``
 #:     whether container start, workspace prep, skills and warmup sit inside
-#:     the clock.  This is the discriminating field: two baselines open the
-#:     clock before the container exists, three after.
+#:     the clock.  False for every baseline in current use: claudecode and
+#:     codex used to open the clock at run_task entry, before the container
+#:     existed, but since WildClawBench 202cd53 all five start it after setup.
+#:     The cross-baseline comparable number is the ``timing`` block
+#:     (src/utils/timing_spans.py), not ``elapsed_time``.
 #: ``excludes_wrapper_retry_time``
 #:     whether the Python wrapper subtracted the time its own retry attempts
 #:     and backoff cost.  False for every baseline in current use -- two of
@@ -234,16 +237,20 @@ RUNTIME_RETIRED_SEMANTICS = frozenset(
 #:     so that records already on disk stay readable.
 RUNTIME_DEFINITIONS = {
     RUNTIME_TASK_WITH_RETRIES: {
-        "includes_container_setup": True,
+        "includes_container_setup": False,
         "excludes_wrapper_retry_time": False,
         "includes_in_container_retry_time": True,
         "retry_sites": ["wrapper", "in-agent"],
-        "note": "clock opens at run_task entry, before the container starts, "
-                "so container start, workspace prep, skills and warmup are "
-                "inside it; nothing is subtracted -- the wrapper's own resumed "
-                "attempts and their backoff are inside the number, as are the "
-                "agent's internal retries.  The wrapper still measures its own "
-                "retry time, but only to refund the task budget",
+        "note": "claudecode/codex.  Since WildClawBench 202cd53 the clock "
+                "opens after container start, workspace prep, skills, warmup "
+                "and config writing, right before the CLI process -- it used "
+                "to open at run_task entry, and this flag said so until it was "
+                "corrected; records written before 202cd53 under this id did "
+                "include container setup.  Nothing is subtracted: the "
+                "wrapper's own resumed attempts and their backoff are inside "
+                "the number, as are the agent's internal retries.  On a "
+                "timeout elapsed_time is the budget itself, not the real "
+                "elapsed time; the timing block records the real one",
     },
     RUNTIME_AGENT_WITH_RETRIES: {
         "includes_container_setup": False,

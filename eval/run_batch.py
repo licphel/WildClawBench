@@ -61,6 +61,7 @@ from src.utils.transient_errors import (
     unbounded_provider_error,
 )
 from src.utils import gateway_usage
+from src.utils.timing_spans import SpanRecorder
 from credential_resolution import ensure_wildclaw_judge_env
 
 load_dotenv()
@@ -362,6 +363,10 @@ def run_single_task(
     # (see each ``src/agents/<backend>/runner.py``) for the gateway to have
     # anything to bucket by.
     usage_window = gateway_usage.GatewayUsageWindow.open(task_id=task_id)
+    # The runner's own spans (setup, boot, agent) plus what this driver does
+    # around them: grading (judge), artifact collection (export) and the
+    # resident gateway's terminate (teardown, counted).
+    timing = SpanRecorder(timeout_s=timeout_seconds)
 
     try:
         execution = backend.run_task(
@@ -383,6 +388,7 @@ def run_single_task(
         elapsed_time = execution.elapsed_time
         excluded_retry_time = execution.excluded_retry_time
         excluded_provider_cooldown_time = execution.excluded_provider_cooldown_time
+        timing.absorb(execution.timing)
         if execution.error:
             result["error"] = execution.error
     except Exception as exc:
@@ -437,17 +443,18 @@ def run_single_task(
                 )
 
         try:
-            result = grade_the_task(
-                task_id,
-                workspace_path,
-                output_dir,
-                task,
-                result,
-                lobster.get("env") if lobster else None,
-                transcript_container_path=grading_transcript_path,
-                grade_on_error=grade_on_error,
-                write_error_score_on_failure=grade_on_error,
-            )
+            with timing.span("judge"):
+                result = grade_the_task(
+                    task_id,
+                    workspace_path,
+                    output_dir,
+                    task,
+                    result,
+                    lobster.get("env") if lobster else None,
+                    transcript_container_path=grading_transcript_path,
+                    grade_on_error=grade_on_error,
+                    write_error_score_on_failure=grade_on_error,
+                )
         except Exception as exc:
             # Scoring is best effort.  It must not suppress usage collection
             # when a timed-out container leaves an incomplete transcript.
@@ -455,11 +462,12 @@ def run_single_task(
             result["error"] = result.get("error") or str(exc)
 
         try:
-            usage = backend.collect_usage(
-                task_id=task_id,
-                output_dir=output_dir,
-                elapsed_time=elapsed_time,
-            )
+            with timing.span("export"):
+                usage = backend.collect_usage(
+                    task_id=task_id,
+                    output_dir=output_dir,
+                    elapsed_time=elapsed_time,
+                )
             if not isinstance(usage, dict):
                 raise TypeError(f"backend returned {type(usage).__name__}, expected dict")
         except Exception as exc:
@@ -497,6 +505,8 @@ def run_single_task(
             usage["cache_semantics"] = gateway_usage.self_reported_cache_semantics(backend)
             usage["annotation_error"] = str(exc)
 
+        usage["timing"] = timing.to_record()
+        result["timing"] = usage["timing"]
         try:
             result = save_usage(output_dir, result, usage, task_id)
         except Exception as exc:
@@ -510,21 +520,24 @@ def run_single_task(
                 logger.exception("[%s] Writing fallback usage.json also failed", task_id)
 
         try:
-            collect_task_output(
-                task_id,
-                output_dir,
-                include_workspace_changes=isinstance(
-                    backend, (CodexAgent, ClaudeCodeAgent, PyLMAgent)
-                ),
-            )
+            with timing.span("export"):
+                collect_task_output(
+                    task_id,
+                    output_dir,
+                    include_workspace_changes=isinstance(
+                        backend, (CodexAgent, ClaudeCodeAgent, PyLMAgent)
+                    ),
+                )
         except Exception as exc:
             logger.warning("[%s] Failed to collect task output: %s", task_id, exc)
 
         if gateway_proc is not None:
-            try:
-                gateway_proc.terminate()
-            except Exception:
-                pass
+            # Counted: stopping the harness's resident gateway (OpenClaw).
+            with timing.span("teardown"):
+                try:
+                    gateway_proc.terminate()
+                except Exception:
+                    pass
         elif backend.expects_gateway:
             logger.warning("[%s] Gateway not started, task incomplete - likely missing required result files, check %s", task_id, output_dir)
 
@@ -539,8 +552,25 @@ def run_single_task(
         if isinstance(backend, PyLMAgent):
             backend.cleanup_staging(task_id)
         logger.info("[%s] Container cleaned up", task_id)
+        # usage.json was written before artifact collection and the gateway
+        # teardown; re-stamp its timing so both files carry the final record.
+        result["timing"] = timing.to_record()
+        _restamp_usage_timing(output_dir, result["timing"])
 
     return result
+
+
+def _restamp_usage_timing(output_dir: Path, timing_record: dict) -> None:
+    usage_path = Path(output_dir) / "usage.json"
+    try:
+        payload = json.loads(usage_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload["timing"] = timing_record
+            usage_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Failed to re-stamp timing into %s: %s", usage_path, exc)
 
 
 # Infra-level hiccups (npm registry connection reset mid-download, upstream LLM

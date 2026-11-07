@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from src.agents.approval_posture import HERMES as HERMES_POSTURE, record as record_posture
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
+from src.utils.timing_spans import SpanRecorder
 from src.utils.docker_utils import (
     run_warmup,
     setup_skills,
@@ -98,6 +99,13 @@ class HermesAgentAgent(BaseAgent):
         return self.transcript_container_path
 
     def run_task(self, spec: AgentTaskSpec) -> AgentExecution:
+        # Execution-time spans (src/utils/timing_spans.py): setup before
+        # start_time is uncounted env_setup; the agent loop (resumed
+        # attempts included) is counted agent; the in-container CLI process
+        # is spawned inside it, so its boot is inside agent.
+        timing = SpanRecorder(timeout_s=spec.timeout_seconds)
+        timing.boot_included_in = "agent"
+        timing.start("env_setup")
         elapsed_time = 0.0
         agent_proc = None
         start_time: float | None = None
@@ -157,6 +165,8 @@ class HermesAgentAgent(BaseAgent):
                 api_key, base_url, reasoning_config,
             )
 
+            timing.stop("env_setup")
+            timing.start("agent")
             start_time = time.perf_counter()
             resume_attempt = 0
             while True:
@@ -210,9 +220,12 @@ class HermesAgentAgent(BaseAgent):
                 except subprocess.TimeoutExpired:
                     logger.info("[%s] hermes-agent timed out...", spec.task_id)
                     elapsed_time = float(spec.timeout_seconds)
+                    timing.stop("agent")
+                    timing.start("teardown")
                     self._flush_timed_out_run(spec.task_id, agent_proc)
                     self._cleanup_bench_config(spec.task_id)
                     return AgentExecution(
+                        timing=_timing_record(timing, timed_out=True),
                         elapsed_time=elapsed_time,
                         error="Hermes run timed out",
                         gateway_proc=None,
@@ -276,6 +289,7 @@ class HermesAgentAgent(BaseAgent):
             self._cleanup_bench_config(spec.task_id)
 
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=False),
                 elapsed_time=elapsed_time,
                 error=None,
                 gateway_proc=None,
@@ -286,6 +300,8 @@ class HermesAgentAgent(BaseAgent):
             if agent_proc is not None and agent_proc.poll() is None:
                 # Settle a live child on every failure path, not only the
                 # explicit wall-clock timeout path, before usage collection.
+                timing.stop("agent")
+                timing.start("teardown")
                 self._flush_timed_out_run(spec.task_id, agent_proc)
             elif agent_proc is not None:
                 self._close_runner_streams(agent_proc)
@@ -294,6 +310,7 @@ class HermesAgentAgent(BaseAgent):
             if start_time is not None:
                 elapsed_time = max(0.0, time.perf_counter() - start_time)
             return AgentExecution(
+                timing=_timing_record(timing, timed_out=isinstance(exc, subprocess.TimeoutExpired)),
                 elapsed_time=elapsed_time,
                 error=str(exc),
                 gateway_proc=None,
@@ -1005,3 +1022,15 @@ fi
             logger.info("[%s] Hermes session logs copied to %s", task_id, hermes_log_dest)
         else:
             logger.warning("[%s] Hermes session log copy failed: %s", task_id, r.stderr.strip())
+
+
+def _timing_record(timing: SpanRecorder, *, timed_out: bool) -> dict:
+    """Close whatever is still open and render the ``timing`` block.
+
+    A timeout is recorded with its real elapsed time (the spans as they
+    ran) and ``timed_out: true`` -- never as the budget itself, which is
+    what the legacy ``elapsed_time`` field reports on that path.
+    """
+    timing.stop_all()
+    timing.mark_timeout(timed_out)
+    return timing.to_record()
