@@ -57,6 +57,7 @@ from src.utils.transient_errors import (
     attempt_evidence,
     harness_precondition_failure,
     rate_limit_or_overload_error,
+    runtime_infra_void_reason,
     should_retry_attempt,
     unbounded_provider_error,
 )
@@ -663,7 +664,14 @@ def run_single_task_with_retry(*args, **kwargs) -> dict:
             time.sleep(RATE_LIMIT_OVERLOAD_RETRY_DELAY_S)
         result = run_single_task(*args, **kwargs)
         attempt += 1
-    if result.get("error") and attempt > 1:
+    void = runtime_infra_void_reason(result.get("error"))
+    if void is not None:
+        # The agent runtime, not the agent, failed on every attempt: excluded
+        # from the score (build_benchmark_table reads benchmark_valid), kept.
+        result["benchmark_valid"] = False
+        result["invalid_reason"] = void
+        logger.warning("[%s] Voided: %s", result.get("task_id"), void)
+    elif result.get("error") and attempt > 1:
         result.setdefault("status", "all_attempts_failed")
         result["score"] = 0.0
     _publish_task_result(result)

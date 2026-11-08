@@ -293,6 +293,54 @@ HARNESS_PRECONDITION_MARKERS = (
 )
 
 
+#: The agent runtime itself failed, not the agent: Perdura's Context completion
+#: report says ``execution_status: "failed"`` with ``execution_error.code:
+#: "infra_failure"`` (seen on the B/T ablation levels as the
+#: ``agent_prompt_cache_prefix`` ValueError, with the goal still ``pending``).
+#: Written only by the eval-side readers of that report -- never matched on
+#: agent text -- as ``f"{RUNTIME_INFRA_FAILURE_MARKER}: <message>"``.  Retried
+#: once under the ordinary MAX_TASK_ATTEMPTS cap; when the last attempt still
+#: carries it the Task is voided (``runtime_infra_void_reason``), not scored 0.
+RUNTIME_INFRA_FAILURE_MARKER = "perdura_runtime_infra_failure"
+
+
+def runtime_infra_code(report: object) -> bool:
+    """True when a Context completion report is a failed runtime, not agent.
+
+    Reads ``execution_error.code`` (and ``error.code``) of a report whose goal
+    or execution failed; only ``infra_failure`` qualifies.
+    """
+
+    if not isinstance(report, dict):
+        return False
+    if report.get("status") != "failed" and report.get("execution_status") != "failed":
+        return False
+    for key in ("execution_error", "error"):
+        detail = report.get(key)
+        if isinstance(detail, dict) and detail.get("code") == "infra_failure":
+            return True
+    return False
+
+
+def runtime_infra_failure(error: str | None) -> str | None:
+    """RUNTIME_INFRA_FAILURE_MARKER if ``error`` carries it, else None."""
+
+    if error and RUNTIME_INFRA_FAILURE_MARKER in error.lower():
+        return RUNTIME_INFRA_FAILURE_MARKER
+    return None
+
+
+def runtime_infra_void_reason(error: str | None) -> str | None:
+    """Why a Task whose final attempt is a runtime infra failure is void."""
+
+    if runtime_infra_failure(error) is None:
+        return None
+    return (
+        "the agent runtime failed with infra_failure on every attempt; "
+        "the Task measured nothing about the agent and is excluded"
+    )
+
+
 def harness_precondition_failure(error: str | None) -> str | None:
     """The HARNESS_PRECONDITION_MARKERS signature in ``error``, or None."""
 
@@ -738,6 +786,12 @@ def should_retry_attempt(
             f"the harness verified a failed task precondition ({precondition!r}); "
             "the agent never had the benchmark's task surface, so the attempt "
             "measured nothing"
+        )
+
+    if runtime_infra_failure(error) is not None:
+        return True, (
+            "the agent runtime reported execution_error.code=infra_failure; "
+            "the runtime, not the agent, failed, so the attempt measured nothing"
         )
 
     # A string can carry both signatures -- perdura's retry-exhausted summary
