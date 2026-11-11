@@ -59,3 +59,33 @@ def test_unfinished_request_cannot_become_valid_zero(tmp_path, monkeypatch):
     prepare(monkeypatch, {scope: [{'route': 'web_search', 'status': None}]
                           for scope in ['scope-1', 'scope-2', 'scope-3']})
     assert grading.run_grading('task', '', tmp_path)['grading_status'] == 'infrastructure_error'
+
+
+def _prepare_stdout(monkeypatch, stdouts):
+    scopes = iter(['scope-1', 'scope-2', 'scope-3'])
+    monkeypatch.setattr(grading, '_judge_relay_base_url', lambda: next(scopes))
+    monkeypatch.setattr(grading, '_relay_audit', lambda scope: [])
+    monkeypatch.setattr(grading, '_grader_interpreter', lambda task: 'python')
+    outs = iter(stdouts)
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=next(outs), stderr='')
+    monkeypatch.setattr(grading.subprocess, 'run', run)
+    return calls
+
+
+def test_a_judge_call_that_never_reached_the_relay_is_not_a_valid_zero(tmp_path, monkeypatch):
+    # The relay saw nothing (empty audit); the checker caught a client timeout.
+    failed = '{"judge_error": "Request timed out.", "overall_score": 0}'
+    calls = _prepare_stdout(monkeypatch, [failed] * 3)
+    scores = grading.run_grading('task', '', tmp_path, write_error_score=True)
+    assert scores['grading_status'] == 'infrastructure_error'
+    assert 'Request timed out.' in scores['error']
+    assert len([call for call in calls if call[1] == 'exec']) == 3
+
+
+def test_a_judge_error_retries_and_a_later_success_counts(tmp_path, monkeypatch):
+    failed = '{"judge_error": "Request timed out.", "overall_score": 0}'
+    _prepare_stdout(monkeypatch, [failed, '{"overall_score": 0.3, "judge_reason": "ok"}'])
+    assert grading.run_grading('task', '', tmp_path)['overall_score'] == 0.3

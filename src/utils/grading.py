@@ -70,6 +70,25 @@ def _judge_relay_base_url() -> str:
     return relay.new_grading_scope()
 
 
+def _judge_error_in(stdout: str) -> str:
+    """The checker's reported judge failure, from its last JSON line, or ``""``."""
+
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            scores = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(scores, dict):
+            for key in ("judge_error", "llm_judge_error"):
+                if scores.get(key):
+                    return str(scores[key])
+        return ""
+    return ""
+
+
 def _relay_audit(relay_url: str) -> list[dict]:
     if not relay_url:
         return []
@@ -296,6 +315,21 @@ def run_grading(
                 (output_dir / "grading_stdout.txt").write_text(r.stdout, encoding="utf-8")
                 scores = {
                     "error": "judge relay request failed; see judge_relay_audit.json",
+                    "grading_status": "infrastructure_error",
+                }
+                _write_score(output_dir, task_id, scores)
+                return scores
+            if r.returncode == 0 and relay_url and _judge_error_in(r.stdout):
+                # The checker's own judge call failed (for example it never
+                # reached the relay, so the audit above is empty) and it fell
+                # back to a score of its own.  That score measures nothing.
+                if attempt <= MAX_GRADING_RETRIES:
+                    logger.warning("[%s] Judge call failed inside the checker; retrying grading attempt %d", task_id, attempt)
+                    continue
+                (output_dir / "grading_stdout.txt").write_text(r.stdout, encoding="utf-8")
+                scores = {
+                    "error": "judge request failed inside the checker: "
+                    + _judge_error_in(r.stdout)[:300],
                     "grading_status": "infrastructure_error",
                 }
                 _write_score(output_dir, task_id, scores)
