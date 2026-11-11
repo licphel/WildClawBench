@@ -70,7 +70,8 @@ def _prepare_stdout(monkeypatch, stdouts):
     calls = []
     def run(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=0, stdout=next(outs), stderr='')
+        stdout = next(outs) if cmd[1] == 'exec' else ''
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
     monkeypatch.setattr(grading.subprocess, 'run', run)
     return calls
 
