@@ -5,7 +5,8 @@ until this module existed the *declaration* lived in three unrelated kinds of
 place and only two of them were in the repository:
 
     codex      harness argv    ``--dangerously-bypass-approvals-and-sandbox``
-    perdura    harness argv    ``--sandbox-mode dangerous_skip``
+    perdura    harness argv    ``--sandbox-mode dangerous_skip`` (and, since
+                               2026-11-14, the Instance settings too)
     claude     Docker layer    ``/claude_code/start.sh`` ran
                                ``claude --dangerously-skip-permissions``; the
                                harness only set ``IS_SANDBOX=1``
@@ -143,18 +144,24 @@ HERMES = ApprovalPosture(
 
 PERDURA = ApprovalPosture(
     baseline="perdura",
-    mechanism="argv",
+    mechanism="argv+config",
     argv=("--sandbox-mode", "dangerous_skip", "--non-interactive"),
+    config={"sandbox": "full-access", "approval": "never"},
     rationale=(
-        "Perdura denies a tool call under its default policy and falls back to "
-        "request_access(), which suspends a headless run waiting for an "
-        "operator approval that never arrives. The benchmark therefore enables "
-        "the explicit non-interactive Run mode together with dangerous_skip: "
-        "the combination auto-confirms canonical confirmation requests while "
-        "returning other human-input requests as awaiting_interaction. See "
-        "apps/perdura-cli/src/perdura/cli/sandbox_confirmation.py: naming "
-        "dangerous_skip is itself the complete authority grant and forces "
-        "access_level=full plus the File/Network/Tool ANY wildcard."
+        "Perdura's product defaults are sandbox workspace-write with approval "
+        "on-request: an operation outside the boundary parks the Run on an "
+        "operator approval that a headless container never answers. The "
+        "harness's --sandbox-mode dangerous_skip is a legacy alias that "
+        "eval_framework/pylm_permissions.py resolves to `perdura run --sandbox "
+        "full-access --approval never`, plus --non-interactive. Perdura "
+        "consumes those run flags for the first Run of the Context only "
+        "(perdura/kernel/context/admission.py::resolve_run_configuration); any "
+        "later Run in the same Context resolves the Instance settings. So the "
+        "container entry also writes the same posture as the Instance default "
+        "(`perdura --instance DIR settings set --sandbox full-access --approval "
+        "never`) before the run starts and checks the settings Perdura prints "
+        "back. `applied.resolved.instance_posture` records that read-back; "
+        "`config` above is the Instance setting it writes."
     ),
 )
 

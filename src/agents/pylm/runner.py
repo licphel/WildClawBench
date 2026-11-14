@@ -190,10 +190,11 @@ class PyLMAgent(BaseAgent):
                 "delivered_as": "perdura CLI argv",
                 "sandbox_mode": sandbox_mode,
                 "overridden_by_env": sandbox_mode != PERDURA_POSTURE.argv[1],
-                # wildclaw_cli_container_entry.py probes `perdura run --help`
-                # and only appends this when the build still accepts it;
-                # current perdura does not (sandbox_confirmation.py: "no
-                # separate confirmation flag exists").
+                # Historical field: current perdura has no separate
+                # confirmation flag; dangerous_skip resolves to
+                # `--sandbox full-access --approval never` (run flags) and the
+                # same pair is written as the Instance default
+                # (`resolved.instance_posture`).
                 "confirm_dangerous_skip_requested": confirm_dangerous_skip,
                 "non_interactive_requested": non_interactive,
                 "resolved": "pending: container has not reported yet",
