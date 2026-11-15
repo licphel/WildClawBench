@@ -639,12 +639,21 @@ PY"""
             return None
 
     @staticmethod
-    def _background_state(probe: dict) -> tuple[str, int]:
+    def _background_state(
+        probe: dict, *, baseline_events: int | None = None, cli_exit_ms: int | None = None,
+    ) -> tuple[str, int]:
         """Classify a probe: ``none`` / ``active`` / ``awaiting_turn`` / ``settled``.
 
         Returns the state and the last task end (epoch ms, 0 when unknown).
         ``settled`` still needs the transcript to be quiet across polls, which
         the caller tracks.
+
+        A completion turn is recognised by the transcript having grown since
+        the CLI exited (``baseline_events``), not by timestamps: OpenClaw
+        stamps the task ``ended_at`` only after its completion turn has
+        delivered, so that turn's final message predates ``ended_at``
+        (measured: by 231 ms).  Work that ended before the CLI exited was
+        delivered into the CLI's own run and needs no further turn.
         """
         tasks = [t for t in (probe.get("tasks") or []) if _is_detached_work(t)]
         if not tasks:
@@ -652,13 +661,20 @@ PY"""
         if any(t.get("status") in _ACTIVE_TASK_STATUSES for t in tasks):
             return "active", 0
         last_end = max(int(t.get("ended_at") or 0) for t in tasks)
-        last_ts = probe.get("last_ts")
-        if (
+        final_assistant = (
             probe.get("last_role") == "assistant"
             and probe.get("last_stop") not in (None, "toolUse")
-            and isinstance(last_ts, (int, float))
-            and last_ts >= last_end
-        ):
+        )
+        events = probe.get("events")
+        turn_ran = (
+            (cli_exit_ms is not None and last_end and last_end <= cli_exit_ms)
+            or (
+                baseline_events is not None
+                and isinstance(events, int)
+                and events > baseline_events
+            )
+        )
+        if final_assistant and turn_ran:
             return "settled", last_end
         return "awaiting_turn", last_end
 
@@ -686,12 +702,19 @@ PY"""
         outcome = "no_background_tasks"
         logged_state: str | None = None
         probe: dict | None = None
+        cli_exit_ms = int(time.time() * 1000)
+        baseline_events: int | None = None
         while True:
             probe = self._probe_background_work(task_id)
             if probe is None:
                 outcome = "probe_failed"
                 break
-            state, last_end = self._background_state(probe)
+            if baseline_events is None and isinstance(probe.get("events"), int):
+                baseline_events = probe["events"]
+                record["baseline_events"] = baseline_events
+            state, last_end = self._background_state(
+                probe, baseline_events=baseline_events, cli_exit_ms=cli_exit_ms,
+            )
             if state == "none":
                 break
             now = time.monotonic()

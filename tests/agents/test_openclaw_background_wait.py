@@ -40,15 +40,27 @@ def test_state_active_while_task_running() -> None:
     )[0] == "active"
 
 
-def test_state_awaits_turn_until_final_assistant_after_task_end() -> None:
+def test_state_awaits_turn_until_transcript_grows_after_cli_exit() -> None:
     done = [_task("succeeded", NOW_MS)]
-    # Last message predates the task's end: the completion turn has not run.
-    assert OpenClawAgent._background_state(_probe(done, ts=NOW_MS - 1))[0] == "awaiting_turn"
+    kw = {"baseline_events": 10, "cli_exit_ms": NOW_MS - 60_000}
+    # Nothing written since the CLI exited: the completion turn has not run.
+    assert OpenClawAgent._background_state(_probe(done, events=10), **kw)[0] == "awaiting_turn"
     # Completion turn still mid tool call.
     assert OpenClawAgent._background_state(
-        _probe(done, stop="toolUse", ts=NOW_MS + 5)
+        _probe(done, events=13, stop="toolUse"), **kw
     )[0] == "awaiting_turn"
-    assert OpenClawAgent._background_state(_probe(done, ts=NOW_MS + 5)) == ("settled", NOW_MS)
+    # Measured shape: the turn's final message is stamped 231 ms *before*
+    # the task's ended_at; growth, not timestamps, decides.
+    assert OpenClawAgent._background_state(
+        _probe(done, events=14, ts=NOW_MS - 231), **kw
+    ) == ("settled", NOW_MS)
+
+
+def test_work_finished_before_cli_exit_needs_no_turn() -> None:
+    done = [_task("succeeded", NOW_MS - 5_000)]
+    assert OpenClawAgent._background_state(
+        _probe(done, events=10), baseline_events=10, cli_exit_ms=NOW_MS,
+    )[0] == "settled"
 
 
 def _run_wait(monkeypatch, tmp_path, probes, budget=600.0):
@@ -82,11 +94,11 @@ def test_no_background_tasks_returns_immediately(monkeypatch, tmp_path: Path) ->
 
 def test_waits_through_task_and_completion_turn(monkeypatch, tmp_path: Path) -> None:
     probes = [
-        _probe([_task("running")], events=10, ts=NOW_MS - 10_000),
+        _probe([_task("running")], events=10, ts=NOW_MS - 10_000),  # baseline
         _probe([_task("running")], events=10, ts=NOW_MS - 10_000),
         _probe([_task("succeeded", NOW_MS)], events=10, ts=NOW_MS - 10_000),
         _probe([_task("succeeded", NOW_MS)], events=14, stop="toolUse", ts=NOW_MS + 3_000),
-        _probe([_task("succeeded", NOW_MS)], events=16, ts=NOW_MS + 8_000),
+        _probe([_task("succeeded", NOW_MS + 9_000)], events=16, ts=NOW_MS + 8_000),
     ]
     record, waited = _run_wait(monkeypatch, tmp_path, probes)
     assert record["outcome"] == "settled"
@@ -105,7 +117,7 @@ def test_budget_bounds_the_wait(monkeypatch, tmp_path: Path) -> None:
 def test_gives_up_when_no_completion_turn(monkeypatch, tmp_path: Path) -> None:
     record, waited = _run_wait(
         monkeypatch, tmp_path,
-        [_probe([_task("succeeded", NOW_MS)], ts=NOW_MS - 1)], budget=3600.0,
+        [_probe([_task("succeeded", NOW_MS + 1)], ts=NOW_MS - 1)], budget=3600.0,
     )
     assert record["outcome"] == "no_completion_turn"
     assert waited < 3600.0
