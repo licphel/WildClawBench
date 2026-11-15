@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -84,6 +85,19 @@ OPENCLAW_BACKGROUND_QUIET_SECONDS = 15.0
 OPENCLAW_BACKGROUND_WAKE_GRACE_SECONDS = 180.0
 OPENCLAW_BACKGROUND_ARTIFACT = "background_tasks.json"
 _ACTIVE_TASK_STATUSES = ("queued", "running")
+
+#: The lines of OpenClaw's own gateway log (``<output_dir>/gateway.log``) that
+#: report a *model request* failing.  The embedded agent runs inside that
+#: gateway process, so a provider failure is logged there in full
+#: (``rawError=server_error: upstream_stream_truncated: ...``) while the CLI's
+#: stdout -- ``agent.log`` -- only says ``request timed out`` or ``Agent
+#: couldn't generate a response``.  Only these lines are read: the same log
+#: also carries ``[tools] web_fetch failed: ...`` with whatever a fetched page
+#: said, which is the task's content, not a provider error.
+_OPENCLAW_PROVIDER_ERROR_LINE = re.compile(
+    r"\[[a-z]+-transport\] \[[a-z_-]+\] error "
+    r"|\[agent/embedded\] embedded run agent end: .*\bisError=true\b"
+)
 
 
 def _is_detached_work(task: dict) -> bool:
@@ -406,12 +420,16 @@ PY"""
                 else ""
             )
             agent_log = spec.output_dir / "agent.log"
+            openclaw_log = spec.output_dir / "gateway.log"
             timing.stop("boot")
             timing.start("agent")
             start_time = time.perf_counter()
             resume_attempt = 0
             while True:
                 log_offset = agent_log.stat().st_size if agent_log.exists() else 0
+                openclaw_log_offset = (
+                    openclaw_log.stat().st_size if openclaw_log.exists() else 0
+                )
                 counted_elapsed = time.perf_counter() - start_time - excluded_retry_time
                 remaining = int(spec.timeout_seconds - counted_elapsed)
                 if remaining <= 0:
@@ -480,7 +498,11 @@ PY"""
                     )
                     elapsed_time = active_elapsed()
                     break
-                provider_error_reason = self._find_error_marker(agent_log, log_offset)
+                provider_error_reason = self._find_error_marker(
+                    agent_log, log_offset
+                ) or self._find_provider_error_in_openclaw_log(
+                    openclaw_log, openclaw_log_offset
+                )
                 if provider_error_reason is None:
                     raise RuntimeError(
                         "OpenClaw agent failed without a resumable provider error "
@@ -841,6 +863,30 @@ fi
                 return resumable_provider_error(log.read())
         except OSError:
             return None
+
+    @staticmethod
+    def _find_provider_error_in_openclaw_log(log_path: Path, offset: int) -> str | None:
+        """The provider-failure signature OpenClaw's own log recorded for this attempt.
+
+        2026-11-15 combined re-run, Terra OpenClaw R2 task_5/task_10/task_11:
+        the upstream cut three streams at once, OpenClaw's log said
+        ``rawError=server_error: upstream_stream_truncated: upstream stream
+        ended early``, ``agent.log`` said only ``request timed out``, and all
+        three were raised as "failed without a resumable provider error" and
+        banked as 0.0.
+        """
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                text = log.read()
+        except OSError:
+            return None
+        provider_lines = "\n".join(
+            line
+            for line in text.splitlines()
+            if _OPENCLAW_PROVIDER_ERROR_LINE.search(line)
+        )
+        return resumable_provider_error(provider_lines)
 
     def collect_usage(self, task_id: str, output_dir: Path, elapsed_time: float) -> dict:
         transcript_host = output_dir / "chat.jsonl"

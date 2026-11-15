@@ -144,6 +144,15 @@ UPSTREAM_FAILURE_PATTERNS = (
     "incomplete chunked read",
     "peer closed connection without sending complete message body",
     "stream ended early",
+    # The Gateway's own spellings of the same event: the anomaly kind it
+    # forwards to the client (``server_error: upstream_stream_truncated: ...``)
+    # and the ``request.finished`` outcome it logs.  Measured live: the
+    # 2026-11-15 combined re-run, Terra OpenClaw R2 task_5/task_10/task_11 --
+    # the codex-oauth upstream cut three streams at the same instant
+    # (14:36:18 CST), OpenClaw surfaced only ``request timed out`` on stdout,
+    # and the three attempts were banked as 0.0.
+    "upstream_stream_truncated",
+    "upstream_truncated",
     # Hermes reports a provider-unavailable turn as a successful HTTP
     # envelope whose payload contains the upstream's concrete failure.  BEAM
     # promotes that payload into ``error_detail``; these markers make the
@@ -151,6 +160,14 @@ UPSTREAM_FAILURE_PATTERNS = (
     # anomaly.
     "provider_unavailable",
     "ConnectError",
+    # The connect leg timing out rather than being refused: httpx's class
+    # name, and the message Python's ssl module gives when the TLS handshake
+    # to the upstream never completes.  The same 2026-11-15 window logged
+    # ``ConnectTimeout: _ssl.c:1015: The handshake operation timed out`` on
+    # the gateway's own upstream requests; it is a connection failure,
+    # exactly as ``ConnectError`` above is.
+    "ConnectTimeout",
+    "handshake operation timed out",
     "UNEXPECTED_EOF_WHILE_READING",
     "HTTP 500",
     "502 Bad Gateway",

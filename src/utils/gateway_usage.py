@@ -135,6 +135,7 @@ import os
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -470,11 +471,39 @@ def _candidate_endpoints() -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     for raw_url, token in pairs:
         url = _provenance_url(raw_url)
-        if not url or url in seen:
+        if not url:
             continue
-        seen.add(url)
-        out.append((url, (token or "").strip()))
+        # This probe runs on the host, but ``OPENROUTER_BASE_URL`` is spelled
+        # for the task container.  Under wz's rootless daemon that is
+        # ``10.0.2.2``, which does not exist on the host, so from 2026-11-10
+        # every WildClaw attempt recorded ``gateway_usage: unavailable`` and
+        # the retry policy's structural leg (a standing upstream anomaly) never
+        # saw a single gateway record.  Try the loopback spelling first.
+        for candidate in (_host_spelling(url), url):
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            out.append((candidate, (token or "").strip()))
     return out
+
+
+#: How a task container spells "the docker host".  None of them is guaranteed
+#: to resolve on the host itself (``10.0.2.2`` is slirp4netns-only), and every
+#: inference Gateway this module counts through listens on all interfaces.
+_CONTAINER_HOST_ALIASES = frozenset(
+    {"10.0.2.2", "172.17.0.1", "host.docker.internal", "host.containers.internal"}
+)
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_spelling(url: str) -> str:
+    """``url`` with a container-side host alias replaced by loopback, or ``""``."""
+
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.hostname or "").lower() not in _CONTAINER_HOST_ALIASES:
+        return ""
+    netloc = "127.0.0.1" + (f":{parsed.port}" if parsed.port else "")
+    return urllib.parse.urlunsplit(parsed._replace(netloc=netloc))
 
 
 def _provenance_url(base: str) -> str:
@@ -488,6 +517,9 @@ def _provenance_url(base: str) -> str:
     return f"{base}/gateway/provenance"
 
 
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _get_json(
     url: str, token: str, timeout: float, *, task_id: str = ""
 ) -> dict[str, Any] | None:
@@ -497,8 +529,12 @@ def _get_json(
         request.add_header("x-api-key", token)
     if task_id:
         request.add_header(TASK_ID_HEADER, task_id)
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    # A loopback Gateway is never reached through the host's HTTP proxy, which
+    # cannot see this host's loopback and answers 502.
+    open_url = _DIRECT.open if host in _LOOPBACK_HOSTS else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
