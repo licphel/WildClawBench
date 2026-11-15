@@ -261,8 +261,37 @@ def task_openrouter_env(extra_env: str) -> dict[str, str]:
 def remove_container(name: str) -> None:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
+def container_dns_args(env_name: str, source: dict[str, str] | None = None) -> list[str]:
+    """``--dns`` arguments from an operator setting of comma/space-separated IPs.
+
+    Rootless Docker's default resolver (10.0.2.3) does not resolve on the run
+    host, so a task container has no DNS at all and every tool reaches the
+    network only through the HTTP proxy.  A harness whose own tools resolve
+    names locally before connecting (OpenClaw's browser navigation guard) is
+    given explicit resolvers instead; see
+    ``eval_framework/wildclaw_cli_runner.py::_docker_dns_args`` for the
+    Perdura precedent this mirrors.  Unset means Docker's default.
+    """
+    import ipaddress
+
+    source = source if source is not None else os.environ
+    args: list[str] = []
+    for server in dict.fromkeys(re.split(r"[\s,]+", source.get(env_name, "").strip())):
+        if not server:
+            continue
+        try:
+            address = ipaddress.ip_address(server)
+        except ValueError:
+            raise ValueError(
+                f"{env_name} requires comma/space-separated IP addresses"
+            ) from None
+        args += ["--dns", str(address)]
+    return args
+
+
 def start_container(task_id: str, workspace_path: str, extra_env: str = "",
-                    tmp_path: str = "", lobster_env: list[str] | None = None) -> None:
+                    tmp_path: str = "", lobster_env: list[str] | None = None,
+                    dns_args: list[str] | None = None) -> None:
     if not DOCKER_IMAGE:
         raise RuntimeError("DOCKER_IMAGE must be set before starting a WildClaw container")
     workspace = Path(workspace_path).expanduser()
@@ -302,6 +331,7 @@ def start_container(task_id: str, workspace_path: str, extra_env: str = "",
     cmd = [
         "docker", "run", "-d",
         "--name", task_id,
+        *(dns_args or []),
         *env_args,
         "-v", f"{workspace}:/app:ro",
         DOCKER_IMAGE,

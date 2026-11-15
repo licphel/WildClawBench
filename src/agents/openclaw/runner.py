@@ -25,6 +25,8 @@ from src.utils.transient_errors import (
 )
 from src.utils.docker_utils import (
     close_proc_log,
+    container_dns_args,
+    container_proxy_env,
     inject_lobster_workspace,
     inject_openclaw_models,
     run_background,
@@ -58,6 +60,16 @@ OPENCLAW_GATEWAY_STARTUP_TIMEOUT_SECONDS = 120.0
 # before the runner escalates to TERM/KILL.
 OPENCLAW_TIMEOUT_FLUSH_SECONDS = 15.0
 OPENCLAW_AGENT_PID_PATH = "/tmp/wildclaw-openclaw-agent.pid"
+#: Operator setting: resolvers for the OpenClaw task container (comma/space
+#: separated IPs).  Falls back to the Perdura setting, which names the
+#: resolvers already verified on the run host.  See
+#: ``OpenClawAgent._configure_browser_runtime``.
+OPENCLAW_DOCKER_DNS_ENV = "WILDCLAW_OPENCLAW_DOCKER_DNS"
+OPENCLAW_DOCKER_DNS_FALLBACK_ENV = "WILDCLAW_PERDURA_DOCKER_DNS"
+#: The interpreter env every WildClaw agent image puts first on PATH
+#: (Dockerfile.openclaw ``ENV PATH``).
+OPENCLAW_EVAL_ENV_BIN = "/root/miniconda3/envs/eval/bin"
+OPENCLAW_BROWSER_RUNTIME_ARTIFACT = "browser_runtime.json"
 OPENCLAW_RESUME_PREFIX = (
     "A previous attempt of this same task was interrupted by a transient "
     "provider error. Continue from the current workspace, preserve and "
@@ -258,6 +270,7 @@ PY"""
                 extra_env=spec.task.get("env", ""),
                 tmp_path=tmp_path,
                 lobster_env=spec.lobster.get("env") if spec.lobster else None,
+                dns_args=openclaw_dns_args(),
             )
             if spec.lobster:
                 inject_lobster_workspace(spec.task_id, spec.lobster["workspace"])
@@ -270,6 +283,7 @@ PY"""
                 inject_openclaw_models(spec.task_id, spec.models_config)
 
             self._apply_approval_posture(spec.task_id, spec.output_dir)
+            self._configure_browser_runtime(spec.task_id, spec.output_dir)
             self._set_model(spec.task_id, spec.model)
             # In-task OpenRouter credential (the task's ``## Env``): the real
             # account at https://openrouter.ai/api/v1, only for tasks that
@@ -833,6 +847,102 @@ PY"""
         applied["readback"] = (readback.stdout or "").strip()[:2000]
         record_posture(output_dir, OPENCLAW_POSTURE, applied=applied)
 
+    def _configure_browser_runtime(self, task_id: str, output_dir: Path) -> None:
+        """Make OpenClaw's own browser and web_fetch tools work in this container.
+
+        Infrastructure only: nothing here reaches the model-visible prompt or
+        changes which tools OpenClaw offers.  Measured on
+        wildclawbench-openclaw-ubuntu:v2026.9.1-grader (2026-11-15), every
+        WildClaw run's ``browser`` call failed and every ``web_fetch`` failed:
+
+        * Chromium refuses to start as root without ``--no-sandbox``
+          ("Running as root without --no-sandbox is not supported"), so the
+          managed profile never exposed CDP and ``start``/``open`` timed out.
+          ``browser.noSandbox`` is OpenClaw's documented switch for exactly
+          this (docs/tools/browser-linux-troubleshooting.md).
+        * The container has no working DNS and reaches the network only
+          through the HTTP proxy.  OpenClaw's managed Chrome deliberately
+          ignores proxy env, so it is given the same proxy explicitly via
+          ``browser.extraArgs``; OpenClaw then refuses proxy-routed
+          navigation under its strict SSRF policy, and every other harness's
+          browser (agent-browser, Playwright, browser-use) has no such policy
+          and can open localhost task services, so the policy is relaxed to
+          match.  The navigation guard still resolves each hostname locally,
+          which is why the container also gets explicit ``--dns``
+          (``openclaw_dns_args``).
+        * ``web_fetch`` pinned DNS locally (``getaddrinfo EAI_AGAIN``);
+          ``tools.web.fetch.useTrustedEnvProxy`` is OpenClaw's documented
+          switch for letting the operator proxy resolve.
+        * ``exec`` takes PATH from a login shell, where the image's conda
+          init puts the base env (no Playwright) ahead of the eval env that
+          the image's ``ENV PATH`` and every other harness give ``python3``.
+          ``tools.exec.pathPrepend`` restores the image's declared order.
+        """
+        proxy_env = container_proxy_env()
+        proxy = proxy_env.get("HTTPS_PROXY") or proxy_env.get("HTTP_PROXY") or ""
+        browser: dict[str, object] = {
+            "enabled": True,
+            "headless": True,
+            "noSandbox": True,
+            "ssrfPolicy": {"dangerouslyAllowPrivateNetwork": True},
+        }
+        if proxy:
+            extra_args = [f"--proxy-server={proxy}"]
+            bypass = [
+                host.strip()
+                for host in (proxy_env.get("NO_PROXY") or "").split(",")
+                if host.strip()
+            ]
+            if bypass:
+                extra_args.append("--proxy-bypass-list=" + ";".join(bypass))
+            browser["extraArgs"] = extra_args
+        settings: dict[str, object] = {
+            "browser": browser,
+            "tools.exec.pathPrepend": [OPENCLAW_EVAL_ENV_BIN],
+        }
+        if proxy:
+            settings["tools.web.fetch.useTrustedEnvProxy"] = True
+
+        applied: dict[str, object] = {"config": {}}
+        for key, value in settings.items():
+            cli_value = (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(value, (list, dict))
+                else ("true" if value is True else str(value))
+            )
+            r = subprocess.run(
+                ["docker", "exec", task_id, "/bin/bash", "-c",
+                 f"openclaw config set {shlex.quote(key)} {shlex.quote(cli_value)}"],
+                capture_output=True, text=True,
+            )
+            applied["config"][key] = {
+                "value": value,
+                "returncode": r.returncode,
+                "stderr": (r.stderr or "").strip()[:400],
+            }
+            if r.returncode != 0:
+                logger.warning(
+                    "[%s] openclaw config set %s failed: %s",
+                    task_id, key, (r.stderr or "").strip(),
+                )
+        readback = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c",
+             "openclaw config get browser 2>&1; "
+             "openclaw config get tools.web.fetch 2>&1; "
+             "openclaw config get tools.exec.pathPrepend 2>&1; "
+             "cat /etc/resolv.conf 2>&1 | grep -v '^#'"],
+            capture_output=True, text=True,
+        )
+        applied["readback"] = (readback.stdout or "").strip()[:4000]
+        applied["dns_args"] = openclaw_dns_args()
+        try:
+            (Path(output_dir) / OPENCLAW_BROWSER_RUNTIME_ARTIFACT).write_text(
+                json.dumps(applied, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("[%s] could not record browser runtime: %s", task_id, exc)
+
     def _set_image_model(self, task_id: str, model: str) -> None:
         subprocess.run(
             ["docker", "exec", task_id, "/bin/bash", "-c", f"openclaw config set agents.defaults.imageModel.primary '{model}'"],
@@ -840,6 +950,17 @@ PY"""
             text=True,
         )
         logger.info("[%s] imageModel set: %s", task_id, model)
+
+
+def openclaw_dns_args(source: dict[str, str] | None = None) -> list[str]:
+    """``--dns`` for the OpenClaw task container, or [] for Docker's default."""
+    source = source if source is not None else os.environ
+    env_name = (
+        OPENCLAW_DOCKER_DNS_ENV
+        if source.get(OPENCLAW_DOCKER_DNS_ENV, "").strip()
+        else OPENCLAW_DOCKER_DNS_FALLBACK_ENV
+    )
+    return container_dns_args(env_name, source)
 
 
 def _timing_record(timing: SpanRecorder, *, timed_out: bool) -> dict:
