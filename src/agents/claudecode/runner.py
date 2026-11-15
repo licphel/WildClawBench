@@ -16,7 +16,12 @@ from src.agents.approval_posture import CLAUDE as CLAUDE_POSTURE, record as reco
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.timing_spans import SpanRecorder
 from src.agents.claudecode.transcript import convert_claudecode_chat_to_openclaw_jsonl
-from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
+from src.utils.docker_utils import (
+    run_warmup,
+    setup_skills,
+    snapshot_workspace_state,
+    task_openrouter_env,
+)
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
 from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.transient_errors import (
@@ -50,8 +55,6 @@ class ClaudeCodeAgent(BaseAgent):
         image: str | None = None,
         anthropic_api_key: str = "",
         anthropic_base_url: str = "",
-        openrouter_api_key: str = "",
-        openrouter_base_url: str = "",
     ) -> None:
         self.image = (image or os.environ.get("DOCKER_IMAGE_CLAUDECODE", "")).strip()
         if not self.image:
@@ -60,9 +63,8 @@ class ClaudeCodeAgent(BaseAgent):
             )
         # The agent's own model-provider credential (ANTHROPIC_API_KEY /
         # ANTHROPIC_BASE_URL, injected into the container below).
-        # Independent of openrouter_api_key/openrouter_base_url, which is the
-        # LLM-judge / in-task-multimodal credential ~75% of WildClawBench
-        # tasks declare. GLOBAL_API_KEY/GLOBAL_API_BASE mirrors run_pylm.sh's
+        # Independent of the in-task OpenRouter credential that tasks declare
+        # in ``## Env`` (see _start_container / task_openrouter_env). GLOBAL_API_KEY/GLOBAL_API_BASE mirrors run_pylm.sh's
         # pylm_provider_setup.py naming.
         explicit_api_key = anthropic_api_key.strip()
         self.api_key = explicit_api_key or os.environ.get("GLOBAL_API_KEY", "")
@@ -72,12 +74,6 @@ class ClaudeCodeAgent(BaseAgent):
             else normalize_openrouter_base_url_for_claudecode(
                 os.environ.get("GLOBAL_API_BASE", "")
             )
-        )
-        self.openrouter_api_key = (
-            openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        ).strip()
-        self.openrouter_base_url = normalize_openrouter_base_url_for_claudecode(
-            openrouter_base_url or os.environ.get("OPENROUTER_BASE_URL", "")
         )
 
     @property
@@ -195,7 +191,12 @@ class ClaudeCodeAgent(BaseAgent):
         retry_time_holder: dict[str, float] = {"excluded_retry_time": 0.0}
 
         try:
-            self._start_container(task_id, spec.workspace_path, small_fast_model=spec.model)
+            self._start_container(
+                task_id,
+                spec.workspace_path,
+                small_fast_model=spec.model,
+                task_env=str(spec.task.get("env") or ""),
+            )
             self._prepare_workspace(task_id)
             self._copy_tmp_files(task_id, spec.workspace_path)
             setup_skills(
@@ -536,7 +537,11 @@ class ClaudeCodeAgent(BaseAgent):
             logger.warning("[%s] ClaudeCode log dir copy failed: %s", task_id, r.stderr.strip())
 
     def _start_container(
-        self, task_id: str, workspace_path: str, small_fast_model: str = ""
+        self,
+        task_id: str,
+        workspace_path: str,
+        small_fast_model: str = "",
+        task_env: str = "",
     ) -> None:
         proxy_http = os.environ.get("HTTP_PROXY_INNER", "")
         proxy_https = os.environ.get("HTTPS_PROXY_INNER", "")
@@ -547,10 +552,11 @@ class ClaudeCodeAgent(BaseAgent):
             # ClaudeCode's built-in WebSearchTool and other side queries use
             # getSmallFastModel(); route them through the benchmark model.
             "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model,
-            # LLM-judge / in-task-multimodal credential -- independent of
-            # ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL above.
-            "OPENROUTER_API_KEY": self.openrouter_api_key,
-            "OPENROUTER_BASE_URL": self.openrouter_base_url,
+            # In-task OpenRouter credential (the task's ``## Env``): the real
+            # account at https://openrouter.ai/api/v1, only for tasks that
+            # declare it -- never the LLM-judge credential in process
+            # OPENROUTER_* (see docker_utils.task_openrouter_env).
+            **task_openrouter_env(task_env),
             # Keep the official CLI's fixed sandbox/compatibility flags; do
             # not expose prompt-cache or reasoning overrides as environment
             # variables that can silently change a benchmark run.

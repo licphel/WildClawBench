@@ -222,6 +222,42 @@ def _container_env_value(key: str) -> str:
     return os.environ.get(key, "")
 
 
+#: Public name for the task-container value of a ``## Env`` key; every
+#: baseline runner that builds its own ``docker run`` uses this instead of
+#: reading process ``os.environ`` (which holds the judge credential).
+container_env_value = _container_env_value
+
+TASK_OPENROUTER_KEYS: tuple[str, ...] = ("OPENROUTER_API_KEY", "OPENROUTER_BASE_URL")
+
+
+def task_declared_env_keys(extra_env: str) -> list[str]:
+    """Keys a task's ``## Env`` block declares (one name per line)."""
+    keys: list[str] = []
+    for line in (extra_env or "").splitlines():
+        key = line.strip()
+        if key and not key.startswith("#"):
+            keys.append(key)
+    return keys
+
+
+def task_openrouter_env(extra_env: str) -> dict[str, str]:
+    """The in-task OpenRouter credential, for tasks that declare it.
+
+    The same real OpenRouter account and ``https://openrouter.ai/api/v1``
+    base every harness's task container receives (``start_container`` above
+    for openclaw/pylm), never the LLM-judge credential that
+    ``resolve_judge_env`` leaves in process ``OPENROUTER_*``. Empty for a task
+    whose ``## Env`` does not declare ``OPENROUTER_*``, so no harness gets
+    OpenRouter on a task that does not offer it.
+    """
+    declared = set(task_declared_env_keys(extra_env))
+    return {
+        key: _container_env_value(key)
+        for key in TASK_OPENROUTER_KEYS
+        if key in declared
+    }
+
+
 def remove_container(name: str) -> None:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 

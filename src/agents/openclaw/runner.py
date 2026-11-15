@@ -32,6 +32,7 @@ from src.utils.docker_utils import (
     setup_skills,
     setup_workspace,
     start_container,
+    task_openrouter_env,
 )
 
 load_dotenv()
@@ -69,13 +70,9 @@ class OpenClawAgent(BaseAgent):
     def __init__(
         self,
         gateway_port: int,
-        openrouter_api_key: str = "",
-        openrouter_base_url: str = "https://openrouter.ai/api/v1",
         image_model: str | None = None,
     ) -> None:
         self.gateway_port = gateway_port
-        self.openrouter_api_key = openrouter_api_key
-        self.openrouter_base_url = openrouter_base_url
         self.image_model = image_model or ""
 
     def _resolve_gateway_port(self, task_id: str) -> int:
@@ -274,7 +271,16 @@ PY"""
 
             self._apply_approval_posture(spec.task_id, spec.output_dir)
             self._set_model(spec.task_id, spec.model)
-            self._inject_openrouter_key(spec.task_id)
+            # In-task OpenRouter credential (the task's ``## Env``): the real
+            # account at https://openrouter.ai/api/v1, only for tasks that
+            # declare it -- never the LLM-judge credential in process
+            # OPENROUTER_* (see docker_utils.task_openrouter_env). The gateway
+            # export below is what the agent's tool processes inherit, so it
+            # must carry the same values start_container injected.
+            task_openrouter = task_openrouter_env(spec.task.get("env", ""))
+            self._inject_openrouter_key(
+                spec.task_id, task_openrouter.get("OPENROUTER_API_KEY", "")
+            )
             self._set_gateway_task_header(spec.task_id)
             image_model = self.image_model or spec.model
             self._set_image_model(spec.task_id, image_model)
@@ -286,8 +292,11 @@ PY"""
             gateway_proc = run_background(
                 spec.task_id,
                 bash_cmd=(
-                    f"export OPENROUTER_API_KEY='{self.openrouter_api_key}' && "
-                    f"export OPENROUTER_BASE_URL='{self.openrouter_base_url}' && "
+                    "".join(
+                        f"export {key}={shlex.quote(value)} && "
+                        for key, value in task_openrouter.items()
+                    )
+                    +
                     f"export OPENCLAW_GATEWAY_PORT='{gateway_port}' && "
                     "for attempt in 1 2; do "
                     f"openclaw gateway run --port {gateway_port} "
@@ -644,7 +653,7 @@ fi
             raise RuntimeError(f"Model setup failed:\n{r.stderr}")
         logger.info("[%s] Model set: %s", task_id, model)
 
-    def _inject_openrouter_key(self, task_id: str) -> None:
+    def _inject_openrouter_key(self, task_id: str, api_key: str) -> None:
         """Save the OpenRouter key where the running OpenClaw will look for it.
 
         Two stores, one per era. Up to 2026.3.x the credential was a JSON file
@@ -665,7 +674,7 @@ fi
         selects the legacy write for an image that still needs it.
         """
 
-        if not self.openrouter_api_key:
+        if not api_key:
             return
 
         modern = subprocess.run(
@@ -674,7 +683,7 @@ fi
                 "openclaw models auth paste-api-key "
                 "--provider openrouter --profile-id openrouter:default",
             ],
-            input=self.openrouter_api_key + "\n",
+            input=api_key + "\n",
             capture_output=True,
             text=True,
         )
@@ -701,7 +710,7 @@ d = json.loads(p.read_text()) if p.exists() else {{"version": 1, "profiles": {{}
 d.setdefault("profiles", {{}})["openrouter:default"] = {{
     "type": "api_key",
     "provider": "openrouter",
-    "key": {json.dumps(self.openrouter_api_key)}
+    "key": {json.dumps(api_key)}
 }}
 p.write_text(json.dumps(d, indent=2))
 PY"""

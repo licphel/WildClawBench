@@ -33,10 +33,7 @@ from src.agents.codex import CodexAgent
 from src.agents.openclaw import OpenClawAgent
 from src.agents.pylm import PyLMAgent
 from src.utils.cli_args import parse_run_batch_args
-from src.utils.endpoint_utils import (
-    normalize_openrouter_base_url_for_claudecode,
-    normalize_openrouter_base_url_for_openclaw,
-)
+from src.utils.endpoint_utils import normalize_openrouter_base_url_for_claudecode
 from src.utils.task_parser import parse_task_md
 from src.utils.docker_utils import (
     remove_container,
@@ -97,15 +94,14 @@ DEFAULT_PARALLEL = 1
 # corrupted a prior benchmark run's scores.
 ensure_wildclaw_judge_env()
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL_OPENCLAW = normalize_openrouter_base_url_for_openclaw(
-    os.environ.get("OPENROUTER_BASE_URL", "")
-)
-OPENROUTER_BASE_URL_CLAUDECODE = normalize_openrouter_base_url_for_claudecode(
-    os.environ.get("OPENROUTER_BASE_URL", "")
-)
+# Process OPENROUTER_* above is now the LLM-judge credential. No agent
+# backend reads it: each one builds the in-task OpenRouter credential from the
+# task's ``## Env`` via src.utils.docker_utils.task_openrouter_env /
+# container_env_value (the real account snapshotted into
+# WILDCLAW_TASK_OPENROUTER_* by ensure_wildclaw_judge_env).
+#
 # The agent's own model-provider credential (independent of OPENROUTER_*
-# above, which is the LLM-judge / in-task-multimodal credential). Set by
+# above, which is the LLM-judge credential). Set by
 # run_claudecode.sh/run_hermesagent.sh (GLOBAL_API_KEY/GLOBAL_API_BASE),
 # mirroring run_pylm.sh's pylm_provider_setup.py naming. Codex reads these
 # straight from the environment inside CodexAgent.__init__ instead of
@@ -688,8 +684,6 @@ def main() -> None:
         backend: BaseAgent = ClaudeCodeAgent(
             anthropic_api_key=GLOBAL_API_KEY,
             anthropic_base_url=GLOBAL_API_BASE_CLAUDECODE,
-            openrouter_api_key=OPENROUTER_API_KEY,
-            openrouter_base_url=OPENROUTER_BASE_URL_CLAUDECODE,
         )
     elif args.agent_backend == "codex":
         backend = CodexAgent()
@@ -704,8 +698,6 @@ def main() -> None:
     else:
         backend = OpenClawAgent(
             gateway_port=GATEWAY_PORT,
-            openrouter_api_key=OPENROUTER_API_KEY,
-            openrouter_base_url=OPENROUTER_BASE_URL_OPENCLAW,
             image_model=args.openclaw_image_model,
         )
     output_root = OUTPUT_DIR / args.agent_backend

@@ -20,7 +20,13 @@ from src.agents.codex.backend import (
     load_skill_documents,
     prepare_codex_prompt,
 )
-from src.utils.docker_utils import run_warmup, setup_skills, snapshot_workspace_state
+from src.utils.docker_utils import (
+    container_env_value,
+    run_warmup,
+    setup_skills,
+    snapshot_workspace_state,
+    task_openrouter_env,
+)
 from src.utils.endpoint_utils import normalize_openrouter_base_url_for_openclaw
 from src.utils.gateway_usage import TASK_ID_HEADER
 from src.utils.transient_errors import (
@@ -153,8 +159,6 @@ class CodexAgent(BaseAgent):
         image: str | None = None,
         agent_api_key: str = "",
         agent_base_url: str = "",
-        openrouter_api_key: str = "",
-        openrouter_base_url: str = "",
         reasoning_effort_default: str = DEFAULT_REASONING_EFFORT,
     ) -> None:
         resolved_image = (image or os.environ.get("DOCKER_IMAGE_CODEX", "")).strip()
@@ -163,9 +167,9 @@ class CodexAgent(BaseAgent):
         self.image: str = resolved_image
         # The agent's own model-provider credential (Codex CLI's
         # config_providers.openrouter, despite the section name -- see
-        # _render_codex_config's env_key below). Independent of
-        # openrouter_api_key/openrouter_base_url, which is the LLM-judge /
-        # in-task-multimodal credential ~75% of WildClawBench tasks declare.
+        # _render_codex_config's env_key below). Independent of the in-task
+        # OpenRouter credential that tasks declare in ``## Env`` (see
+        # _start_container / task_openrouter_env).
         # GLOBAL_API_KEY/GLOBAL_API_BASE mirrors run_pylm.sh's
         # pylm_provider_setup.py naming.
         self.agent_api_key = (
@@ -173,12 +177,6 @@ class CodexAgent(BaseAgent):
         ).strip()
         self.agent_base_url = normalize_openrouter_base_url_for_openclaw(
             agent_base_url or os.environ.get("GLOBAL_API_BASE", "")
-        )
-        self.openrouter_api_key = (
-            openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        ).strip()
-        self.openrouter_base_url = normalize_openrouter_base_url_for_openclaw(
-            openrouter_base_url or os.environ.get("OPENROUTER_BASE_URL", "")
         )
         self.reasoning_effort_default = reasoning_effort_default
 
@@ -471,9 +469,11 @@ class CodexAgent(BaseAgent):
         env_map: dict[str, str] = {
             # Agent's own model provider -- config.toml's env_key names this.
             "GLOBAL_API_KEY": self.agent_api_key,
-            # LLM-judge / in-task-multimodal credential (image helper below).
-            "OPENROUTER_API_KEY": self.openrouter_api_key,
-            "OPENROUTER_BASE_URL": self.openrouter_base_url,
+            # In-task OpenRouter credential (the task's ``## Env``): the real
+            # account at https://openrouter.ai/api/v1, only for tasks that
+            # declare it -- never the LLM-judge credential in process
+            # OPENROUTER_* (see docker_utils.task_openrouter_env).
+            **task_openrouter_env(task.get("env", "") if task else ""),
             "http_proxy": proxy_http,
             "https_proxy": proxy_https,
             "HTTP_PROXY": proxy_http,
@@ -491,7 +491,7 @@ class CodexAgent(BaseAgent):
             key = line.strip()
             if not key or key.startswith("#"):
                 continue
-            value = os.environ.get(key, "").strip()
+            value = container_env_value(key).strip()
             env_args += ["-e", f"{key}={value}"]
             masked = (value[:4] + "***") if value else "(empty)"
             logger.info("[%s] Injecting env var: %s=%s", task_id, key, masked)

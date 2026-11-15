@@ -17,6 +17,7 @@ from src.agents.approval_posture import HERMES as HERMES_POSTURE, record as reco
 from src.agents.base import AgentExecution, AgentTaskSpec, BaseAgent
 from src.utils.timing_spans import SpanRecorder
 from src.utils.docker_utils import (
+    container_env_value,
     run_warmup,
     setup_skills,
     inject_lobster_workspace,
@@ -81,7 +82,8 @@ class HermesAgentAgent(BaseAgent):
         # OPENROUTER_API_KEY/OPENROUTER_BASE_URL credential, which this
         # class does not otherwise touch -- WildClawBench tasks that declare
         # it get it via their own "## Env" section (_start_container's
-        # extra_env), reading the host process's OPENROUTER_* directly.
+        # extra_env), resolved by docker_utils.container_env_value to the
+        # real OpenRouter account (not the judge's process OPENROUTER_*).
         self.agent_api_key = agent_api_key or os.environ.get("GLOBAL_API_KEY", "")
         self.agent_base_url = agent_base_url
         self.brave_api_key = brave_api_key or os.environ.get("BRAVE_API_KEY", "")
@@ -434,7 +436,9 @@ class HermesAgentAgent(BaseAgent):
             key = line.strip()
             if not key or key.startswith("#"):
                 continue
-            value = os.environ.get(key, "")
+            # Task-container value: the real OpenRouter account for
+            # OPENROUTER_*, not the judge credential in process os.environ.
+            value = container_env_value(key)
             env_args += ["-e", f"{key}={value}"]
 
         for key in (lobster_env or []):
