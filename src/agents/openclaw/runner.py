@@ -70,6 +70,32 @@ OPENCLAW_DOCKER_DNS_FALLBACK_ENV = "WILDCLAW_PERDURA_DOCKER_DNS"
 #: (Dockerfile.openclaw ``ENV PATH``).
 OPENCLAW_EVAL_ENV_BIN = "/root/miniconda3/envs/eval/bin"
 OPENCLAW_BROWSER_RUNTIME_ARTIFACT = "browser_runtime.json"
+#: Detached work (image_generate/music_generate/video_generate, subagents)
+#: finishes after ``openclaw agent`` has already exited 0; its result reaches
+#: the workspace only in a follow-up turn the gateway runs on completion.
+#: See ``OpenClawAgent._wait_for_background_work``.
+OPENCLAW_STATE_DB = f"{OPENCLAW_HOME}/state/openclaw.sqlite"
+OPENCLAW_BACKGROUND_POLL_SECONDS = 5.0
+#: The transcript must be unchanged this long, ending in a final assistant
+#: message, before the follow-up turn counts as finished.
+OPENCLAW_BACKGROUND_QUIET_SECONDS = 15.0
+#: After the last background task ends, how long to wait for the completion
+#: turn to start writing before giving up on it (still inside the task budget).
+OPENCLAW_BACKGROUND_WAKE_GRACE_SECONDS = 180.0
+OPENCLAW_BACKGROUND_ARTIFACT = "background_tasks.json"
+_ACTIVE_TASK_STATUSES = ("queued", "running")
+
+
+def _is_detached_work(task: dict) -> bool:
+    """Work whose result is delivered back to the session in a later turn.
+
+    Media generators record ``<kind>_generation`` CLI tasks; subagent/ACP
+    runs report back the same way.  The ledger also holds the ``openclaw
+    agent`` CLI run itself (task_kind null) and the image's cron
+    automation runs, neither of which delivers anything back.
+    """
+    kind = str(task.get("task_kind") or "")
+    return kind.endswith("_generation") or task.get("runtime") in ("subagent", "acp")
 OPENCLAW_RESUME_PREFIX = (
     "A previous attempt of this same task was interrupted by a transient "
     "provider error. Continue from the current workspace, preserve and "
@@ -444,6 +470,15 @@ PY"""
                         spec.task_id,
                         elapsed_time,
                     )
+                    counted_elapsed = (
+                        time.perf_counter() - start_time - excluded_retry_time
+                    )
+                    self._wait_for_background_work(
+                        spec.task_id,
+                        spec.output_dir,
+                        budget_seconds=spec.timeout_seconds - counted_elapsed,
+                    )
+                    elapsed_time = active_elapsed()
                     break
                 provider_error_reason = self._find_error_marker(agent_log, log_offset)
                 if provider_error_reason is None:
@@ -547,6 +582,164 @@ PY"""
                 excluded_retry_time=excluded_retry_time,
                 excluded_provider_cooldown_time=excluded_cooldown_time,
             )
+
+    def _probe_background_work(self, task_id: str) -> dict | None:
+        """Background task ledger + transcript tail, read inside the container."""
+        script = f"""python3 - <<'PY'
+import glob, json, sqlite3
+out = {{"tasks": [], "events": 0, "last_role": None, "last_stop": None, "last_ts": None}}
+try:
+    conn = sqlite3.connect("file:" + {json.dumps(OPENCLAW_STATE_DB)} + "?mode=ro", uri=True, timeout=5.0)
+    try:
+        for row in conn.execute(
+            "select task_id, runtime, task_kind, status, delivery_status, created_at, ended_at "
+            "from task_runs"
+        ):
+            out["tasks"].append(dict(zip(
+                ("task_id", "runtime", "task_kind", "status", "delivery_status",
+                 "created_at", "ended_at"), row)))
+    finally:
+        conn.close()
+except sqlite3.Error as exc:
+    out["tasks_error"] = str(exc)
+last = None
+for db in sorted(glob.glob({json.dumps(OPENCLAW_HOME)} + "/**/openclaw-agent.sqlite", recursive=True)):
+    try:
+        conn = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=5.0)
+        try:
+            out["events"] += conn.execute("select count(*) from transcript_events").fetchone()[0]
+            for (event_json,) in conn.execute("select event_json from transcript_events"):
+                try:
+                    msg = json.loads(event_json).get("message") or {{}}
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                ts = msg.get("timestamp")
+                if msg.get("role") and isinstance(ts, (int, float)) and (last is None or ts >= last[2]):
+                    last = (msg.get("role"), msg.get("stopReason"), ts)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        continue
+if last:
+    out["last_role"], out["last_stop"], out["last_ts"] = last
+print(json.dumps(out))
+PY"""
+        r = subprocess.run(
+            ["docker", "exec", task_id, "/bin/bash", "-c", script],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "[%s] background-work probe failed: %s", task_id, (r.stderr or "").strip()[:400],
+            )
+            return None
+        try:
+            return json.loads((r.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _background_state(probe: dict) -> tuple[str, int]:
+        """Classify a probe: ``none`` / ``active`` / ``awaiting_turn`` / ``settled``.
+
+        Returns the state and the last task end (epoch ms, 0 when unknown).
+        ``settled`` still needs the transcript to be quiet across polls, which
+        the caller tracks.
+        """
+        tasks = [t for t in (probe.get("tasks") or []) if _is_detached_work(t)]
+        if not tasks:
+            return "none", 0
+        if any(t.get("status") in _ACTIVE_TASK_STATUSES for t in tasks):
+            return "active", 0
+        last_end = max(int(t.get("ended_at") or 0) for t in tasks)
+        last_ts = probe.get("last_ts")
+        if (
+            probe.get("last_role") == "assistant"
+            and probe.get("last_stop") not in (None, "toolUse")
+            and isinstance(last_ts, (int, float))
+            and last_ts >= last_end
+        ):
+            return "settled", last_end
+        return "awaiting_turn", last_end
+
+    def _wait_for_background_work(
+        self, task_id: str, output_dir: Path, *, budget_seconds: float,
+    ) -> None:
+        """Let detached OpenClaw work and its completion turn finish before grading.
+
+        ``image_generate`` (and the other media generators) return "Background
+        task started ... the completion agent will send the finished image"
+        and the CLI exits 0 at once.  The image exists only after the task
+        ends and the gateway wakes the session for a follow-up turn, in which
+        the agent saves it.  Grading right after the CLI exits graded an empty
+        results directory (smoke 20261115T041507Z, CS6 scored 0).
+
+        Bounded by the task's remaining time budget; a run that started no
+        background task returns after one probe.  What was observed is
+        recorded in ``background_tasks.json``.
+        """
+        deadline = time.monotonic() + max(0.0, budget_seconds)
+        record: dict[str, object] = {"budget_seconds": round(budget_seconds, 1)}
+        started = time.monotonic()
+        last_events: int | None = None
+        quiet_since = time.monotonic()
+        outcome = "no_background_tasks"
+        logged_state: str | None = None
+        probe: dict | None = None
+        while True:
+            probe = self._probe_background_work(task_id)
+            if probe is None:
+                outcome = "probe_failed"
+                break
+            state, last_end = self._background_state(probe)
+            if state == "none":
+                break
+            now = time.monotonic()
+            if probe.get("events") != last_events:
+                last_events = probe.get("events")
+                quiet_since = now
+            if state == "settled" and now - quiet_since >= OPENCLAW_BACKGROUND_QUIET_SECONDS:
+                outcome = "settled"
+                break
+            if (
+                state == "awaiting_turn"
+                and last_end
+                and time.time() * 1000 - last_end >= OPENCLAW_BACKGROUND_WAKE_GRACE_SECONDS * 1000
+                and now - quiet_since >= OPENCLAW_BACKGROUND_WAKE_GRACE_SECONDS
+            ):
+                outcome = "no_completion_turn"
+                logger.warning(
+                    "[%s] background work ended but no completion turn followed "
+                    "within %.0fs; grading as is",
+                    task_id, OPENCLAW_BACKGROUND_WAKE_GRACE_SECONDS,
+                )
+                break
+            if now >= deadline:
+                outcome = f"budget_exhausted_while_{state}"
+                logger.warning(
+                    "[%s] task budget ran out waiting for background work (%s)",
+                    task_id, state,
+                )
+                break
+            if state != logged_state:
+                logger.info("[%s] waiting for OpenClaw background work (%s)", task_id, state)
+                logged_state = state
+            time.sleep(min(OPENCLAW_BACKGROUND_POLL_SECONDS, max(0.0, deadline - now)))
+        record["outcome"] = outcome
+        record["waited_seconds"] = round(time.monotonic() - started, 1)
+        record["final_probe"] = probe
+        if outcome != "no_background_tasks":
+            logger.info(
+                "[%s] background work: %s after %.1fs",
+                task_id, outcome, record["waited_seconds"],
+            )
+        try:
+            (Path(output_dir) / OPENCLAW_BACKGROUND_ARTIFACT).write_text(
+                json.dumps(record, indent=2, ensure_ascii=False, default=str) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("[%s] could not record background work: %s", task_id, exc)
 
     @staticmethod
     def _signal_openclaw_process(task_id: str, signal_name: str) -> None:
